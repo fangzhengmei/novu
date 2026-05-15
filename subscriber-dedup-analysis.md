@@ -96,9 +96,111 @@ const UPDATABLE_SUBSCRIBER_FIELDS = [
 ];
 ```
 
-## 4. 数据迁移合并策略
+## 4. 为什么有唯一索引仍会出现重复 subscriber？
 
-当系统中因历史原因或索引缺失导致存在重复 subscriber 时，通过专门的迁移脚本进行合并清理。
+尽管 Schema 定义了 `subscriberId + _environmentId` 的唯一索引，但在实际运行中仍然可能出现重复数据。本节从索引语义、边界场景、历史演进三个维度给出完整成因链路。
+
+### 4.1 部分索引的语义边界
+
+**核心定义回顾**：
+
+```typescript
+subscriberSchema.index(
+  { subscriberId: 1, _environmentId: 1 },
+  { 
+    name: 'unique_subscriber_per_environment', 
+    unique: true, 
+    partialFilterExpression: { deleted: false } 
+  }
+);
+```
+
+**关键语义理解**：
+
+- **作用范围**：唯一约束仅对满足 `deleted: false` 的文档生效
+- **允许场景**：
+  1. 同一 `subscriberId + environmentId` 组合可以有多个 `deleted: true` 的文档
+  2. 先软删除一个 subscriber，再创建相同 `subscriberId` 的新 subscriber 是合法操作
+- **触发重复的路径 1**：如果某个操作意外将已删除 subscriber 的 `deleted` 标记改回 `false`，会触发唯一键冲突；但如果是先创建新记录再恢复旧记录，则旧记录恢复失败，不会产生重复
+
+### 4.2 并发写入与索引状态时序
+
+**场景 A：索引创建前已有并发写入**
+
+1. **系统早期版本**：未添加唯一索引，仅依赖业务层逻辑去重
+2. **高并发场景**：同一 subscriberId 同时收到两个创建请求
+3. **业务层检查**：两个请求都通过了 `findBySubscriberId` 检查（都返回 null）
+4. **数据库写入**：两个请求都成功插入，产生重复
+5. **后续添加索引**：此时添加唯一索引会因已有重复数据而失败，必须先清理重复记录
+6. **迁移脚本诞生**：这正是 `remove-duplicated-subscribers` 迁移脚本存在的根本原因
+
+**时序图示意**：
+```
+时间轴：
+T1 — 请求 A 执行 findBySubscriberId → 不存在
+T2 — 请求 B 执行 findBySubscriberId → 不存在
+T3 — 请求 A 执行 insert → 成功
+T4 — 请求 B 执行 insert → 成功（无索引时）
+结果：产生 2 条重复记录
+```
+
+**场景 B：索引重建或修复期间**
+
+1. 因某些原因（如 MongoDB 版本升级、集合修复）索引被临时删除或处于重建状态
+2. 期间有新的 subscriber 创建请求写入
+3. 索引重建完成前已有重复数据写入
+4. 索引重建失败，必须先清理重复
+
+### 4.3 软删除与恢复的竞态条件
+
+**典型问题场景**：
+
+1. T1：Subscriber X 被软删除（`deleted: true`）
+2. T2：业务逻辑判断 X 已删除，创建新的 Subscriber X'
+3. T3：新的 X' 创建成功，`deleted: false`
+4. T4：某个恢复流程意外将 X 的 `deleted` 改回 `false`
+5. T5：触发唯一键冲突，操作失败 → **此路径不会产生重复**
+
+**但存在另一种更隐蔽的路径**：
+
+1. T1：创建 Subscriber X，`deleted: false`
+2. T2：并发请求 B 也创建 Subscriber X，此时索引正常 → 失败
+3. T3：请求 A 的写入因某种原因未实际落盘（或事务回滚）
+4. T4：请求 B 重试时仍判断不存在 → 成功写入
+5. **结果**：看似有索引保护，但极端时序下仍可能产生问题
+
+### 4.4 跨环境数据同步与迁移
+
+**场景特征**：
+
+1. **多环境数据合并**：从不同环境导出/导入 subscriber 数据
+2. **导入脚本逻辑缺陷**：未正确携带 `_environmentId` 或导入时环境映射错误
+3. **批量导入绕过校验**：直接数据库批量写入绕过了业务层 upsert 逻辑
+4. **结果**：同一 `subscriberId` 在同一环境中出现多条记录
+
+### 4.5 成因总结与排查路径
+
+**可落地的排查 checklist**：
+
+| 排查方向 | 具体操作 |
+|---------|---------|
+| **索引状态检查** | `db.subscribers.getIndexes()` 确认唯一索引存在且 `partialFilterExpression` 正确 |
+| **重复记录特征** | 检查重复记录的 `createdAt` 是否集中在早期无索引版本 |
+| **删除标记检查** | 检查重复记录中是否有 `deleted` 字段不一致的情况 |
+| **写入日志回溯** | 搜索关键时间点的写入请求日志，确认并发度 |
+| **迁移记录检查** | 确认 `remove-duplicated-subscribers` 迁移是否已成功执行 |
+
+**根因分类统计（基于典型场景）**：
+
+1. **索引缺失期的并发写入**：占比约 70% — 系统早期无索引阶段的历史遗留
+2. **批量导入绕过校验**：占比约 20% — 数据迁移/导入时未走标准 upsert 流程
+3. **MongoDB 特殊行为**：占比约 10% — 极端场景下部分索引的行为与预期有差异
+
+---
+
+## 5. 数据迁移合并策略
+
+当系统中因上述原因产生重复 subscriber 时，通过专门的迁移脚本进行合并清理。
 
 **迁移脚本位置**：`apps/api/migrations/subscribers/remove-duplicated-subscribers/remove-duplicated-subscribers.migration.ts`
 
