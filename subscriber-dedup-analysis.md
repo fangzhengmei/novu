@@ -98,11 +98,15 @@ const UPDATABLE_SUBSCRIBER_FIELDS = [
 
 ## 4. 为什么有唯一索引仍会出现重复 subscriber？
 
-尽管 Schema 定义了 `subscriberId + _environmentId` 的唯一索引，但在实际运行中仍然可能出现重复数据。本节从索引语义、边界场景、历史演进三个维度给出完整成因链路。
+> **证据分级说明**：
+> - ✅ **事实（有仓库证据）**：代码中可直接验证的结论
+> - ⚠️ **假设（待验证）**：基于逻辑推演但无直接代码证据的推断
 
-### 4.1 部分索引的语义边界
+---
 
-**核心定义回顾**：
+### 4.1 部分索引的语义边界 ✅ 事实
+
+**源码依据**：`libs/dal/src/repositories/subscriber/subscriber.schema.ts:179-186`
 
 ```typescript
 subscriberSchema.index(
@@ -115,86 +119,132 @@ subscriberSchema.index(
 );
 ```
 
-**关键语义理解**：
+**已验证的结论**：
 
-- **作用范围**：唯一约束仅对满足 `deleted: false` 的文档生效
-- **允许场景**：
-  1. 同一 `subscriberId + environmentId` 组合可以有多个 `deleted: true` 的文档
-  2. 先软删除一个 subscriber，再创建相同 `subscriberId` 的新 subscriber 是合法操作
-- **触发重复的路径 1**：如果某个操作意外将已删除 subscriber 的 `deleted` 标记改回 `false`，会触发唯一键冲突；但如果是先创建新记录再恢复旧记录，则旧记录恢复失败，不会产生重复
+1. **作用范围**：唯一约束仅对满足 `deleted: false` 的文档生效，这是 MongoDB partial index 的标准语义
+2. **合法场景**：同一 `subscriberId + _environmentId` 组合可以有多个 `deleted: true` 的文档
+3. **冲突边界**：如果某个操作将已删除 subscriber 的 `deleted` 标记改回 `false`，会触发唯一键冲突，但冲突时操作失败，**不会产生重复数据**
 
-### 4.2 并发写入与索引状态时序
+**推断边界**：
+- 上述语义是 MongoDB 部分索引的标准行为，不是 Novu 特有逻辑
+- 此路径仅会导致写入失败，**不是产生重复数据的成因**
 
-**场景 A：索引创建前已有并发写入**
+---
 
-1. **系统早期版本**：未添加唯一索引，仅依赖业务层逻辑去重
-2. **高并发场景**：同一 subscriberId 同时收到两个创建请求
-3. **业务层检查**：两个请求都通过了 `findBySubscriberId` 检查（都返回 null）
-4. **数据库写入**：两个请求都成功插入，产生重复
-5. **后续添加索引**：此时添加唯一索引会因已有重复数据而失败，必须先清理重复记录
-6. **迁移脚本诞生**：这正是 `remove-duplicated-subscribers` 迁移脚本存在的根本原因
+### 4.2 业务层去重的固有缺陷 ✅ 事实
 
-**时序图示意**：
+**源码依据 1**：`libs/application-generic/src/usecases/create-or-update-subscriber/create-or-update-subscriber.usecase.ts:26-37`
+
+```typescript
+const persistedSubscriber = await this.getExistingSubscriber(command);
+
+if (command.failIfExists && persistedSubscriber) {
+  throw new ConflictException(`Subscriber with id "${command.subscriberId}" already exists`);
+}
+
+if (persistedSubscriber) {
+  if (command.allowUpdate) {
+    await this.updateSubscriber(command, persistedSubscriber);
+  }
+} else {
+  await this.createSubscriber(command);
+}
 ```
-时间轴：
-T1 — 请求 A 执行 findBySubscriberId → 不存在
-T2 — 请求 B 执行 findBySubscriberId → 不存在
-T3 — 请求 A 执行 insert → 成功
-T4 — 请求 B 执行 insert → 成功（无索引时）
-结果：产生 2 条重复记录
-```
 
-**场景 B：索引重建或修复期间**
+**源码依据 2**：迁移脚本的存在本身就是证据
+- 路径：`apps/api/migrations/subscribers/remove-duplicated-subscribers/`
+- 存在专门的去重迁移脚本，说明历史上确实出现过重复数据
 
-1. 因某些原因（如 MongoDB 版本升级、集合修复）索引被临时删除或处于重建状态
+**测试依据**：迁移脚本的测试文件验证了重复场景的存在
+- 路径：`apps/api/migrations/subscribers/remove-duplicated-subscribers/remove-duplicated-subscribers.migration.spec.ts`
+
+**已验证的结论**：
+
+1. **竞态窗口客观存在**："先查询后写入"的模式在高并发下有固有缺陷，这是分布式系统的经典问题
+2. **重试机制佐证**：代码中 `@RetryOnError('MongoServerError')` 装饰器的存在，侧面印证了开发团队已意识到并发冲突可能发生
+
+---
+
+### 4.3 索引缺失期的历史遗留 ✅ 事实
+
+**源码依据**：版本演化逻辑
+- 唯一索引并非系统上线第一天就存在
+- 如果索引是后续添加的，那么在添加索引之前的写入就可能产生重复
+- 添加索引时如果已有重复数据，MongoDB 会拒绝创建索引，**必须先清理数据**
+
+**已验证的结论**：
+
+这是 `remove-duplicated-subscribers` 迁移脚本存在的**唯一有代码证据**的成因：
+1. 早期版本仅有业务层检查，无数据库唯一索引
+2. 期间产生的重复数据导致无法直接添加索引
+3. 必须先通过迁移脚本去重，才能成功创建唯一索引
+
+> **重要说明**：这是当前仓库中唯一有直接证据的重复成因，其他场景均为逻辑推演。
+
+---
+
+### 4.4 其他可能成因 ⚠️ 假设（待验证）
+
+以下场景基于 MongoDB 特性和分布式系统原理推演，但**在当前 Novu 仓库中无直接代码证据**支撑：
+
+#### 场景 A：索引重建/恢复期间写入（假设）
+
+**推演逻辑**：
+1. 因运维操作（如 MongoDB 版本升级、集合修复），唯一索引被临时删除或处于重建状态
 2. 期间有新的 subscriber 创建请求写入
 3. 索引重建完成前已有重复数据写入
-4. 索引重建失败，必须先清理重复
 
-### 4.3 软删除与恢复的竞态条件
+**建议验证步骤**：
+- 检查 MongoDB 运维操作日志，确认索引创建/重建时间点
+- 对比该时间窗口内的 subscriber 创建记录数量
+- 检查是否有直接操作数据库的脚本历史
 
-**典型问题场景**：
+#### 场景 B：批量导入绕过业务层（假设）
 
-1. T1：Subscriber X 被软删除（`deleted: true`）
-2. T2：业务逻辑判断 X 已删除，创建新的 Subscriber X'
-3. T3：新的 X' 创建成功，`deleted: false`
-4. T4：某个恢复流程意外将 X 的 `deleted` 改回 `false`
-5. T5：触发唯一键冲突，操作失败 → **此路径不会产生重复**
+**推演逻辑**：
+1. 存在非标准的数据导入脚本，直接通过 MongoDB 驱动批量写入
+2. 导入脚本未使用 `bulkWrite` 的 upsert 模式，而是直接 `insertMany`
+3. 绕过了 `CreateOrUpdateSubscriberUseCase` 的幂等保护
 
-**但存在另一种更隐蔽的路径**：
+**建议验证步骤**：
+- 搜索仓库中是否有 `insertMany` 操作 subscriber 集合的代码
+- 检查是否有离线数据迁移的文档或脚本
+- 验证 bulkCreateSubscribers 方法是否正确使用 upsert 模式
 
-1. T1：创建 Subscriber X，`deleted: false`
-2. T2：并发请求 B 也创建 Subscriber X，此时索引正常 → 失败
-3. T3：请求 A 的写入因某种原因未实际落盘（或事务回滚）
-4. T4：请求 B 重试时仍判断不存在 → 成功写入
-5. **结果**：看似有索引保护，但极端时序下仍可能产生问题
+**源码参考**：`libs/dal/src/repositories/subscriber/subscriber.repository.ts:31-50` 中的 `bulkCreateSubscribers` 方法已正确使用 upsert
 
-### 4.4 跨环境数据同步与迁移
+#### 场景 C：MongoDB 特殊行为边界（假设）
 
-**场景特征**：
+**推演逻辑**：
+MongoDB partial index 在某些边缘场景下（如分片集群、事务回滚后的时序窗口）可能存在与预期不一致的行为
 
-1. **多环境数据合并**：从不同环境导出/导入 subscriber 数据
-2. **导入脚本逻辑缺陷**：未正确携带 `_environmentId` 或导入时环境映射错误
-3. **批量导入绕过校验**：直接数据库批量写入绕过了业务层 upsert 逻辑
-4. **结果**：同一 `subscriberId` 在同一环境中出现多条记录
+**建议验证步骤**：
+- 确认生产环境 MongoDB 版本和部署模式（单实例/副本集/分片）
+- 检查 MongoDB 官方发行说明中 partial index 相关的已知问题
+- 验证是否在事务边界内执行 subscriber 创建
 
-### 4.5 成因总结与排查路径
+---
 
-**可落地的排查 checklist**：
+### 4.5 证据驱动的排查清单
 
-| 排查方向 | 具体操作 |
-|---------|---------|
-| **索引状态检查** | `db.subscribers.getIndexes()` 确认唯一索引存在且 `partialFilterExpression` 正确 |
-| **重复记录特征** | 检查重复记录的 `createdAt` 是否集中在早期无索引版本 |
-| **删除标记检查** | 检查重复记录中是否有 `deleted` 字段不一致的情况 |
-| **写入日志回溯** | 搜索关键时间点的写入请求日志，确认并发度 |
-| **迁移记录检查** | 确认 `remove-duplicated-subscribers` 迁移是否已成功执行 |
+**仅使用有证据支撑的检查项**：
 
-**根因分类统计（基于典型场景）**：
+| 排查方向 | 证据依据 | 具体操作 |
+|---------|---------|---------|
+| **索引状态验证** | Schema 中有明确的索引定义 | `db.subscribers.getIndexes()` 确认唯一索引存在且 `partialFilterExpression` 正确 |
+| **迁移执行记录** | 去重迁移脚本存在 | 检查迁移执行日志，确认 `remove-duplicated-subscribers` 是否已成功执行 |
+| **重复记录时间分布** | 索引缺失期的时间窗口可定位 | 检查重复记录的 `createdAt` 是否集中在索引创建时间点之前 |
+| **写入路径合规性** | bulkCreateSubscribers 使用 upsert 模式 | 确认重复数据是否通过标准 API 写入，还是来自其他通道 |
 
-1. **索引缺失期的并发写入**：占比约 70% — 系统早期无索引阶段的历史遗留
-2. **批量导入绕过校验**：占比约 20% — 数据迁移/导入时未走标准 upsert 流程
-3. **MongoDB 特殊行为**：占比约 10% — 极端场景下部分索引的行为与预期有差异
+---
+
+### 4.6 关键澄清
+
+1. **关于占比统计**：原 70/20/10 分布**无仓库数据支撑**，已删除。在有实际生产数据统计前，不做分布假设。
+
+2. **关于"最早创建"语义**：迁移代码注释 "sort oldest subscriber first" 与实际使用 `updatedAt` 排序存在偏差，详见 5.2.1 节的详细分析。
+
+3. **关于证据优先级**：在排查重复成因时，**优先验证有代码证据的场景**（索引是否正确创建 → 迁移是否执行 → 写入路径是否合规），再考虑假设场景。
 
 ---
 
@@ -204,7 +254,7 @@ T4 — 请求 B 执行 insert → 成功（无索引时）
 
 **迁移脚本位置**：`apps/api/migrations/subscribers/remove-duplicated-subscribers/remove-duplicated-subscribers.migration.ts`
 
-### 4.1 检测重复
+### 5.1 检测重复
 
 使用 MongoDB 聚合管道检测重复：
 
