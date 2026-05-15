@@ -129,7 +129,7 @@ const pipeline = [
 
 #### 4.2.1 保留哪个 subscriber？
 
-**实际排序依据**：
+**实际排序依据（源码第 49 行）**：
 
 ```typescript
 // sort oldest subscriber first
@@ -142,13 +142,14 @@ const mergedSubscriber = mergeSubscribers(sortedSubscribers);
 - **主记录选择**：选择排序后的 **第一个元素**（`subscribers[0]`）作为主记录
 - **删除规则**：所有 `_id !== mergedSubscriber._id` 的记录都被删除
 
-**updatedAt 与 createdAt 的关系**：
+**updatedAt 与创建时间的关系**：
 
-在正常场景下，先创建的 subscriber 通常 `updatedAt` 也更小，因此按 `updatedAt` 排序与按创建时间排序的结果一致。测试用例 "should keep the first created subscriber" 正是依赖这一假设。
+只有在 subscriber **从未发生后续更新** 时，按 `updatedAt` 升序排序才可能与创建先后看起来一致。
 
 但存在例外情况：
 - 如果某个较早创建的 subscriber 后续被更新过，其 `updatedAt` 会变得比后创建的 subscriber 更大
 - 此时按 `updatedAt` 排序的结果会与实际创建顺序相反
+- **最终结论**：代码实际选择的是 `updatedAt` 最小的 subscriber，而非创建最早的 subscriber
 
 **时间相同场景下的确定性**：
 
@@ -157,7 +158,7 @@ const mergedSubscriber = mergeSubscribers(sortedSubscribers);
 2. **JavaScript `sort()` 稳定性**：在 V8 引擎（Node.js）中，`Array.sort()` 对于相等元素是**稳定排序**，即相等元素保持其在原数组中的相对位置
 3. **最终结果**：当 `updatedAt` 相同时，哪个 subscriber 被保留取决于 MongoDB 返回的顺序，该顺序由文档在集合中的物理存储位置决定，**不保证与创建时间一致**
 
-> **⚠️ 注意**：迁移代码注释标注 "sort oldest subscriber first"，但实际实现基于 `updatedAt` 而非 `createdAt`，存在注释与实现的语义差异。在 subscriber 从未被更新的场景下，两者结果等价。
+> **⚠️ 代码注释偏差说明**：迁移代码注释标注 "sort oldest subscriber first"（按最旧的 subscriber 排序），但实际实现基于 `updatedAt` 而非 `createdAt`，存在注释语义与实现的偏差。
 
 #### 4.2.2 字段合并规则
 
@@ -191,9 +192,9 @@ function mergeChannels(existingChannel: IChannelSettings, newChannel: IChannelSe
 
 ### 4.3 合并执行流程
 
-1. **排序**：将重复组按时间排序（最早的在前）
+1. **排序**：将重复组按 `updatedAt` 升序排序
 2. **合并数据**：调用 `mergeSubscribers()` 合并所有重复 subscriber 的数据
-3. **更新主记录**：将合并后的数据更新到保留的主 subscriber
+3. **更新主记录**：将合并后的数据更新到保留的主 subscriber（排序后第一个）
 4. **删除重复**：删除其他所有重复的 subscriber 记录
 
 ```typescript
@@ -237,7 +238,11 @@ await subscriberRepository.deleteMany({
 | **Channels 同集成合并** | 同一 _integrationId 的 deviceTokens 合并去重 |
 | **Channels 不同集成保留** | 不同 _integrationId 的 channel 都保留 |
 | **WebhookUrl 更新** | 新的 webhookUrl 覆盖旧的 |
-| **保留最早创建** | 主记录始终是最早创建的那个 |
+| **保留 updatedAt 最小的记录** | 主记录是 `updatedAt` 最小的 subscriber ⚠️ |
+
+> ⚠️ **测试隐含假设说明**：测试用例 "should keep the first created subscriber" 实际验证的是"先创建的 subscriber 其 `updatedAt` 也更小"这一隐含假设。该假设在 subscriber 从未被更新的场景下成立，但并非绝对保证。实际上代码选择的是 `updatedAt` 最小的 subscriber，而非 `createdAt` 最小的。
+>
+> 只有在 subscriber **从未发生后续更新** 时，按 `updatedAt` 升序排序才可能与创建先后看起来一致。
 
 ## 6. 架构设计总结
 
@@ -267,8 +272,11 @@ await subscriberRepository.deleteMany({
 |-----|------|------|
 | **以 subscriberId + environmentId 作为唯一键** | 符合多租户隔离要求，业务逻辑清晰 | 需要在所有查询中包含 environmentId |
 | **partialFilterExpression 排除已删除记录** | 允许删除后重新创建相同 subscriberId | 软删除记录可能累积占用存储空间 |
-| **合并时保留最早记录** | 保持 _id 的引用稳定性，不影响外键关联 | 可能丢失较新记录的创建时间信息 |
+| **按 updatedAt 升序选择主记录** | subscriber 从未更新时等价于保留创建较早的记录，符合大部分场景预期 | 若旧 subscriber 被更新过，其 `updatedAt` 变大，可能反而不被保留；代码注释与实现存在语义偏差 |
+| **updatedAt 相同时依赖 MongoDB 返回顺序** | 实现简单，无需额外排序字段 | 结果依赖数据库内部状态，不保证绝对可预测 |
 | **channels 按 integrationId 聚合，tokens 去重** | 最大限度保留推送令牌，提高送达率 | 可能导致 channels 数组逐渐膨胀 |
+
+> **重要说明**：只有在 subscriber **从未发生后续更新** 时，按 `updatedAt` 升序排序才可能与创建先后看起来一致。
 
 ## 7. 相关文件索引
 
