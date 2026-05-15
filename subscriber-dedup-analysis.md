@@ -129,8 +129,35 @@ const pipeline = [
 
 #### 4.2.1 保留哪个 subscriber？
 
-- 保留 **最早创建**（按 `_id` 或 `updatedAt` 排序）的 subscriber 作为主记录
-- 删除其他重复的 subscriber 记录
+**实际排序依据**：
+
+```typescript
+// sort oldest subscriber first
+const sortedSubscribers = subscribers.sort((a, b) => a.updatedAt - b.updatedAt);
+const mergedSubscriber = mergeSubscribers(sortedSubscribers);
+```
+
+- **排序字段**：严格按 `updatedAt` 字段排序，**不使用** `createdAt`
+- **排序方向**：升序排列（`a.updatedAt - b.updatedAt`），`updatedAt` 值最小的排在最前
+- **主记录选择**：选择排序后的 **第一个元素**（`subscribers[0]`）作为主记录
+- **删除规则**：所有 `_id !== mergedSubscriber._id` 的记录都被删除
+
+**updatedAt 与 createdAt 的关系**：
+
+在正常场景下，先创建的 subscriber 通常 `updatedAt` 也更小，因此按 `updatedAt` 排序与按创建时间排序的结果一致。测试用例 "should keep the first created subscriber" 正是依赖这一假设。
+
+但存在例外情况：
+- 如果某个较早创建的 subscriber 后续被更新过，其 `updatedAt` 会变得比后创建的 subscriber 更大
+- 此时按 `updatedAt` 排序的结果会与实际创建顺序相反
+
+**时间相同场景下的确定性**：
+
+当多个 subscriber 的 `updatedAt` 完全相同时：
+1. **MongoDB `$push` 顺序**：聚合管道中 `subscribers: { $push: '$$ROOT' }` 的返回顺序取决于 MongoDB 内部的文档存储顺序（通常与 `_id` 插入顺序相关，但无正式保证）
+2. **JavaScript `sort()` 稳定性**：在 V8 引擎（Node.js）中，`Array.sort()` 对于相等元素是**稳定排序**，即相等元素保持其在原数组中的相对位置
+3. **最终结果**：当 `updatedAt` 相同时，哪个 subscriber 被保留取决于 MongoDB 返回的顺序，该顺序由文档在集合中的物理存储位置决定，**不保证与创建时间一致**
+
+> **⚠️ 注意**：迁移代码注释标注 "sort oldest subscriber first"，但实际实现基于 `updatedAt` 而非 `createdAt`，存在注释与实现的语义差异。在 subscriber 从未被更新的场景下，两者结果等价。
 
 #### 4.2.2 字段合并规则
 
