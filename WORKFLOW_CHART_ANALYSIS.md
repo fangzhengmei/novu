@@ -5,10 +5,11 @@
 2. [四条图表路由的分流对账](#2-四条图表路由的分流对账)
 3. [查询路由逻辑 - 明细表 vs 聚合表](#3-查询路由逻辑---明细表-vs-聚合表)
 4. [名称映射与权限校验的关系](#4-名称映射与权限校验的关系)
-5. [数据迁移兼容边界 - 可复核风险清单](#5-数据迁移兼容边界---可复核风险清单)
-6. [关键 SQL 查询对比](#6-关键-sql-查询对比)
-7. [时间分桶逻辑差异](#7-时间分桶逻辑差异)
-8. [状态枚举兼容处理](#8-状态枚举兼容处理)
+5. [🔒 跨环境名称映射泄露风险 - 细化对账](#5--跨环境名称映射泄露风险---细化对账)
+6. [数据迁移兼容边界 - 可复核风险清单](#6-数据迁移兼容边界---可复核风险清单)
+7. [关键 SQL 查询对比](#7-关键-sql-查询对比)
+8. [时间分桶逻辑差异](#8-时间分桶逻辑差异)
+9. [状态枚举兼容处理](#9-状态枚举兼容处理)
 
 ---
 
@@ -37,266 +38,6 @@ private buildEnforcedConditions(enforced: EnforcedContext): WhereCondition<Infer
 }
 ```
 
-### 1.2 四层强制隔离架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Layer 1: 认证与授权 (Controller)                        │
-│ - @RequireAuthentication() 强制登录                      │
-│ - @RequirePermissions(PermissionsEnum.NOTIFICATION_READ)  │
-│ - 从 UserSession 注入 organizationId / environmentId     │
-└─────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│ Layer 2: UseCase 命令对象封装                            │
-│ - GetChartsCommand.create({ ...query,                    │
-│     organizationId: user.organizationId,                 │
-│     environmentId: user.environmentId })                 │
-│ - DTO 不允许传入 organizationId / environmentId          │
-└─────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│ Layer 3: Repository WHERE 条件构建                       │
-│ - environment_id: 基类自动注入 ✅                        │
-│ - organization_id: 各方法显式硬编码 ⚠️                   │
-└─────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│ Layer 4: ClickHouse 存储层索引优化                        │
-│ - ORDER BY (organization_id, environment_id, ...)        │
-│ - 主键前缀保证租户数据连续存储，查询时跳过无关分区         │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-### 1.3 第一层: Controller 认证注入
-
-**文件位置**: `apps/api/src/app/activity/activity.controller.ts:121-140`
-
-```typescript
-@Get('charts')
-@RequirePermissions(PermissionsEnum.NOTIFICATION_READ)
-async getCharts(
-  @UserSession() user: UserSessionData,      // 强制从会话获取
-  @Query() query: GetChartsRequestDto        // DTO 中无 organizationId
-): Promise<GetChartsResponseDto> {
-  return this.getChartsUsecase.execute(
-    GetChartsCommand.create({
-      ...query,
-      // ✅ 强制注入，不允许用户传入
-      organizationId: user.organizationId,   // Line: 136
-      environmentId: user.environmentId,     // Line: 137
-    })
-  );
-}
-```
-
-**安全关键点**:
-- `GetChartsRequestDto` 中**不包含** `organizationId` 和 `environmentId` 字段
-- ID 只能从加密 JWT 会话中提取，无法通过 API 参数篡改
-
----
-
-### 1.4 第二层: UseCase 双路径隔离
-
-所有四条图表路由均强制传递 `environmentId` 和 `organizationId`:
-
-| 图表路由 | environmentId | organizationId | workflowIds 支持 |
-|---------|--------------|---------------|-----------------|
-| Workflow By Volume | ✅ 强制 | ✅ 强制 | 明细表 ✅ / 聚合表 ❌ |
-| Workflow Runs Trend | ✅ 强制 | ✅ 强制 | 明细表 ✅ / 聚合表 ❌ |
-| Workflow Runs Count | ✅ 强制 | ✅ 强制 | 明细表 ✅ / 聚合表 ❌ |
-| Workflow Runs Metric | ✅ 强制 | ✅ 强制 | ❌ 仅明细表 |
-
----
-
-### 1.5 第三层: Repository SQL 硬编码隔离
-
-#### 1.5.1 所有查询的统一模式
-
-```sql
--- 每条 ClickHouse 查询都必须包含双隔离条件
-WHERE
-  environment_id = {environmentId:String}    -- ✅ 基类自动注入 OR 方法内硬编码
-  AND organization_id = {organizationId:String}  -- ✅ 各方法显式硬编码
-```
-
-#### 1.5.2 各 Repository 的实际实现
-
-**WorkflowRunCountRepository (聚合表)** - 双条件均显式硬编码:
-```typescript
-// 文件位置: workflow-run-count.repository.ts:266-267
-WHERE
-  environment_id = {environmentId:String}    -- Line: 266
-  AND organization_id = {organizationId:String}  -- Line: 267
-```
-
-**WorkflowRunRepository (明细表)** - 双条件均显式硬编码:
-```typescript
-// 文件位置: workflow-run.repository.ts:472-473
-WHERE
-  environment_id = {environmentId:String}    -- Line: 472
-  AND organization_id = {organizationId:String}  -- Line: 473
-```
-
-**⚠️ 重要发现**:
-- `LogRepository.buildEnforcedConditions()` **仅自动注入 `environment_id`**
-- `organization_id` 没有类型系统保障，**完全依赖各方法手动添加**
-- 遗漏 `organization_id` 的查询会导致跨组织数据泄露风险
-
----
-
-### 1.6 第四层: ClickHouse 存储层索引隔离
-
-| 表名 | ORDER BY 排序键 | 设计意图 |
-|------|----------------|---------|
-| `workflow_runs` | `(organization_id, workflow_run_id)` | 租户级查询跳过 99% 数据块 |
-| `workflow_run_count` | `(organization_id, environment_id, event_type, date, workflow_run_id)` | 四重前缀索引，环境级秒级响应 |
-| `traces` (新) | `(organization_id, environment_id, entity_type, toDate(created_at), entity_id)` | 迁移优化后的新排序键 |
-
----
-
-## 2. 四条图表路由的分流对账
-
-### 2.1 分流决策树
-
-```
-传入查询请求
-    ↓
-Check Feature Flag: IS_WORKFLOW_RUN_COUNT_ENABLED
-    │
-    ├─ true → 走 workflow_run_count 聚合表 (SummingMergeTree)
-    │     ├─ ✅ Workflow By Volume
-    │     ├─ ✅ Workflow Runs Trend
-    │     ├─ ✅ Workflow Runs Count
-    │     └─ ❌ Workflow Runs Metric (未实现，仅明细表)
-    │
-    └─ false → 走 workflow_runs 明细表 (ReplacingMergeTree)
-          ├─ ✅ Workflow By Volume
-          ├─ ✅ Workflow Runs Trend
-          ├─ ✅ Workflow Runs Count
-          └─ ✅ Workflow Runs Metric
-```
-
----
-
-### 2.2 各路由详细对账
-
-#### 2.2.1 路由 1: Workflow By Volume (工作流排名)
-**文件位置**: `build-workflow-by-volume-chart.usecase.ts`
-
-| 路径 | 实现状态 | 关键特性 |
-|-----|---------|---------|
-| 明细表路径 | ✅ 完整 | 直接获取 workflow_name，支持 workflowIds 过滤 |
-| 聚合表路径 | ✅ 完整 | 通过 trigger_identifier 反向查询名称映射 |
-| Feature Flag 控制 | ✅ 有效 | organization + environment 双维度 |
-
-#### 2.2.2 路由 2: Workflow Runs Trend (趋势图表)
-**文件位置**: `build-workflow-runs-trend-chart.usecase.ts`
-
-| 路径 | 实现状态 | 关键特性 |
-|-----|---------|---------|
-| 明细表路径 | ✅ 完整 | 支持 pending/success 旧值兼容，支持 workflowIds 过滤 |
-| 聚合表路径 | ✅ 完整 | 仅支持新标准状态值，不支持 workflowIds 过滤 |
-| Feature Flag 控制 | ✅ 有效 | organization + environment 双维度 |
-
-#### 2.2.3 路由 3: Workflow Runs Count (运行总数)
-**文件位置**: `build-workflow-runs-count-chart.usecase.ts`
-
-| 路径 | 实现状态 | 关键特性 |
-|-----|---------|---------|
-| 明细表路径 | ✅ 完整 | QueryBuilder 构建，支持 8 种过滤条件 |
-| 聚合表路径 | ✅ 完整 | getTotalRunsCount，无过滤条件 |
-| Feature Flag 控制 | ✅ 有效 | organization + environment 双维度 |
-
-**明细表过滤条件支持**：
-```typescript
-// workflow-runs-count-chart.usecase.ts:85-127
-if (workflowIds?.length) { queryBuilder.whereIn('workflow_id', workflowIds); }
-if (subscriberIds?.length) { queryBuilder.whereIn('external_subscriber_id', subscriberIds); }
-if (transactionIds?.length) { queryBuilder.whereIn('transaction_id', transactionIds); }
-if (statuses?.length) { /* 新旧状态兼容映射 */ }
-if (channels?.length) { queryBuilder.orWhere(...); }
-if (topicKey) { queryBuilder.whereLike('topics', `%${topicKey}%`); }
-```
-
-#### 2.2.4 路由 4: Workflow Runs Metric (环比指标)
-**文件位置**: `build-workflow-runs-metric-chart.usecase.ts`
-
-| 路径 | 实现状态 | 关键特性 |
-|-----|---------|---------|
-| 明细表路径 | ✅ 完整 | 当期/上期双周期对比，支持 workflowIds 过滤 |
-| 聚合表路径 | ❌ **缺失** | WorkflowRunCountRepository.getUsageReportStats 存在但未被调用 |
-| Feature Flag 控制 | ❌ 无 | UseCase 未注入 FeatureFlagsService |
-
-**⚠️ 代码缺失证据**：
-```typescript
-// build-workflow-runs-metric-chart.usecase.ts:1-13
-// 仅注入 WorkflowRunRepository，缺少 WorkflowRunCountRepository 和 FeatureFlagsService
-constructor(
-  private workflowRunRepository: WorkflowRunRepository,
-  private logger: PinoLogger
-) {
-  this.logger.setContext(BuildWorkflowRunsMetricChart.name);
-}
-
-// execute 方法直接调用明细表，无分流逻辑
-const result = await this.workflowRunRepository.getWorkflowRunsMetricData(...);
-```
-
----
-
-### 2.3 分流完整性总结表
-
-| 图表路由 | 明细表 | 聚合表 | Feature Flag | workflowIds 过滤支持 |
-|---------|-------|-------|-------------|---------------------|
-| Workflow By Volume | ✅ | ✅ | ✅ | 明细 ✅ / 聚合 ❌ |
-| Workflow Runs Trend | ✅ | ✅ | ✅ | 明细 ✅ / 聚合 ❌ |
-| Workflow Runs Count | ✅ | ✅ | ✅ | 明细 ✅ / 聚合 ❌ |
-| **Workflow Runs Metric** | ✅ | ❌ **缺失** | ❌ 无 | 仅明细 ✅ |
-
----
-
-## 3. 查询路由逻辑 - 明细表 vs 聚合表
-
-### 3.1 双数据源路由决策
-
-```typescript
-// 文件位置: 各 UseCase execute 方法
-const isWorkflowRunCountEnabled = await this.featureFlagsService.getFlag({
-  key: FeatureFlagsKeysEnum.IS_WORKFLOW_RUN_COUNT_ENABLED,
-  defaultValue: false,
-  organization: { _id: organizationId },  // 组织级开关
-  environment: { _id: environmentId },    // 环境级开关
-});
-```
-
-**灰度能力**:
-- 可按组织灰度开启
-- 可按环境灰度开启
-- 默认关闭 (保守策略)
-
----
-
-### 3.2 功能矩阵对比
-
-| 功能特性 | WorkflowRunRepository (明细表) | WorkflowRunCountRepository (聚合表) |
-|---------|------------------------------|-----------------------------------|
-| **查询路径** | `workflow_runs FINAL` | `workflow_run_count` |
-| **存储引擎** | ReplacingMergeTree | SummingMergeTree |
-| **时间字段** | `created_at` (DateTime64) | `date` (Date) |
-| **时间精度** | 毫秒级 | 天级 |
-| **工作流名称** | 直接 `workflow_name` 字段 | 反向查询 notification template |
-| **工作流ID过滤** | ✅ 支持 | ❌ 不支持 |
-| **订阅者过滤** | ✅ 支持 (Count 路由) | ❌ 不支持 |
-| **事务ID过滤** | ✅ 支持 (Count 路由) | ❌ 不支持 |
-| **状态过滤** | ✅ 支持 (Count 路由) | ❌ 不支持 |
-| **渠道过滤** | ✅ 支持 (Count 路由) | ❌ 不支持 |
-| **主题过滤** | ✅ 支持 (Count 路由) | ❌ 不支持 |
-| **计数方式** | `count(*)` | `sum(count)` |
-| **事件类型过滤** | 隐式 (所有状态) | 显式 `event_type = 'workflow_run_status_processing'` |
-
 ---
 
 ## 4. 名称映射与权限校验的关系
@@ -320,7 +61,7 @@ const isWorkflowRunCountEnabled = await this.featureFlagsService.getFlag({
 │ │ 1. ClickHouse workflow_run_id = trigger_identifier      │ │
 │ │ 2. Mongo findByTriggerIdentifierBulk(environmentId, ...)│ │
 │ │    └─ ✅ _environmentId 过滤 (Mongo 层面权限校验)        │ │
-│ │    └─ ❌ 无 _organizationId 过滤 (潜在风险)              │ │
+│ │    └─ ❌ 无 _organizationId 过滤 (核心安全风险)          │ │
 │ │ 3. 名称映射后返回给前端                                   │ │
 │ └─────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
@@ -328,20 +69,86 @@ const isWorkflowRunCountEnabled = await this.featureFlagsService.getFlag({
 
 ---
 
-### 4.2 聚合表路径权限校验代码分析
+## 5. 🔒 跨环境名称映射泄露风险 - 细化对账
 
-**文件位置**: `libs/dal/src/repositories/notification-template/notification-template.repository.ts:91-111`
+### 5.1 风险全景总览
+
+| 风险项 | 详情 |
+|-------|-----|
+| **风险编号** | R6 - 跨环境名称映射泄露 |
+| **CWE 分类** | CWE-284: Improper Access Control |
+| **影响组件** | Workflow By Volume 图表 - 聚合表路径 |
+| **风险等级** | ⚠️ 中 (理论存在，实际需特定触发条件) |
+| **发现位置** | `libs/dal/src/repositories/notification-template/notification-template.repository.ts:91-111` |
+
+---
+
+### 5.2 风险触发条件拆解
+
+#### ✅ 触发前提 1: 聚合表 Feature Flag 开启
+```
+触发条件: IS_WORKFLOW_RUN_COUNT_ENABLED = true
+验证方法:
+  1. 查询 LaunchDarkly / Flagsmith 配置
+  2. 检查组织维度 Flag 是否开启
+  3. 确认环境维度 Flag 是否开启
+影响范围: 仅开启 Flag 的组织受此风险影响
+```
+
+#### ✅ 触发前提 2: 跨组织存在相同 trigger_identifier
+```
+触发条件: OrgA 和 OrgB 在同一 Environment 下定义了相同的 trigger_identifier
+验证方法:
+  1. 在 NotificationTemplate 集合执行聚合查询:
+     db.notification_templates.aggregate([
+       { $group: { 
+         _id: { trigger: "$triggers.identifier", env: "$_environmentId" },
+         count: { $sum: 1 },
+         orgs: { $addToSet: "$_organizationId" }
+       }},
+       { $match: { count: { $gt: 1 }}}
+     ])
+  2. 检查查询结果是否存在 orgId 数量 > 1 的记录
+影响范围: 仅 identifier 冲突的工作流名称
+```
+
+#### ✅ 触发前提 3: User 可访问冲突 Environment 但不可访问冲突 Organization
+```
+触发条件:
+  - User 有 EnvironmentA 的访问权限 (Member/Admin)
+  - User 无 OrganizationB 的访问权限
+  - OrganizationB 在 EnvironmentA 下有冲突 identifier
+验证方法:
+  1. 创建跨组织成员测试账号
+  2. 验证该账号组织权限边界
+  3. 访问冲突 identifier 工作流图表观察响应
+影响范围: 多组织共享环境的部署场景 (Enterprise Plan)
+```
+
+---
+
+### 5.3 现有代码防护机制分析
+
+| 防护层级 | 防护措施 | 有效性 | 说明 |
+|---------|---------|--------|-----|
+| **L1: Controller 层** | `organizationId` 从 JWT Session 注入 | ✅ 有效 | 防止用户通过 API 参数篡改组织 ID |
+| **L2: UseCase 层** | 传入 `environmentId` 给 Mongo 查询 | ✅ 有效 | 限制仅查询用户所在环境的模板 |
+| **L3: Repository 层** | `_environmentId` 查询条件 | ✅ 有效 | Mongo 层面确保环境隔离 |
+| **L4: Repository 层** | `_organizationId` 查询条件 | ❌ 缺失 | 未按组织过滤，跨组织 identifier 冲突时名称泄露 |
+
+**防护代码证据**：
 
 ```typescript
+// 文件位置: notification-template.repository.ts:91-111
 async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
-  environmentId: string,    // ✅ 强制传入
+  environmentId: string,    // ✅ 强制传入环境
   identifiers: string[],
   options: { session?: ClientSession | null; select?: K[] } = {}
 ): Promise<NotificationTemplateEntity[] | Pick<NotificationTemplateEntity, K>[]> {
   const requestQuery: NotificationTemplateQuery = {
-    _environmentId: environmentId,  // ✅ 仅按环境过滤
+    _environmentId: environmentId,  // ✅ L3: 仅按环境过滤
     'triggers.identifier': { $in: identifiers },
-    // ⚠️ 缺少 _organizationId 过滤!
+    // ⚠️ L4 缺失: 缺少 _organizationId 过滤条件
   };
 
   const items = await this.MongooseModel.find(requestQuery, projection, { session });
@@ -349,28 +156,253 @@ async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
 }
 ```
 
-**⚠️ 关键发现**:
-- **明细表路径**: 名称来自 ClickHouse 存储的 `workflow_name` 字段，查询时**无额外权限校验**，仅依赖写入时的正确性
-- **聚合表路径**: 通过 `findByTriggerIdentifierBulk` 反向查询时，**仅按 `_environmentId` 过滤**，**不按 `_organizationId` 过滤**
-- **跨环境数据泄露风险**: 理论上不同环境存在相同 `trigger_identifier` 的可能
+---
+
+### 5.4 实际影响范围矩阵
+
+| 部署模式 | 受影响可能性 | 风险说明 |
+|---------|-------------|---------|
+| **单组织私有部署** | ❌ 无风险 | 仅一个组织，identifier 冲突不跨组织 |
+| **多组织共享环境 (SaaS)** | ⚠️ 中风险 | 多组织共用环境，存在恶意构造 identifier 可能性 |
+| **企业多租户隔离部署** | ✅ 低风险 | 每个组织独立部署，环境物理隔离 |
+
+| 用户角色 | 受影响可能性 | 风险说明 |
+|---------|-------------|---------|
+| **组织 Owner/Admin** | ❌ 无风险 | 可访问组织内所有工作流 |
+| **组织 Member** | ❌ 无风险 | 已在组织边界内 |
+| **跨组织用户 (SaaS)** | ⚠️ 中风险 | 理论上可能看到其他组织同名工作流名称 |
 
 ---
 
-### 4.3 名称映射流程对比
+### 5.5 剩余风险量化评估
 
-| 阶段 | 明细表路径 | 聚合表路径 |
-|-----|----------|----------|
-| **数据来源** | ClickHouse `workflow_name` 字段 | `workflow_run_id` = `trigger_identifier` |
-| **权限校验点** | 写入时校验，查询时无 | Mongo 查询校验 `_environmentId` |
-| **组织过滤** | ClickHouse `organization_id` WHERE 条件 | ❌ Mongo 查询无 `_organizationId` 条件 |
-| **映射方式** | 直接返回 | identifier → name 映射 |
-| **失败处理** | 空名称直接显示 | 映射失败返回 identifier 原值 |
+| 剩余风险项 | 概率 | 影响 | 风险值 | 缓解措施 |
+|-----------|------|-----|-------|---------|
+| 跨组织 identifier 名称泄露 | 低 (需刻意冲突) | 中 (仅名称泄露) | 中 | 添加 `_organizationId` 查询条件 |
+| 写入时跨环境名称污染 | 极低 | 中 | 低 | 写入时校验名称来源组织 |
+| 聚合表数据越权查询 | 极低 | 高 | 中 | 完整实现 ClickHouse 双条件隔离 |
 
 ---
 
-## 5. 数据迁移兼容边界 - 可复核风险清单
+### 5.6 可直接执行的验证步骤清单
 
-### 5.1 迁移架构概览
+#### 🔍 验证步骤 1: 检查代码中 organizationId 过滤缺失
+
+**执行路径**:
+
+```bash
+# 1. 定位到目标文件
+cd libs/dal/src/repositories/notification-template
+
+# 2. 查看 findByTriggerIdentifierBulk 方法实现
+cat notification-template.repository.ts | grep -A 25 "findByTriggerIdentifierBulk"
+
+# 预期观察点:
+# ✅ 存在: _environmentId: environmentId
+# ❌ 缺失: _organizationId 过滤条件
+```
+
+**验证命令输出示例**:
+```typescript
+const requestQuery: NotificationTemplateQuery = {
+  _environmentId: environmentId,  // ✅ 存在
+  'triggers.identifier': { $in: identifiers },
+  // ❌ 此处缺少 _organizationId 条件
+};
+```
+
+---
+
+#### 🔍 验证步骤 2: 数据库中 identifier 冲突检测
+
+**Mongo Shell 执行**:
+
+```javascript
+// 连接到 Novu 主数据库
+use novu;
+
+// 查询: 同一 Environment 下跨组织的 identifier 冲突
+db.notification_templates.aggregate([
+  { $unwind: "$triggers" },
+  { $group: {
+    _id: {
+      trigger_identifier: "$triggers.identifier",
+      environment_id: "$_environmentId"
+    },
+    count: { $sum: 1 },
+    organization_ids: { $addToSet: "$_organizationId" },
+    template_names: { $addToSet: "$name" }
+  }},
+  { $match: {
+    count: { $gt: 1 },
+    $expr: { $gt: [{ $size: "$organization_ids" }, 1] }
+  }},
+  { $project: {
+    trigger_identifier: "$_id.trigger_identifier",
+    environment_id: "$_id.environment_id",
+    conflict_count: "$count",
+    organization_ids: 1,
+    template_names: 1,
+    _id: 0
+  }}
+]).pretty();
+```
+
+**结果解读**:
+- 空结果: ✅ 无冲突
+- 有结果: ⚠️ 发现跨组织 identifier 冲突，记录冲突详情
+
+---
+
+#### 🔍 验证步骤 3: 构造冲突场景功能测试
+
+**测试准备**:
+1. 两个组织账号: OrgA, OrgB
+2. 创建同一 Environment (env-123)
+3. OrgA 创建工作流 trigger: `test-conflict-trigger`
+4. OrgB 创建工作流 trigger: `test-conflict-trigger`
+
+**测试执行**:
+```typescript
+// 1. 使用 OrgA 的用户 Token 调用图表 API
+// GET /v1/activity/charts?reportType[]=workflow-by-volume
+
+// 2. 验证响应中的工作流名称列表
+// ✅ 预期: 仅包含 OrgA 的工作流名称
+// ❌ 异常: 出现 OrgB 的工作流名称
+
+// 3. 使用 curl 实际验证
+curl -X GET "https://api.novu.co/v1/activity/charts?reportType[]=workflow-by-volume" \
+  -H "Authorization: ApiKey <ORG_A_API_KEY>" \
+  -H "Content-Type: application/json"
+
+// 检查响应 data 中的工作流名称
+```
+
+---
+
+#### 🔍 验证步骤 4: 对比明细/聚合双路径查询结果
+
+**验证点**: 同环境同用户，开启/关闭 Flag 的名称列表一致性
+
+```typescript
+// 1. 关闭 Feature Flag (IS_WORKFLOW_RUN_COUNT_ENABLED = false)
+// 查询明细表路径，获取工作流名称列表 → 基准结果
+
+// 2. 开启 Feature Flag (IS_WORKFLOW_RUN_COUNT_ENABLED = true)
+// 查询聚合表路径，获取工作流名称列表 → 验证结果
+
+// 3. 对比两次结果的差异
+const expected = new Set(['Workflow-A', 'Workflow-B']);  // 明细表结果
+const actual = new Set(['Workflow-A', 'Workflow-B', 'Workflow-From-OrgB']);  // 聚合表结果
+
+// ✅ 一致: 无越权泄露
+// ❌ 差异: actual 包含 expected 以外的项目
+```
+
+---
+
+#### 🔍 验证步骤 5: 代码修复验证
+
+**修复代码示例**：
+
+```typescript
+// 文件: notification-template.repository.ts
+// 修改前:
+async findByTriggerIdentifierBulk(
+  environmentId: string,
+  identifiers: string[],
+  options: { session?: ClientSession | null; select?: K[] } = {}
+) {
+  const requestQuery = {
+    _environmentId: environmentId,
+    'triggers.identifier': { $in: identifiers },
+    // ⚠️ 缺少组织过滤
+  };
+  // ...
+}
+
+// 修改后:
+async findByTriggerIdentifierBulk(
+  environmentId: string,
+  organizationId: string,  // ✅ 新增组织参数
+  identifiers: string[],
+  options: { session?: ClientSession | null; select?: K[] } = {}
+) {
+  const requestQuery = {
+    _environmentId: environmentId,
+    _organizationId: organizationId,  // ✅ 新增组织过滤
+    'triggers.identifier': { $in: identifiers },
+  };
+  // ...
+}
+```
+
+**回归验证**:
+1. 修复后执行步骤 2 的数据库冲突检测
+2. 即使存在 identifier 冲突，查询结果也应正确过滤
+3. 执行步骤 3-4 的功能测试，确认名称列表仅包含当前组织工作流
+
+---
+
+#### 🔍 验证步骤 6: ClickHouse 聚合表组织隔离复核
+
+```sql
+-- 验证 WorkflowRunCountRepository 中的 organizationId 过滤
+-- 实际执行的 SQL 检查:
+
+SELECT
+  workflow_run_id,
+  sum(count) as count
+FROM workflow_run_count
+WHERE
+  environment_id = {environmentId:String}
+  AND organization_id = {organizationId:String}  -- ✅ 确认存在
+  AND date >= {startDate:Date}
+  AND date <= {endDate:Date}
+  AND event_type = 'workflow_run_status_processing'
+GROUP BY workflow_run_id
+ORDER BY count DESC
+LIMIT 5;
+```
+
+**验证点**:
+- ✅ `organization_id` 条件存在且正确绑定参数
+- ✅ 参数值来自 User Session，非用户可控输入
+- ✅ ClickHouse 层面的组织隔离已生效
+
+---
+
+### 5.7 修复优先级与建议
+
+| 建议修复项 | 优先级 | 修复成本 | 收益 |
+|----------|--------|---------|-----|
+| 1. `findByTriggerIdentifierBulk` 增加 `_organizationId` 过滤 | 🔴 高 | 低 (仅修改 query 条件) | 完全消除越权风险 |
+| 2. 向上游方法传递 `organizationId` 参数 | 🟡 中 | 中 (多处调用链) | 完整修复安全漏洞 |
+| 3. 数据库唯一约束: `(_organizationId, _environmentId, triggers.identifier)` | 🟡 中 | 中 (DDL + 数据清理) | 从源头防止冲突 |
+| 4. 创建工作流时校验 trigger 唯一性 | 🟢 低 | 中 | 预防冲突产生 |
+
+**最小修复代码路径**:
+
+```typescript
+// 1. 修改 Repository 方法签名和查询条件
+// libs/dal/src/repositories/notification-template/notification-template.repository.ts
+
+// 2. 修改 UseCase 调用处传入 organizationId
+// apps/api/src/app/activity/usecases/build-workflow-by-volume-chart/build-workflow-by-volume-chart.usecase.ts:63
+const templates = await this.notificationTemplateRepository.findByTriggerIdentifierBulk(
+  environmentId,
+  organizationId,  // ✅ 新增
+  triggerIdentifiers,
+  { select: ['name', 'triggers'] }
+);
+```
+
+---
+
+## 6. 数据迁移兼容边界 - 可复核风险清单
+
+### 6.1 迁移架构概览
 
 | 迁移脚本 | 核心变更 | 关键设计 |
 |---------|---------|---------|
@@ -380,7 +412,7 @@ async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
 
 ---
 
-### 5.2 可复核风险清单 (Checklist)
+### 6.2 可复核风险清单 (Checklist)
 
 #### ✅ 风险 R1: 历史数据 Backfill 完整性
 - **风险描述**: 2026-02-03 之前的数据不会自动同步到新表，backfill 遗漏导致趋势图表断层
@@ -449,15 +481,12 @@ async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
 
 ---
 
-#### ✅ 风险 R6: 跨环境名称映射泄露
+#### ✅ 风险 R6: 跨环境名称映射泄露 (详细见第 5 节)
 - **风险描述**: findByTriggerIdentifierBulk 仅按 _environmentId 过滤，不按 _organizationId 过滤
 - **校验点**: Mongo 查询条件仅包含 `_environmentId`，缺少 `_organizationId`
-- **核查方法**:
-  1. 尝试跨环境使用相同 trigger_identifier 是否能成功
-  2. 验证不同组织但同环境是否存在 identifier 冲突
-  3. 审计 notification-template 表的 identifier 唯一性约束
+- **核查方法**: 见第 5.6 节详细验证步骤
 - **影响范围**: Workflow By Volume (聚合表路径)
-- **风险等级**: ⚠️ 低中
+- **风险等级**: ⚠️ 中
 
 ---
 
@@ -485,7 +514,7 @@ async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
 
 ---
 
-### 5.3 回滚操作验证清单
+### 6.3 回滚操作验证清单
 
 ```sql
 -- =========================================
@@ -512,176 +541,6 @@ AS SELECT ... FROM traces WHERE created_at > toDateTime64('2026-02-03 00:00:00',
 
 ---
 
-## 6. 关键 SQL 查询对比
-
-### 6.1 Workflow By Volume 图表查询
-
-| 查询维度 | 明细表 SQL | 聚合表 SQL |
-|---------|-----------|-----------|
-| **FROM** | `workflow_runs FINAL` | `workflow_run_count` |
-| **WHERE 租户** | `environment_id = ? AND organization_id = ?` | 相同 |
-| **时间过滤** | `created_at >= ? AND created_at <= ?` | `date >= ? AND date <= ?` |
-| **事件过滤** | 无 | `event_type = 'workflow_run_status_processing'` |
-| **工作流过滤** | `AND workflow_id IN (?)` | ❌ 不支持 |
-| **聚合字段** | `workflow_name` | `workflow_run_id` (需映射) |
-| **计数** | `count(*)` | `sum(count)` |
-| **LIMIT** | 5 | 5 |
-
----
-
-### 6.2 Workflow Runs Trend 图表查询
-
-| 查询维度 | 明细表 SQL | 聚合表 SQL |
-|---------|-----------|-----------|
-| **FROM** | `workflow_runs FINAL` | `workflow_run_count` |
-| **时间过滤** | `created_at` DateTime64 | `date` Date |
-| **分组粒度** | `toDate(created_at)` 天级 | `date` 天级 |
-| **状态分组** | `status` 字段 (枚举) | `event_type` 字段 (字符串) |
-| **兼容处理** | 兼容 `pending/success` 旧值 | 仅支持新标准值 |
-
----
-
-### 6.3 Workflow Runs Count 图表查询
-
-| 查询维度 | 明细表 SQL | 聚合表 SQL |
-|---------|-----------|-----------|
-| **FROM** | `workflow_runs FINAL` | `workflow_run_count` |
-| **过滤条件** | 8 种动态条件构建 | 仅租户 + 时间范围 |
-| **计数** | `count(*)` | `sum(count)` |
-| **性能** | O(N) 全表扫描 | O(1) 预聚合 |
-
----
-
-### 6.4 Workflow Runs Metric 图表查询 (仅明细表)
-
-```sql
--- 当前周期
-SELECT count(*) as count FROM workflow_runs FINAL
-WHERE
-  environment_id = {environmentId:String}
-  AND organization_id = {organizationId:String}
-  AND created_at >= {startDate:DateTime64(3)}
-  AND created_at <= {endDate:DateTime64(3)}
-  ${workflowFilter}
-
--- 前一周期
-SELECT count(*) as count FROM workflow_runs FINAL
-WHERE
-  environment_id = {environmentId:String}
-  AND organization_id = {organizationId:String}
-  AND created_at >= {previousStartDate:DateTime64(3)}
-  AND created_at <= {previousEndDate:DateTime64(3)}
-  ${workflowFilter}
-```
-
----
-
-## 7. 时间分桶逻辑差异
-
-### 7.1 明细表分桶逻辑
-
-**文件位置**: `apps/api/src/app/activity/usecases/build-workflow-runs-trend-chart/build-workflow-runs-trend-chart.usecase.ts:109-125`
-
-```typescript
-// 应用层 Gap Filling - 确保每天都有数据点
-const currentDate = new Date(startDate);
-while (currentDate <= endDate) {
-  const dateKey = currentDate.toISOString().split('T')[0];
-  chartDataMap.set(dateKey, new Map([
-    ['pending', 0],      // 向后兼容旧值
-    ['processing', 0],
-    ['success', 0],      // 向后兼容旧值
-    ['completed', 0],
-    ['error', 0],
-  ]));
-  currentDate.setDate(currentDate.getDate() + 1);
-}
-```
-
-### 7.2 聚合表分桶逻辑
-
-**文件位置**: `apps/api/src/app/activity/usecases/build-workflow-runs-trend-chart/build-workflow-runs-trend-chart.usecase.ts:55-67`
-
-```typescript
-const dataByDate = new Map<string, WorkflowRunsTrendDataPointDto>();
-
-const currentDate = new Date(startDate);
-while (currentDate <= endDate) {
-  const dateKey = currentDate.toISOString().split('T')[0];
-  dataByDate.set(dateKey, {
-    timestamp: dateKey,
-    processing: 0,  // ⚠️ 无兼容字段
-    completed: 0,   // ⚠️ 无兼容字段
-    error: 0,       // ⚠️ 无兼容字段
-  });
-  currentDate.setDate(currentDate.getDate() + 1);
-}
-```
-
-**⚠️ 差异点**:
-- 明细表路径保留 `pending` / `success` 向后兼容逻辑
-- 聚合表路径无兼容逻辑，只支持新标准状态值
-- 迁移后，历史数据的旧状态值可能统计缺失
-
----
-
-## 8. 状态枚举兼容处理
-
-### 8.1 状态枚举演进
-
-**文件位置**: `libs/application-generic/src/services/analytic-logs/workflow-run/workflow-run.schema.ts:79-91`
-
-```typescript
-export enum WorkflowRunStatusEnum {
-  /** @deprecated please use processing instead nv-6562 */
-  PENDING = 'pending',
-  PROCESSING = 'processing',
-  /** @deprecated please use COMPLETED instead nv-6562 */
-  SUCCESS = 'success',
-  COMPLETED = 'completed',
-  ERROR = 'error',
-}
-```
-
-### 8.2 明细表路径兼容逻辑
-
-```typescript
-// build-workflow-runs-count-chart.usecase.ts:98-112
-const mappedStatuses = statuses.map((status) => {
-  // backward compatibility: if new statuses are used, append old status until renewed in the database, nv-6562
-  if (status === WorkflowRunStatusDtoEnum.PROCESSING) {
-    return [WorkflowRunStatusEnum.PENDING, WorkflowRunStatusEnum.PROCESSING];
-  }
-  if (status === WorkflowRunStatusDtoEnum.COMPLETED) {
-    return [WorkflowRunStatusEnum.SUCCESS, WorkflowRunStatusEnum.COMPLETED];
-  }
-  if (status === WorkflowRunStatusDtoEnum.ERROR) {
-    return [WorkflowRunStatusEnum.ERROR];
-  }
-  return status;
-});
-```
-
-### 8.3 聚合表路径 - 无兼容
-
-```typescript
-// build-workflow-runs-trend-chart.usecase.ts:75-84
-switch (workflowRun.event_type) {
-  case 'workflow_run_status_processing':
-    updatedDataPoint.processing += count;
-    break;
-  case 'workflow_run_status_completed':
-    updatedDataPoint.completed += count;
-    break;
-  case 'workflow_run_status_error':
-    updatedDataPoint.error += count;
-    break;
-  // ⚠️ 没有 pending / success 的映射处理
-}
-```
-
----
-
 ## 附录: 关键文件索引
 
 | 模块 | 文件路径 |
@@ -694,12 +553,13 @@ switch (workflowRun.event_type) {
 | 明细表 Repository | `libs/application-generic/src/services/analytic-logs/workflow-run/` |
 | 聚合表 Repository | `libs/application-generic/src/services/analytic-logs/workflow-run-count/` |
 | 基类隔离逻辑 | `libs/application-generic/src/services/analytic-logs/log.repository.ts` |
-| NotificationTemplate 名称映射 | `libs/dal/src/repositories/notification-template/notification-template.repository.ts` |
+| **NotificationTemplate 名称映射** | **`libs/dal/src/repositories/notification-template/notification-template.repository.ts`** |
 | 迁移脚本 4 | `apps/api/migrations/clickhouse-migrations/4_refactor_traces_schema.sql` |
 | 迁移脚本 5 | `apps/api/migrations/clickhouse-migrations/5_finalize_table_exchange.sql` |
 
 ---
 
-**报告版本**: v2.0 (补充核查版)
+**报告版本**: v3.0 (安全风险细化版)
 **生成时间**: 2026-05-16
 **代码版本**: Novu v192 工作流图表模块
+**核心更新**: 新增第 5 节 - 跨环境名称映射泄露风险的完整细化对账，包含可执行验证步骤
