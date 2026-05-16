@@ -186,28 +186,46 @@ async findByTriggerIdentifierBulk<K extends keyof NotificationTemplateEntity>(
 
 ### 5.6 可直接执行的验证步骤清单
 
+---
+
 #### 🔍 验证步骤 1: 检查代码中 organizationId 过滤缺失
 
-**执行路径**:
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 静态代码检查确认 MongoDB 查询层面是否缺少组织隔离条件 |
+| **执行路径** | 代码审计，无需运行服务 |
+| **✅ 通过阈值** | 同时满足两个条件：<br>1. `_environmentId: environmentId` 条件明确存在<br>2. `_organizationId: organizationId` 条件明确存在 |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. `_organizationId` 查询条件缺失<br>2. `_organizationId` 参数未从方法签名传入<br>3. `_organizationId` 值硬编码为固定值 |
+| **⚠️ 异常分支处理** | <br>• 方法被多处调用 → 追踪所有调用点，确认每个调用链都正确传参<br>• 方法被其他模块复用 → 检查复用场景的权限边界<br>• 代码使用 Query Builder 动态构建 → 检查所有构建分支<br>• 代码存在条件分支构建查询 → 检查每个分支都包含组织过滤 |
+| **🔄 回滚准则** | <br>• 发现缺少组织过滤 → 立即暂停 Feature Flag 灰度<br>• 无法快速修复 → 回滚到明细表查询路径（安全但性能下降）<br>• 修复后必须通过所有后续验证步骤才可重新开启灰度 |
+
+**执行命令**:
 
 ```bash
 # 1. 定位到目标文件
 cd libs/dal/src/repositories/notification-template
 
 # 2. 查看 findByTriggerIdentifierBulk 方法实现
-cat notification-template.repository.ts | grep -A 25 "findByTriggerIdentifierBulk"
+cat notification-template.repository.ts | grep -A 30 "findByTriggerIdentifierBulk"
 
-# 预期观察点:
-# ✅ 存在: _environmentId: environmentId
-# ❌ 缺失: _organizationId 过滤条件
+# 3. 查找所有调用该方法的地方
+grep -r "findByTriggerIdentifierBulk" --include="*.ts" .
 ```
 
-**验证命令输出示例**:
+**验证输出检查清单**:
 ```typescript
+// ✅ PASS: 双隔离条件都存在
 const requestQuery: NotificationTemplateQuery = {
-  _environmentId: environmentId,  // ✅ 存在
+  _environmentId: environmentId,    // ✅ 环境隔离 - 存在
+  _organizationId: organizationId,  // ✅ 组织隔离 - 存在
   'triggers.identifier': { $in: identifiers },
-  // ❌ 此处缺少 _organizationId 条件
+};
+
+// ❌ FAIL: 缺少组织隔离
+const requestQuery: NotificationTemplateQuery = {
+  _environmentId: environmentId,    // ✅ 环境隔离 - 存在
+  // ⚠️ 组织隔离 - 缺失（失败）
+  'triggers.identifier': { $in: identifiers },
 };
 ```
 
@@ -215,14 +233,22 @@ const requestQuery: NotificationTemplateQuery = {
 
 #### 🔍 验证步骤 2: 数据库中 identifier 冲突检测
 
-**Mongo Shell 执行**:
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 检测生产环境中是否已经存在跨组织的 trigger_identifier 冲突 |
+| **执行路径** | MongoDB 聚合查询，只读操作 |
+| **✅ 通过阈值** | 两个层级的通过标准：<br>1. 聚合查询返回空结果 → 无冲突，完全安全<br>2. 查询返回冲突但冲突组织 ID 完全相同 → 组织内不同工作流重名，无越权风险 |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. 查询结果中 `organization_ids` 数组长度 ≥ 2<br>2. 同一 `trigger_identifier` 对应不同组织的工作流<br>3. 冲突数量 ≥ 3 条 → 系统性命名冲突问题 |
+| **⚠️ 异常分支处理** | <br>• 发现少量冲突（1-2条） → 记录冲突组织，沟通重命名后继续灰度<br>• 发现大量冲突（≥5条） → 暂停灰度，先统一清理命名<br>• 冲突涉及重要客户 → 优先处理该客户的命名调整<br>• 空字符串或 null identifier → 过滤掉不纳入统计 |
+| **🔄 回滚准则** | <br>• 冲突数量 ≥ 3 条 → 暂停 Feature Flag 开启计划<br>• 存在可验证的实际越权场景 → 立即关闭已开启的 Flag<br>• 冲突清理完成后重新执行本步骤验证 |
+
+**Mongo Shell 执行脚本**（含统计输出）:
 
 ```javascript
-// 连接到 Novu 主数据库
 use novu;
 
-// 查询: 同一 Environment 下跨组织的 identifier 冲突
-db.notification_templates.aggregate([
+// Step 1: 检测跨组织冲突
+const conflictResults = db.notification_templates.aggregate([
   { $unwind: "$triggers" },
   { $group: {
     _id: {
@@ -241,135 +267,281 @@ db.notification_templates.aggregate([
     trigger_identifier: "$_id.trigger_identifier",
     environment_id: "$_id.environment_id",
     conflict_count: "$count",
+    org_count: { $size: "$organization_ids" },
     organization_ids: 1,
     template_names: 1,
     _id: 0
   }}
-]).pretty();
-```
+]).toArray();
 
-**结果解读**:
-- 空结果: ✅ 无冲突
-- 有结果: ⚠️ 发现跨组织 identifier 冲突，记录冲突详情
+// Step 2: 输出结果判定
+print("=== 跨组织 Identifier 冲突检测报告 ===");
+print("总冲突数:", conflictResults.length);
+
+if (conflictResults.length === 0) {
+  print("✅ PASS: 无跨组织 identifier 冲突");
+} else {
+  print("⚠️ FAIL: 发现", conflictResults.length, "处跨组织冲突");
+  conflictResults.forEach((c, i) => {
+    print(`\n冲突 #${i+1}:`);
+    print(`  Trigger: ${c.trigger_identifier}`);
+    print(`  环境: ${c.environment_id}`);
+    print(`  涉及组织数: ${c.org_count}`);
+    print(`  组织 IDs: ${c.organization_ids.join(', ')}`);
+    print(`  工作流名称: ${c.template_names.join(', ')}`);
+  });
+}
+
+// Step 3: 判定结果
+const isPass = conflictResults.length === 0;
+print("\n=== 最终判定: " + (isPass ? "✅ PASS" : "❌ FAIL") + " ===");
+```
 
 ---
 
 #### 🔍 验证步骤 3: 构造冲突场景功能测试
 
-**测试准备**:
-1. 两个组织账号: OrgA, OrgB
-2. 创建同一 Environment (env-123)
-3. OrgA 创建工作流 trigger: `test-conflict-trigger`
-4. OrgB 创建工作流 trigger: `test-conflict-trigger`
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 人工构造越权访问场景，验证安全边界是否生效 |
+| **执行路径** | 功能测试，需要测试环境账号 |
+| **✅ 通过阈值** | 三个层级全部通过：<br>1. OrgA API 响应仅包含 OrgA 的工作流名称<br>2. OrgB API 响应仅包含 OrgB 的工作流名称<br>3. 即使 identifier 完全相同，名称也按组织正确隔离 |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. OrgA 响应中出现 OrgB 的工作流名称<br>2. OrgB 响应中出现 OrgA 的工作流名称<br>3. 响应中出现 null / undefined / 空名称 |
+| **⚠️ 异常分支处理** | <br>• 创建工作流失败 → 排查 API Key 和环境权限<br>• 相同 identifier 也能成功创建 → 说明无唯一性校验，确认风险存在<br>• 测试环境无数据 → 先发送测试消息生成统计数据<br>• 数量太少 TOP 5 不显示 → 多发消息让工作流进入排名 |
+| **🔄 回滚准则** | <br>• 测试失败 → 立即停止所有灰度并关闭已开启的 Flag<br>• 测试通过但生产有冲突数据 → 先清理数据再开启灰度<br>• 修复后必须重新执行本步骤验证 |
 
-**测试执行**:
-```typescript
-// 1. 使用 OrgA 的用户 Token 调用图表 API
-// GET /v1/activity/charts?reportType[]=workflow-by-volume
+**标准测试流程**:
 
-// 2. 验证响应中的工作流名称列表
-// ✅ 预期: 仅包含 OrgA 的工作流名称
-// ❌ 异常: 出现 OrgB 的工作流名称
+```bash
+# =========================================
+# 阶段 1: 测试环境准备
+# =========================================
 
-// 3. 使用 curl 实际验证
-curl -X GET "https://api.novu.co/v1/activity/charts?reportType[]=workflow-by-volume" \
+# 1.1 创建 OrgA 工作流 (Trigger ID: security-test-trigger)
+curl -X POST "https://api.novu.co/v1/workflows" \
   -H "Authorization: ApiKey <ORG_A_API_KEY>" \
-  -H "Content-Type: application/json"
+  -H "Content-Type: application/json" \
+  -d '{"name":"OrgA-Test-Workflow","triggerIdentifier":"security-test-trigger",...}'
 
-// 检查响应 data 中的工作流名称
+# 1.2 创建 OrgB 同名 trigger 工作流
+curl -X POST "https://api.novu.co/v1/workflows" \
+  -H "Authorization: ApiKey <ORG_B_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"OrgB-Test-Workflow","triggerIdentifier":"security-test-trigger",...}'
+
+# 1.3 两边分别发送测试消息（让数据进入统计）
+for i in {1..10}; do
+  curl -X POST "https://api.novu.co/v1/events/trigger" \
+    -H "Authorization: ApiKey <ORG_A_API_KEY>" \
+    -d '{"name":"security-test-trigger","to":{"subscriberId":"test-user"}}'
+done
+
+# =========================================
+# 阶段 2: 执行越权测试
+# =========================================
+
+# 2.1 使用 OrgA 凭证查询图表
+curl -s "https://api.novu.co/v1/activity/charts?reportType[]=workflow-by-volume" \
+  -H "Authorization: ApiKey <ORG_A_API_KEY>" | jq '.data' > orgA-response.json
+
+# 2.2 验证 OrgA 响应中不应出现 OrgB 的工作流名称
+if grep -q "OrgB-Test-Workflow" orgA-response.json; then
+  echo "❌ FAIL: OrgA 响应中发现 OrgB 的工作流名称 - 越权泄露"
+  exit 1
+else
+  echo "✅ PASS: OrgA 响应中仅包含 OrgA 工作流"
+fi
+
+# 2.3 反向测试：OrgB 凭证查询
+curl -s "https://api.novu.co/v1/activity/charts?reportType[]=workflow-by-volume" \
+  -H "Authorization: ApiKey <ORG_B_API_KEY>" | jq '.data' > orgB-response.json
+
+if grep -q "OrgA-Test-Workflow" orgB-response.json; then
+  echo "❌ FAIL: OrgB 响应中发现 OrgA 的工作流名称 - 越权泄露"
+  exit 1
+else
+  echo "✅ PASS: OrgB 响应中仅包含 OrgB 工作流"
+fi
 ```
 
 ---
 
 #### 🔍 验证步骤 4: 对比明细/聚合双路径查询结果
 
-**验证点**: 同环境同用户，开启/关闭 Flag 的名称列表一致性
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 验证双查询路径的数据一致性，确保聚合表路径没有越权数据 |
+| **执行路径** | A/B 对比测试，需要 Feature Flag 控制权限 |
+| **✅ 通过阈值** | 数据完全一致：<br>1. 工作流名称集合完全相等（子集相等 → 实际相等）<br>2. 每个工作流的数量误差 ≤ ±1（允许 Replication 延迟）<br>3. TOP 5 排名顺序一致（或差异可解释） |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. 聚合表路径包含明细表路径没有的工作流名称<br>2. 名称完全不匹配（映射逻辑出错）<br>3. 数量误差 > 5 条（排除时间窗口差异） |
+| **⚠️ 异常分支处理** | <br>• 聚合表数据比明细表少 → 正常：聚合表只统计最近数据<br>• 数量有轻微差异（2-5条） → 归因于物化视图延迟，等待 5 分钟重试<br>• 名称有微小差异（大小写、空格） → 规范化后比较<br>• 工作流在 Flag 切换期间刚创建 → 等待聚合表同步 |
+| **🔄 回滚准则** | <br>• 发现额外工作流名称 → 立即关闭 Flag<br>• 名称完全不匹配 → 检查 mapping 逻辑，暂停灰度<br>• 差异无法解释 → 回滚到明细表路径，深入调查 |
+
+**标准化验证脚本**:
 
 ```typescript
-// 1. 关闭 Feature Flag (IS_WORKFLOW_RUN_COUNT_ENABLED = false)
-// 查询明细表路径，获取工作流名称列表 → 基准结果
+// =========================================
+// 双路径对比测试脚本
+// =========================================
 
-// 2. 开启 Feature Flag (IS_WORKFLOW_RUN_COUNT_ENABLED = true)
-// 查询聚合表路径，获取工作流名称列表 → 验证结果
+interface WorkflowVolume {
+  workflowName: string;
+  count: number;
+}
 
-// 3. 对比两次结果的差异
-const expected = new Set(['Workflow-A', 'Workflow-B']);  // 明细表结果
-const actual = new Set(['Workflow-A', 'Workflow-B', 'Workflow-From-OrgB']);  // 聚合表结果
+function normalizeName(name: string): string {
+  return name.toLowerCase().replace(/\s+/g, ' ').trim();
+}
 
-// ✅ 一致: 无越权泄露
-// ❌ 差异: actual 包含 expected 以外的项目
+function compareResults(detailResults: WorkflowVolume[], aggregatedResults: WorkflowVolume[]): {
+  pass: boolean;
+  issues: string[];
+} {
+  const issues: string[] = [];
+  
+  // 1. 名称集合对比
+  const detailNames = new Set(detailResults.map(r => normalizeName(r.workflowName)));
+  const aggregatedNames = new Set(aggregatedResults.map(r => normalizeName(r.workflowName)));
+  
+  // 检查聚合表是否有额外名称（越权泄露）
+  for (const name of aggregatedNames) {
+    if (!detailNames.has(name)) {
+      issues.push(`越权风险: 聚合表包含明细表没有的工作流名称 '${name}'`);
+    }
+  }
+  
+  // 2. 数量对比（允许误差 ±1）
+  const detailMap = new Map(detailResults.map(r => [normalizeName(r.workflowName), r.count]));
+  for (const aggregated of aggregatedResults) {
+    const normName = normalizeName(aggregated.workflowName);
+    const detailCount = detailMap.get(normName);
+    
+    if (detailCount !== undefined && Math.abs(aggregated.count - detailCount) > 1) {
+      issues.push(`数量差异: '${aggregated.workflowName}' 明细=${detailCount}, 聚合=${aggregated.count}`);
+    }
+  }
+  
+  return {
+    pass: issues.length === 0,
+    issues
+  };
+}
+
+// 执行测试流程:
+// 1. 关闭 Flag → 调用 API → 保存 detailResults
+// 2. 开启 Flag → 调用同一 API → 保存 aggregatedResults
+// 3. compareResults(detailResults, aggregatedResults)
+// 4. pass=true → 继续下一验证步骤
+//    pass=false → 记录 issues，执行回滚
 ```
 
 ---
 
 #### 🔍 验证步骤 5: 代码修复验证
 
-**修复代码示例**：
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 确认修复方案正确解决了安全问题，无回归风险 |
+| **执行路径** | 修复后全量回归测试 |
+| **✅ 通过阈值** | 修复后所有前置步骤全部通过：<br>1. 步骤 1 通过：代码中双隔离条件均存在<br>2. 步骤 2 通过：（如有）冲突已清理或不影响<br>3. 步骤 3 通过：构造场景测试无越权泄露<br>4. 步骤 4 通过：双路径数据一致<br>5. 所有调用点均已更新，无遗漏 |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. 任何前置步骤失败<br>2. 存在遗漏的调用点未修复<br>3. TypeScript 类型错误未解决<br>4. 编译 / 单元测试失败 |
+| **⚠️ 异常分支处理** | <br>• 第三方模块也调用了该方法 → 检查第三方是否需要传组织参数<br>• 调用点分散在多个仓库 → 逐个仓库检查，确保同步发布<br>• 修复引入 Breaking Change → 保持向后兼容：organizationId 可选参数，内部校验必须传入<br>• 有测试覆盖该方法 → 更新测试用例包含组织参数断言 |
+| **🔄 回滚准则** | <br>• 修复验证失败 → 回滚修复代码，评估影响范围<br>• 修复引入其他 Bug → 回滚到未修改版本，重新设计修复方案<br>• 无法在发布窗口内完成 → 推迟灰度计划 |
 
-```typescript
-// 文件: notification-template.repository.ts
-// 修改前:
-async findByTriggerIdentifierBulk(
-  environmentId: string,
-  identifiers: string[],
-  options: { session?: ClientSession | null; select?: K[] } = {}
-) {
-  const requestQuery = {
-    _environmentId: environmentId,
-    'triggers.identifier': { $in: identifiers },
-    // ⚠️ 缺少组织过滤
-  };
-  // ...
-}
+**修复验证清单**:
 
-// 修改后:
-async findByTriggerIdentifierBulk(
-  environmentId: string,
-  organizationId: string,  // ✅ 新增组织参数
-  identifiers: string[],
-  options: { session?: ClientSession | null; select?: K[] } = {}
-) {
-  const requestQuery = {
-    _environmentId: environmentId,
-    _organizationId: organizationId,  // ✅ 新增组织过滤
-    'triggers.identifier': { $in: identifiers },
-  };
-  // ...
-}
+```markdown
+✅ 修复代码验证清单
+-----------------
+[ ] 1. Repository 方法签名已新增 organizationId 参数
+[ ] 2. MongoDB 查询条件包含 _organizationId 过滤
+[ ] 3. 所有调用点均传入了正确的 organizationId（从 Session 取值）
+[ ] 4. TypeScript 类型检查通过：tsc --noEmit
+[ ] 5. 相关单元测试通过
+[ ] 6. 步骤 2 数据库冲突检测重新执行通过
+[ ] 7. 步骤 3 构造场景功能测试重新执行通过
+[ ] 8. 步骤 4 双路径对比重新执行通过
+[ ] 9. 接口文档同步更新（如有）
+[ ] 10. CHANGELOG 记录安全修复说明
 ```
-
-**回归验证**:
-1. 修复后执行步骤 2 的数据库冲突检测
-2. 即使存在 identifier 冲突，查询结果也应正确过滤
-3. 执行步骤 3-4 的功能测试，确认名称列表仅包含当前组织工作流
 
 ---
 
 #### 🔍 验证步骤 6: ClickHouse 聚合表组织隔离复核
 
-```sql
--- 验证 WorkflowRunCountRepository 中的 organizationId 过滤
--- 实际执行的 SQL 检查:
+| 标准项 | 详细定义 |
+|-------|---------|
+| **验证目的** | 确认 ClickHouse 层查询严格按组织隔离，防止跨组织数据泄露 |
+| **执行路径** | 代码审计 + 实际 SQL 日志核查 |
+| **✅ 通过阈值** | 三层防护均满足：<br>1. SQL 字符串中明确包含 `organization_id = {organizationId:String}` 条件<br>2. 参数绑定使用预编译语句，非字符串拼接<br>3. organizationId 值来源为 User Session，非用户可控制输入 |
+| **❌ 失败判定** | 任一条件成立即失败：<br>1. WHERE 子句缺少 organization_id 条件<br>2. organization_id 条件使用 OR 连接（可能被绕过）<br>3. 参数值可被用户通过 API 参数控制<br>4. 使用字符串拼接构造 SQL（注入风险） |
+| **⚠️ 异常分支处理** | <br>• 使用 Query Builder 动态构建 → 检查所有分支都包含 AND 条件<br>• 有多个 environment_id / organization_id 条件 → 确认逻辑正确<br>• SQL 注释中提到 organization_id → 确认实际执行也包含<br>• 多表 JOIN 查询 → 确认每个表都有正确的组织过滤条件 |
+| **🔄 回滚准则** | <br>• ClickHouse 层缺少组织过滤 → 极高风险，立即停止所有灰度<br>• 无法快速修复 → 回滚到明细表查询路径<br>• 修复后执行安全渗透测试确认 |
 
-SELECT
-  workflow_run_id,
-  sum(count) as count
+**SQL 审计检查清单**:
+
+```sql
+-- ✅ PASS: 正确的双隔离查询
+SELECT workflow_run_id, sum(count) as count
 FROM workflow_run_count
 WHERE
-  environment_id = {environmentId:String}
-  AND organization_id = {organizationId:String}  -- ✅ 确认存在
+  environment_id = {environmentId:String}   -- ✅ 预编译参数绑定
+  AND organization_id = {organizationId:String}  -- ✅ AND 连接，不可绕过
   AND date >= {startDate:Date}
   AND date <= {endDate:Date}
-  AND event_type = 'workflow_run_status_processing'
 GROUP BY workflow_run_id
 ORDER BY count DESC
 LIMIT 5;
+
+-- ⚠️ FAIL: 缺少组织过滤
+SELECT workflow_run_id, sum(count) as count
+FROM workflow_run_count
+WHERE
+  environment_id = {environmentId:String}
+  -- ❌ organization_id 条件缺失
+  AND date >= {startDate:Date}
+GROUP BY workflow_run_id;
+
+-- ⚠️ FAIL: OR 连接可能被绕过
+WHERE
+  environment_id = {environmentId:String}
+  OR organization_id = {organizationId:String}  -- ❌ 使用 OR，可被绕过
 ```
 
-**验证点**:
-- ✅ `organization_id` 条件存在且正确绑定参数
-- ✅ 参数值来自 User Session，非用户可控输入
-- ✅ ClickHouse 层面的组织隔离已生效
+---
+
+### 5.6.1 验证结果判定矩阵
+
+| 步骤 | 失败 → 风险等级 | 行动 |
+|-----|---------------|-----|
+| Step 1 (代码检查) | 🔴 高 | 立即暂停灰度计划，修复后重新开始 |
+| Step 2 (数据库冲突) | 🟡 中 | 少量冲突 → 沟通清理后继续；大量冲突 → 暂停 |
+| Step 3 (功能测试) | 🔴 高 | 立即关闭所有已开启的 Flag，修复后验证 |
+| Step 4 (双路径对比) | 🟠 中高 | 发现额外名称 → 关闭 Flag；数量差异 → 调查原因 |
+| Step 5 (修复验证) | 🟡 中 | 修复验证失败 → 回滚修复代码 |
+| Step 6 (ClickHouse 审计) | 🔴 高 | 立即停止所有灰度，安全团队介入调查 |
+
+---
+
+### 5.6.2 全量验证通过标准
+
+**只有同时满足以下所有条件，才可判定验证通过，允许继续 Feature Flag 灰度**:
+
+```markdown
+✅ 全部验证通过标准
+------------------
+[ ] Step 1: 代码静态检查 - 双隔离条件均存在
+[ ] Step 2: 数据库冲突检测 - 无跨组织冲突 或 冲突已清理
+[ ] Step 3: 构造场景功能测试 - 无越权泄露
+[ ] Step 4: 双路径数据对比 - 结果完全一致
+[ ] Step 5: 修复验证 - 所有回归测试通过
+[ ] Step 6: ClickHouse 审计 - 组织隔离正确
+
+满足所有条件 → ✅ 验证通过，可继续灰度
+任一条件不满足 → ❌ 验证不通过，执行对应回滚措施
+```
+
+---
 
 ---
 
