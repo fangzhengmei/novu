@@ -4,8 +4,6 @@
 
 本文档详细分析了 Novu 项目中 WhatsApp 通道的访问令牌从录入、加密保存，到发送消息时取出校验的完整流程，涵盖凭据管理、provider 选择以及失败处理机制。
 
-**重要修正**：上版报告中关于 `check` 参数触发 WhatsApp 校验的描述有误。实际上 `CheckIntegration` usecase 仅支持 EMAIL 通道，对 WhatsApp 无校验效果。WhatsApp 令牌校验需通过独立的手动校验接口完成。
-
 ## 2. 凭据结构定义
 
 ### 2.1 WhatsApp Business 凭据字段
@@ -36,63 +34,52 @@ export const secureCredentials: CredentialsKeyEnum[] = [
 ];
 ```
 
-## 3. 令牌校验链路（关键修正）
+## 3. 令牌校验链路（三条独立路径）
 
-### 3.1 两条校验链路的真实调用关系
+WhatsApp 令牌校验存在三条独立链路，边界清晰，适用场景不同：
 
-WhatsApp 令牌校验存在两条独立链路，二者**无关联**：
+| 链路 | 触发方式 | 对 WhatsApp 是否生效 | 调用组件 | 校验目的 |
+|------|----------|----------------------|----------|----------|
+| **链路 A：保存前手动校验** | 调用独立 API 接口 | ✅ 完全生效 | `WhatsAppValidateToken` usecase | 保存前验证令牌有效性、权限范围、资源归属 |
+| **链路 B：create/update 内置 check** | 创建/更新时传 `check: true` | ❌ 无效 | `CheckIntegration` usecase | 仅支持 EMAIL 通道 |
+| **链路 C：Agent Webhook 自动配置校验** | 配置 webhook 时自动触发 | ✅ 完全生效 | `ConfigureWhatsAppWebhook` usecase | 验证令牌有效性，获取 appId 用于 webhook 注册 |
 
-| 链路 | 触发方式 | 对 WhatsApp 是否生效 | 调用组件 |
-|------|----------|----------------------|----------|
-| **链路 A：保存前手动校验** | 调用独立 API 接口 | ✅ 生效 | `WhatsAppValidateToken` usecase |
-| **链路 B：create/update 内置 check** | 创建/更新时传 `check: true` | ❌ 无效 | `CheckIntegration` usecase（仅支持 EMAIL） |
+### 3.1 链路 A：保存前手动校验接口（推荐使用）
 
-### 3.2 链路 A：保存前手动校验接口（推荐使用）
+这是 WhatsApp 令牌校验的**完整验证路径**，覆盖令牌有效性、权限范围、电话号码归属、WABA 可访问性等全维度检查。
 
-这是 WhatsApp 令牌校验的**唯一有效路径**。
-
-#### 3.2.1 接口定义
+#### 3.1.1 接口定义
 
 - **端点**：`POST /integrations/whatsapp/validate-token`
 - **位置**：`apps/api/src/app/integrations/integrations.controller.ts:783-806`
 - **用途**：在保存集成前，调用 Meta Graph API 验证令牌有效性，用于 Dashboard 表单实时校验
 
-#### 3.2.2 调用流程
+#### 3.1.2 真实返回结构
+
+根据 `WhatsAppValidateTokenResponseDto`（`apps/api/src/app/integrations/dtos/whatsapp-validate-token.dto.ts:50-92`），真实返回字段如下：
 
 ```typescript
-@Post('/whatsapp/validate-token')
-async validateWhatsAppToken(
-  @UserSession() user: UserSessionData,
-  @Body() body: WhatsAppValidateTokenRequestDto
-): Promise<WhatsAppValidateTokenResponseDto> {
-  return this.whatsAppValidateTokenUsecase.execute(
-    WhatsAppValidateTokenCommand.create({
-      userId: user._id,
-      organizationId: user.organizationId,
-      accessToken: body.accessToken,
-      phoneNumberIdentification: body.phoneNumberIdentification,
-      businessAccountId: body.businessAccountId,
-    })
-  );
+interface WhatsAppValidateTokenResponseDto {
+  valid: boolean;                    // 令牌是否可用
+  hasManagementScope: boolean;       // 是否有 whatsapp_business_management 权限
+  hasMessagingScope: boolean;        // 是否有 whatsapp_business_messaging 权限
+  scopes: string[];                  // 授予的所有 OAuth 权限列表
+  expiresAt?: number;                // 令牌过期时间（Unix 秒），永不过期则省略
+  wabaId?: string;                   // WhatsApp Business Account ID
+  phoneNumberId?: string;            // 电话号码 ID（从请求回显）
+  displayPhoneNumber?: string;       // 电话号码显示格式（如 +1 555-123-4567）
+  verifiedName?: string;             // 电话号码对应的企业认证名称
+  error?: {                          // 校验失败时填充
+    code: WhatsAppValidateTokenError['code'];  // 机器可读错误码
+    message: string;                 // 人类可读错误信息
+  };
 }
 ```
 
-#### 3.2.3 校验逻辑
+#### 3.1.3 错误码说明
 
-在 `WhatsAppValidateToken` usecase 中（`apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:48-269`）：
-
-1. 调用 Meta Graph API 的 `debug_token` 端点验证令牌
-2. 检查必需的权限范围（`whatsapp_business_messaging`）
-3. 验证电话号码 ID 是否属于该令牌
-4. 验证 WABA ID 是否可访问
-5. 交叉验证电话号码 ID 是否属于指定的 WABA
-
-#### 3.2.4 返回结果
-
-成功时返回可用的 scopes 和 WABA ID；失败时返回结构化错误：
-
-| 错误代码 | 说明 |
-|----------|------|
+| 错误码 | 说明 |
+|--------|------|
 | `invalid_token` | 令牌无效 |
 | `expired_token` | 令牌过期 |
 | `phone_not_found` | 电话号码不存在 |
@@ -100,15 +87,48 @@ async validateWhatsAppToken(
 | `waba_not_accessible` | WABA 不可访问 |
 | `waba_phone_mismatch` | 电话号码不属于该 WABA |
 | `missing_messaging_scope` | 缺少消息发送权限 |
+| `unknown` | 未知错误 |
 
-### 3.3 链路 B：create/update 内置 check 流程（对 WhatsApp 无效）
+#### 3.1.4 成功返回示例
 
-#### 3.3.1 代码位置
+```json
+{
+  "valid": true,
+  "hasManagementScope": true,
+  "hasMessagingScope": true,
+  "scopes": ["whatsapp_business_management", "whatsapp_business_messaging"],
+  "expiresAt": 1767225600,
+  "wabaId": "1234567890123456",
+  "phoneNumberId": "9876543210987654",
+  "displayPhoneNumber": "+1 555-123-4567",
+  "verifiedName": "Acme Inc."
+}
+```
+
+#### 3.1.5 失败返回示例
+
+```json
+{
+  "valid": false,
+  "hasManagementScope": false,
+  "hasMessagingScope": true,
+  "scopes": ["whatsapp_business_messaging"],
+  "expiresAt": 1767225600,
+  "error": {
+    "code": "missing_management_scope",
+    "message": "This token is missing the \"whatsapp_business_management\" permission needed for auto-configure."
+  }
+}
+```
+
+### 3.2 链路 B：create/update 内置 check 流程（对 WhatsApp 无效）
+
+#### 3.2.1 代码位置
 
 - `CreateIntegration.execute()`: `apps/api/src/app/integrations/usecases/create-integration/create-integration.usecase.ts:159-169`
 - `UpdateIntegration.execute()`: `apps/api/src/app/integrations/usecases/update-integration/update-integration.usecase.ts:151-161`
 
-#### 3.3.2 调用代码
+#### 3.2.2 调用代码
 
 ```typescript
 // CreateIntegration 中
@@ -125,7 +145,7 @@ if (command.check && !isAgentKind) {
 }
 ```
 
-#### 3.3.3 为什么对 WhatsApp 无效
+#### 3.2.3 为什么对 WhatsApp 无效
 
 `CheckIntegration` usecase 仅支持 EMAIL 通道（`apps/api/src/app/integrations/usecases/check-integration/check-integration.usecase.ts:10-25`）：
 
@@ -146,11 +166,130 @@ public async execute(command: CheckIntegrationCommand) {
 
 **结论**：当创建/更新 WhatsApp 集成时传入 `check: true`，代码会执行但**不执行任何实际校验**，直接静默通过。
 
-## 4. 凭据录入与加密保存流程
+### 3.3 链路 C：Agent Webhook 自动配置校验
 
-### 4.1 录入流程
+这是在配置 Agent WhatsApp webhook 时**自动触发**的校验路径，主要目的是验证令牌有效性并获取 Meta App ID。
 
-#### 4.1.1 自动生成 Verify Token
+#### 3.3.1 接口定义
+
+- **端点**：`POST /agents/:identifier/integrations/:integrationIdentifier/whatsapp/auto-configure`
+- **位置**：`apps/api/src/app/agents/agents.controller.ts:301-325`
+- **用途**：自动注册 Meta webhook 时，验证令牌有效性并获取 appId
+
+#### 3.3.2 校验流程
+
+在 `ConfigureWhatsAppWebhook` usecase 中（`apps/api/src/app/agents/usecases/configure-whatsapp-webhook/configure-whatsapp-webhook.usecase.ts:169-181`）：
+
+```typescript
+// 从已保存的集成中解密凭据
+const credentials = decryptCredentials(integration.credentials ?? {});
+const accessToken = typeof credentials.apiToken === 'string' ? credentials.apiToken.trim() : '';
+
+// 调用 debugAccessToken 验证令牌并获取 appId
+let appId: string | undefined;
+try {
+  const debug = await debugAccessToken(accessToken);
+  appId = debug.body.data?.app_id;
+} catch (err) {
+  this.logger.warn({ err }, 'WhatsApp auto-configure: debug_token call failed');
+}
+
+if (!appId) {
+  return {
+    success: false,
+    callbackUrl,
+    wabaId,
+    fallbackToManual: true,
+    reason: {
+      code: 'unknown',
+      message: "Couldn't resolve your Meta App ID from the access token. Try regenerating the token.",
+    },
+  };
+}
+```
+
+#### 3.3.3 校验特点
+
+- **自动触发**：用户点击"自动配置 webhook"按钮时触发，无需手动调用
+- **仅验证令牌有效性**：不检查权限范围、电话号码归属等（链路 A 已做过）
+- **主要目的**：获取 Meta App ID，用于后续 webhook 注册
+- **失败处理**：返回 `fallbackToManual: true`，提示用户手动配置
+- **不保存集成**：仅读取已保存的凭据，不修改数据库
+
+## 4. 三条校验链路的边界关系与适用场景
+
+### 4.1 边界关系图
+
+```
+用户操作
+   ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  链路 A：手动校验接口 (可选)                                     │
+│  POST /integrations/whatsapp/validate-token                    │
+│  - 验证令牌有效性、权限范围、资源归属                           │
+│  - 保存前调用，提供即时反馈                                     │
+└─────────────────────────────────────────────────────────────────┘
+   ↓ （可选，用户选择是否调用）
+┌─────────────────────────────────────────────────────────────────┐
+│  集成创建/更新                                                  │
+│  POST/PUT /integrations (可选 check: true)                      │
+│  - ensureWhatsAppManagedCredentials() 生成/继承 token           │
+│  - encryptCredentials() 加密敏感字段                            │
+│  - 链路 B：checkIntegration (仅 EMAIL，对 WhatsApp 空操作)      │
+│  - 保存到数据库                                                 │
+└─────────────────────────────────────────────────────────────────┘
+   ↓ （保存成功后，用户可能执行此操作）
+┌─────────────────────────────────────────────────────────────────┐
+│  链路 C：Agent Webhook 自动配置 (可选)                           │
+│  POST /agents/.../whatsapp/auto-configure                       │
+│  - 解密已保存的凭据                                             │
+│  - 调用 debugAccessToken 验证令牌 + 获取 appId                  │
+│  - 注册 Meta webhook                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 适用场景对比表
+
+| 对比维度 | 链路 A：手动校验 | 链路 B：内置 check | 链路 C：Webhook 配置校验 |
+|----------|----------------|-------------------|------------------------|
+| **触发时机** | 保存集成前 | 创建/更新集成时 | 配置 webhook 时 |
+| **触发方式** | 用户主动调用 | 自动（传 `check: true`） | 自动（用户点击按钮） |
+| **是否修改数据库** | 否 | 是（保存集成） | 否（仅读取） |
+| **校验范围** | 完整（令牌+权限+资源归属） | 无（对 WhatsApp） | 最小（仅令牌有效性） |
+| **返回错误细节** | 详细（结构化错误码） | 无（静默通过） | 中等（返回失败原因） |
+| **推荐使用** | ✅ 推荐（保存前调用） | ❌ 不推荐 | ✅ 需要 webhook 时使用 |
+| **依赖关系** | 无前置依赖 | 独立（但无效） | 依赖链路 B 已保存凭据 |
+
+### 4.3 失败返回与错误可见性对比
+
+| 链路 | 失败返回方式 | 用户可见性 | 风险等级 |
+|------|-------------|-----------|----------|
+| **链路 A** | 同步返回结构化错误 | 高，Dashboard 实时展示 | 低，可及时修正 |
+| **链路 B** | 静默通过，无错误返回 | 无，用户无法感知 | 高，无效凭据可能被保存 |
+| **链路 C** | 返回 `success: false` + 失败原因 | 中，提示手动配置 | 中，可通过手动配置绕过 |
+
+### 4.4 风险面分析
+
+**链路 A（手动校验）风险**：
+- 无固有风险，校验失败可及时修正
+- 可选步骤，用户可能跳过直接保存
+
+**链路 B（内置 check）风险**：
+- ❗ **静默失败风险**：用户以为开启了校验，但实际上对 WhatsApp 无任何校验
+- ❗ **延迟暴露风险**：无效凭据可能在数天/数周后发送消息时才被发现
+- ❗ **用户误导风险**：`check: true` 参数给用户错误的安全感
+- ❗ **调试困难**：问题发生时难以追溯到集成创建阶段
+
+**链路 C（Webhook 配置校验）风险**：
+- 依赖已保存的凭据，如果凭据无效，自动配置失败
+- 提供 `fallbackToManual` 选项，用户可手动配置 webhook
+- 仅影响 webhook 配置，不影响消息发送（只要凭据有效）
+
+## 5. 凭据录入与加密保存流程
+
+### 5.1 录入流程
+
+#### 5.1.1 自动生成 Verify Token
 
 WhatsApp 的 Verify Token 由系统自动生成，无需用户手动输入。逻辑位于 `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-credentials.utils.ts:11-35`：
 
@@ -182,11 +321,11 @@ export function ensureWhatsAppManagedCredentials({
 }
 ```
 
-#### 4.1.2 集成创建流程
+#### 5.1.2 集成创建流程
 
 在 `CreateIntegration` usecase 中（`apps/api/src/app/integrations/usecases/create-integration/create-integration.usecase.ts:138-222`）：
 
-1. （可选）调用 `checkIntegration.execute()` - 对 WhatsApp 无效
+1. 调用 `checkIntegration.execute()` - 对 WhatsApp 无效
 2. 调用 `ensureWhatsAppManagedCredentials` 处理自动生成的字段
 3. 调用 `encryptCredentials` 加密凭据
 4. 保存到数据库
@@ -205,7 +344,7 @@ const query: IntegrationQuery = {
 };
 ```
 
-#### 4.1.3 更新集成分支：Verify Token 继承与重新加密
+#### 5.1.3 更新集成分支：Verify Token 继承与重新加密
 
 在 `UpdateIntegration` usecase 中（`apps/api/src/app/integrations/usecases/update-integration/update-integration.usecase.ts:183-193`），更新集成时的凭据处理流程：
 
@@ -234,9 +373,9 @@ if (command.credentials) {
 - 如果用户未提供 `token` 且数据库中也没有（罕见场景），生成新的 UUID
 - **注意**：无论是否修改凭据，只要 `command.credentials` 存在，所有敏感字段都会被重新加密（IV 会变化，加密结果不同）
 
-### 4.2 加密机制
+### 5.2 加密机制
 
-#### 4.2.1 加密算法
+#### 5.2.1 加密算法
 
 使用 AES-256-CBC 加密算法（`libs/application-generic/src/encryption/cipher.ts:1-28`）：
 
@@ -254,7 +393,7 @@ export function encrypt(text) {
 }
 ```
 
-#### 4.2.2 加密标记
+#### 5.2.2 加密标记
 
 加密后的字符串会添加 `NOVU_ENCRYPTION_SUB_MASK` 前缀，用于识别是否已加密（`libs/application-generic/src/encryption/encrypt-provider.ts:1-68`）：
 
@@ -275,7 +414,7 @@ export function encryptCredentials(credentials: ICredentialsDto): ICredentialsDt
 }
 ```
 
-## 5. 从录入到发送的完整时序图
+## 6. 从录入到发送的完整时序图
 
 ```
 用户/Dashboard                          API 层                              Worker 层                          Meta Graph API
@@ -283,8 +422,8 @@ export function encryptCredentials(credentials: ICredentialsDto): ICredentialsDt
      | 1. 输入 WhatsApp 凭据                |                                   |                                   |
      |------------------------------------>|                                   |                                   |
      |                                     |                                   |                                   |
-     | 2. （可选）调用手动校验接口           |                                   |                                   |
-     | POST /whatsapp/validate-token       |                                   |                                   |
+     | 2. （可选）调用链路 A 手动校验        |                                   |                                   |
+     | POST /integrations/whatsapp/validate-token |                             |                                   |
      |------------------------------------>|                                   |                                   |
      |                                     | 3. WhatsAppValidateToken.execute() |                                   |
      |                                     |---------------------------------->|                                   |
@@ -317,86 +456,48 @@ export function encryptCredentials(credentials: ICredentialsDto): ICredentialsDt
      | 12. 返回集成信息                     |                                   |                                   |
      |<------------------------------------|                                   |                                   |
      |                                     |                                   |                                   |
+     | 13. （可选）配置 webhook             |                                   |                                   |
+     | POST /agents/.../whatsapp/auto-configure |                             |                                   |
+     |------------------------------------>|                                   |                                   |
+     |                                     | 14. ConfigureWhatsAppWebhook.execute() |                              |
+     |                                     |   - decryptCredentials()           |                                   |
+     |                                     |   - debugAccessToken() 获取 appId  |                                   |
+     |                                     |   - 注册 webhook                   |                                   |
+     |                                     |---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     | 13. 触发消息发送                    |                                   |                                   |
+     | 15. 返回配置结果                     |                                   |                                   |
+     |<------------------------------------|                                   |                                   |
+     |                                     |                                   |                                   |
+     |                                     |                                   |                                   |
+     | 16. 触发消息发送                     |                                   |                                   |
      |------------------------------------>|---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     |                                     |                                   | 14. SelectIntegration.execute()    |                                   |
+     |                                     |                                   | 17. SelectIntegration.execute()    |                                   |
      |                                     |                                   |   (选择集成交互式检查条件)         |                                   |
      |                                     |                                   |---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     |                                     |                                   | 15. getDecryptedCredentials()      |                                   |
+     |                                     |                                   | 18. getDecryptedCredentials()      |                                   |
      |                                     |                                   |   (解密凭据)                       |                                   |
      |                                     |                                   |---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     |                                     |                                   | 16. ChatFactory.getHandler()       |                                   |
+     |                                     |                                   | 19. ChatFactory.getHandler()       |                                   |
      |                                     |                                   |   (选择 WhatsAppBusinessHandler)   |                                   |
      |                                     |                                   |---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     |                                     |                                   | 17. buildProvider()                |                                   |
+     |                                     |                                   | 20. buildProvider()                |                                   |
      |                                     |                                   |   (使用 apiToken 初始化)           |                                   |
      |                                     |                                   |---------------------------------->|                                   |
      |                                     |                                   |                                   |
-     |                                     |                                   | 18. sendMessage()                  |                                   |
+     |                                     |                                   | 21. sendMessage()                  |                                   |
      |                                     |                                   |   (Bearer token 认证)              |                                   |
      |                                     |                                   |---------------------------------->|
      |                                     |                                   |                                   |
-     |                                     |                                   | 19. 返回发送结果                    |
+     |                                     |                                   | 22. 返回发送结果                    |
      |                                     |                                   |<----------------------------------|
      |                                     |                                   |                                   |
-     |                                     |                                   | 20. 更新状态 + 发送 webhook        |                                   |
+     |                                     |                                   | 23. 更新状态 + 发送 webhook        |                                   |
      |                                     |                                   |---------------------------------->|                                   |
 ```
-
-## 6. 两条校验链路的差异对比
-
-### 6.1 核心差异表
-
-| 对比维度 | 链路 A：保存前手动校验 | 链路 B：create/update 内置 check |
-|----------|----------------------|--------------------------------|
-| **触发方式** | 独立 API 调用 | 创建/更新时传 `check: true` |
-| **端点** | `POST /integrations/whatsapp/validate-token` | `POST/PUT /integrations` |
-| **对 WhatsApp 是否生效** | ✅ 完全生效 | ❌ 完全无效 |
-| **调用组件** | `WhatsAppValidateToken` | `CheckIntegration`（仅 EMAIL） |
-| **校验时机** | 保存前，可选 | 保存前，可选 |
-| **失败返回** | 结构化错误码，实时反馈 | 静默通过，无任何提示 |
-| **错误可见性** | 高，Dashboard 可直接展示 | 无，用户无法感知 |
-| **风险面** | 无，校验失败可修正 | 高，无效凭据可能被保存 |
-| **推荐使用** | ✅ 推荐 | ❌ 不推荐用于 WhatsApp |
-
-### 6.2 失败返回差异
-
-**链路 A（手动校验）失败返回示例**：
-```json
-{
-  "valid": false,
-  "scopes": [],
-  "businessAccountId": null,
-  "error": {
-    "code": "invalid_token",
-    "message": "The access token is invalid or has expired",
-    "metadata": { "type": "OAuthException", "code": 190 }
-  }
-}
-```
-
-**链路 B（内置 check）失败表现**：
-- 无任何错误返回
-- 集成会被"成功"创建
-- 直到发送消息时才会暴露令牌无效问题
-- 用户无法在录入阶段发现问题
-
-### 6.3 风险面分析
-
-**链路 A（手动校验）风险**：
-- 无固有风险，校验失败可及时修正
-- 可选步骤，用户可能跳过直接保存
-
-**链路 B（内置 check）风险**：
-- ❗ **静默失败风险**：用户以为开启了校验，但实际上对 WhatsApp 无任何校验
-- ❗ **延迟暴露风险**：无效凭据可能在数天/数周后发送消息时才被发现
-- ❗ **用户误导风险**：`check: true` 参数给用户错误的安全感
-- ❗ **调试困难**：问题发生时难以追溯到集成创建阶段
 
 ## 7. 消息发送时的令牌取出与使用流程
 
@@ -446,7 +547,8 @@ export function decryptCredentials(credentials: ICredentialsDto): ICredentialsDt
 **重要结论**：发送链路中**不存在**二次 token 校验。
 
 - Worker 进程中没有调用 `WhatsAppValidateToken` 或 Meta `debug_token` 端点
-- 令牌仅在集成创建/更新时（API 层）可通过手动校验接口验证
+- 令牌仅在集成创建/更新时（API 层）可通过链路 A 手动校验
+- 配置 webhook 时（链路 C）会进行最小化验证
 - 发送时直接使用解密后的 token 调用 Meta Graph API
 - 如果 token 已失效或权限不足，Meta API 会直接返回错误，由失败处理机制处理
 
@@ -666,7 +768,7 @@ try {
 ```
 用户输入凭据 (apiToken, phoneNumberIdentification, businessAccountId, secretKey)
         ↓
-（可选）调用 POST /whatsapp/validate-token 手动校验
+（可选）调用链路 A：POST /whatsapp/validate-token 手动校验
         ↓
 POST /integrations (可选带 check: true，对 WhatsApp 无效)
         ↓
@@ -675,6 +777,14 @@ ensureWhatsAppManagedCredentials() - 自动生成 token (Verify Token)
 encryptCredentials() - 加密敏感字段 (apiToken, secretKey, token)
         ↓
 保存到集成表 (IntegrationRepository.create)
+        ↓
+（可选）调用链路 C：配置 Agent webhook 自动配置
+        ↓
+decryptCredentials() - 解密凭据
+        ↓
+debugAccessToken() - 验证令牌 + 获取 appId
+        ↓
+注册 Meta webhook
 ```
 
 ### 10.2 凭据录入流程（更新）
@@ -682,7 +792,7 @@ encryptCredentials() - 加密敏感字段 (apiToken, secretKey, token)
 ```
 用户提交更新 (可能包含部分凭据字段)
         ↓
-（可选）调用 POST /whatsapp/validate-token 手动校验
+（可选）调用链路 A：POST /whatsapp/validate-token 手动校验
         ↓
 PUT /integrations/:id (可选带 check: true，对 WhatsApp 无效)
         ↓
@@ -728,13 +838,14 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 
 ### 10.5 校验时机与范围
 
-| 校验类型 | 时机 | 位置 | 说明 |
+| 校验类型 | 时机 | 链路 | 说明 |
 |----------|------|------|------|
-| Token 有效性 | 手动调用校验接口时 | API 层 | 调用 Meta debug_token |
-| 权限范围检查 | 手动调用校验接口时 | API 层 | 检查 whatsapp_business_messaging |
-| 电话号码归属 | 手动调用校验接口时 | API 层 | 验证 phoneNumberId |
-| WABA 可访问性 | 手动调用校验接口时 | API 层 | 验证 businessAccountId |
-| create/update check | 创建/更新集成时 | - | 对 WhatsApp 无效 |
+| 令牌有效性 | 手动调用校验接口时 | 链路 A | 调用 Meta debug_token |
+| 权限范围检查 | 手动调用校验接口时 | 链路 A | 检查 whatsapp_business_messaging |
+| 电话号码归属 | 手动调用校验接口时 | 链路 A | 验证 phoneNumberId |
+| WABA 可访问性 | 手动调用校验接口时 | 链路 A | 验证 businessAccountId |
+| 令牌有效性（最小） | 配置 webhook 时 | 链路 C | 获取 appId |
+| create/update check | 创建/更新集成时 | 链路 B | 对 WhatsApp 无效 |
 | 二次校验 | 发送消息时 | - | 不存在，直接调用 Meta API |
 
 ## 11. 安全特性
@@ -754,9 +865,12 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 | WhatsApp 凭据定义 | `packages/shared/src/consts/providers/credentials/provider-credentials.ts:1278-1316` |
 | 敏感字段列表 | `packages/shared/src/consts/providers/credentials/secure-credentials.ts:1-11` |
 | 自动生成/继承 Verify Token | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-credentials.utils.ts:11-35` |
-| WhatsApp 手动校验接口 | `apps/api/src/app/integrations/integrations.controller.ts:783-806` |
-| WhatsApp 令牌校验 usecase | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:48-269` |
-| CheckIntegration（仅 EMAIL） | `apps/api/src/app/integrations/usecases/check-integration/check-integration.usecase.ts:10-25` |
+| 链路 A：WhatsApp 手动校验接口 | `apps/api/src/app/integrations/integrations.controller.ts:783-806` |
+| 链路 A：WhatsApp 令牌校验 usecase | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:48-269` |
+| 链路 A：校验返回 DTO | `apps/api/src/app/integrations/dtos/whatsapp-validate-token.dto.ts:50-92` |
+| 链路 B：CheckIntegration（仅 EMAIL） | `apps/api/src/app/integrations/usecases/check-integration/check-integration.usecase.ts:10-25` |
+| 链路 C：Agent Webhook 自动配置接口 | `apps/api/src/app/agents/agents.controller.ts:301-325` |
+| 链路 C：ConfigureWhatsAppWebhook usecase | `apps/api/src/app/agents/usecases/configure-whatsapp-webhook/configure-whatsapp-webhook.usecase.ts:64-317` |
 | 加密算法 | `libs/application-generic/src/encryption/cipher.ts:1-28` |
 | 凭据加解密 | `libs/application-generic/src/encryption/encrypt-provider.ts:1-68` |
 | 集成创建 | `apps/api/src/app/integrations/usecases/create-integration/create-integration.usecase.ts:138-222` |
