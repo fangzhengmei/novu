@@ -92,6 +92,35 @@ const query: IntegrationQuery = {
 };
 ```
 
+#### 3.1.3 更新集成分支：Verify Token 继承与重新加密
+
+在 `UpdateIntegration` usecase 中（`apps/api/src/app/integrations/usecases/update-integration/update-integration.usecase.ts:183-193`），更新集成时的凭据处理流程：
+
+1. **解密现有凭据**：首先从数据库读取并解密现有凭据
+2. **Verify Token 继承**：调用 `ensureWhatsAppManagedCredentials`，如果用户未提供新的 token，则继承现有 token
+3. **重新加密**：对最终凭据重新加密后保存
+
+关键代码：
+```typescript
+if (command.credentials) {
+  const existingCredentials = existingIntegration.credentials
+    ? decryptCredentials(existingIntegration.credentials)  // 解密现有凭据
+    : undefined;
+  const managedCredentials = ensureWhatsAppManagedCredentials({
+    providerId: existingIntegration.providerId,
+    nextCredentials: command.credentials,
+    existingCredentials,                                 // 传入现有凭据用于继承
+  });
+  updatePayload.credentials = encryptCredentials(managedCredentials);  // 重新加密
+}
+```
+
+**继承规则**：
+- 如果用户在更新时明确提供了 `token` 字段，使用用户提供的值
+- 如果用户未提供 `token`，但数据库中已有 token，继承现有 token
+- 如果用户未提供 `token` 且数据库中也没有（罕见场景），生成新的 UUID
+- **注意**：无论是否修改凭据，只要 `command.credentials` 存在，所有敏感字段都会被重新加密（IV 会变化，加密结果不同）
+
 ### 3.2 加密机制
 
 #### 3.2.1 加密算法
@@ -135,7 +164,7 @@ export function encryptCredentials(credentials: ICredentialsDto): ICredentialsDt
 
 ### 3.3 令牌有效性验证
 
-在创建集成时（如果启用了 `check` 参数），会调用 `WhatsAppValidateToken` usecase 验证令牌有效性（`apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:41-269`）。
+在创建/更新集成时（如果启用了 `check` 参数），会调用 `WhatsAppValidateToken` usecase 验证令牌有效性（`apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:41-269`）。
 
 验证流程：
 1. 调用 Meta Graph API 的 `debug_token` 端点验证令牌
@@ -196,9 +225,18 @@ export function decryptCredentials(credentials: ICredentialsDto): ICredentialsDt
 }
 ```
 
-### 4.4 Provider 初始化
+### 4.4 发送链路二次校验说明
 
-#### 4.4.1 ChatFactory 选择 Handler
+**重要结论**：发送链路中**不存在**二次 token 校验。
+
+- Worker 进程中没有调用 `WhatsAppValidateToken` 或 Meta `debug_token` 端点
+- 令牌仅在集成创建/更新时（API 层）进行有效性验证
+- 发送时直接使用解密后的 token 调用 Meta Graph API
+- 如果 token 已失效或权限不足，Meta API 会直接返回错误，由失败处理机制处理
+
+### 4.5 Provider 初始化
+
+#### 4.5.1 ChatFactory 选择 Handler
 
 通过 `ChatFactory` 根据 providerId 选择对应的 Handler（`libs/application-generic/src/factories/chat/chat.factory.ts:16-42`）：
 
@@ -220,7 +258,7 @@ export class ChatFactory implements IChatFactory {
 }
 ```
 
-#### 4.4.2 WhatsAppBusinessHandler
+#### 4.5.2 WhatsAppBusinessHandler
 
 WhatsApp Business 的 Handler 实现（`libs/application-generic/src/factories/chat/handlers/whatsapp-business.handler.ts:1-16`）：
 
@@ -239,7 +277,7 @@ export class WhatsAppBusinessHandler extends BaseChatHandler {
 }
 ```
 
-#### 4.4.3 WhatsappBusinessChatProvider
+#### 4.5.3 WhatsappBusinessChatProvider
 
 实际发送消息的 Provider（`packages/providers/src/lib/chat/whatsapp-business/whatsapp-business.provider.ts:15-116`）：
 
@@ -302,7 +340,7 @@ private getLegacyChatChannels(command: SendMessageChannelCommand): IChannelSetti
 }
 ```
 
-### 5.2 多通道重试机制
+### 5.2 多通道尝试机制
 
 系统会尝试向所有可用的通道发送消息，只要有一个成功即视为成功（`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:216-257`）：
 
@@ -326,7 +364,38 @@ private async sendToAllChannels(channels: UnifiedChannel[], messageContext: Mess
 
 ## 6. 失败处理与回退机制
 
-### 6.1 重试装饰器
+### 6.1 真正生效的失败处理机制
+
+#### 6.1.1 多通道回退机制（已接入）
+
+这是 WhatsApp 消息发送最主要的失败处理机制：
+
+- **位置**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:216-257`
+- **机制**：遍历所有可用通道，依次尝试发送
+- **行为**：单个通道失败不抛出异常，继续尝试下一个通道
+- **成功条件**：只要有一个通道成功，整体状态即为成功
+- **适用场景**：配置了多个 Chat 集成（如同时配置 Slack 和 WhatsApp）
+
+#### 6.1.2 队列级重试（部分接入）
+
+- **位置**：`apps/worker/src/app/workflow/services/standard.worker.ts:230-285`
+- **触发条件**：仅当错误消息包含 `EXCEPTION_MESSAGE_ON_WEBHOOK_FILTER` 时才会重试
+- **重试逻辑**：
+  - 最大重试次数：`DEFAULT_ATTEMPTS`（默认 3 次）
+  - 退避策略：随机指数退避 `Math.round(Math.random() * 2 ** attemptsMade * 1000)`
+  - 定义于 `apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts:35`
+- **限制**：WhatsApp API 返回的常规错误（如 token 无效、权限不足）不会触发此重试
+
+#### 6.1.3 错误记录与通知（已接入）
+
+失败时会：
+1. 更新消息状态为 `error`
+2. 创建执行详情记录（`ExecutionDetailsStatusEnum.FAILED`）
+3. 发送 webhook 通知（`WebhookEventEnum.MESSAGE_SENT`），包含错误信息
+
+### 6.2 未接入该链路的通用重试能力
+
+#### 6.2.1 RetryOnError 装饰器（未使用）
 
 系统提供了通用的重试装饰器 `RetryOnError`（`libs/application-generic/src/decorators/retry-on-error-decorator.ts:16-82`），支持：
 
@@ -335,38 +404,18 @@ private async sendToAllChannels(channels: UnifiedChannel[], messageContext: Mess
 - 自定义错误过滤逻辑
 - 自定义日志记录
 
-```typescript
-export function RetryOnError(errorName: string, options: RetryOptions = {}) {
-  return (target: unknown, propertyKey: string, descriptor: PropertyDescriptor) => {
-    const originalMethod = descriptor.value;
-    descriptor.value = async function (this: unknown, ...args: unknown[]) {
-      const {
-        maxRetries = 3,
-        delay = 100,
-        exponentialBackoff = true,
-        shouldRetry = (error: Error) => /* ... */,
-        logger = console,
-      } = options;
-      
-      let retries = 0;
-      do {
-        try {
-          return await originalMethod.apply(this, args);
-        } catch (error) {
-          if (!shouldRetry(error as Error)) throw error;
-          retries += 1;
-          const currentDelay = exponentialBackoff ? delay * 2 ** (retries - 1) : delay;
-          await new Promise<void>((resolve) => setTimeout(resolve, currentDelay));
-          if (retries >= maxRetries) throw error;
-        }
-      } while (retries < maxRetries);
-    };
-    return descriptor;
-  };
-}
-```
+**实际使用情况**：
+- 该装饰器**未在 WhatsApp 消息发送链路中使用**
+- 仅在两个地方使用：
+  - `create-or-update-subscriber.usecase.ts:20` - 处理 `MongoServerError`
+  - `merge-or-create-digest.usecase.ts:146` - 处理 `MongoServerError`
+- WhatsApp Provider 的 `sendMessage` 方法没有使用此装饰器
 
-### 6.2 消息发送失败处理
+#### 6.2.2 Provider 级重试（未实现）
+
+`WhatsappBusinessChatProvider` 的 `sendMessage` 方法没有内置重试逻辑，Meta API 调用失败直接抛出异常。
+
+### 6.3 消息发送失败处理流程
 
 在 `SendMessageChat.sendMessage` 中（`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:542-574`）：
 
@@ -384,25 +433,19 @@ try {
 }
 ```
 
-### 6.3 错误记录与通知
+### 6.4 失败处理机制对比表
 
-失败时会：
-1. 更新消息状态为 `error`
-2. 创建执行详情记录（`ExecutionDetailsStatusEnum.FAILED`）
-3. 发送 webhook 通知（`WebhookEventEnum.MESSAGE_SENT`），包含错误信息
-
-### 6.4 多通道回退
-
-当配置了多个 Chat 集成时，系统会依次尝试每个通道，只要有一个成功即返回成功。这提供了天然的回退机制。
-
-例如，如果同时配置了 Slack 和 WhatsApp Business：
-1. 首先尝试发送到 Slack
-2. 如果 Slack 失败，继续尝试 WhatsApp Business
-3. 如果 WhatsApp Business 也失败，才标记为最终失败
+| 机制 | 位置 | 状态 | 适用场景 |
+|------|------|------|----------|
+| 多通道回退 | `send-message-chat.usecase.ts` | ✅ 已接入 | 多 Chat 集成配置 |
+| 队列级重试 | `standard.worker.ts` | ⚠️ 部分接入 | 仅 webhook filter 错误 |
+| 错误记录通知 | `send-message-chat.usecase.ts` | ✅ 已接入 | 所有错误 |
+| RetryOnError 装饰器 | `retry-on-error-decorator.ts` | ❌ 未使用 | 数据库操作错误 |
+| Provider 级重试 | `whatsapp-business.provider.ts` | ❌ 未实现 | - |
 
 ## 7. 关键流程总结
 
-### 7.1 凭据录入流程
+### 7.1 凭据录入流程（创建）
 
 ```
 用户输入凭据 (apiToken, phoneNumberIdentification, businessAccountId, secretKey)
@@ -414,7 +457,21 @@ encryptCredentials() - 加密敏感字段 (apiToken, secretKey, token)
 保存到集成表 (IntegrationRepository.create)
 ```
 
-### 7.2 消息发送流程
+### 7.2 凭据录入流程（更新）
+
+```
+用户提交更新 (可能包含部分凭据字段)
+        ↓
+decryptCredentials() - 解密数据库中现有凭据
+        ↓
+ensureWhatsAppManagedCredentials() - 继承或生成 token
+        ↓
+encryptCredentials() - 重新加密所有敏感字段
+        ↓
+更新集成表 (IntegrationRepository.update)
+```
+
+### 7.3 消息发送流程
 
 ```
 触发消息发送
@@ -433,7 +490,7 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 失败 → 记录错误，尝试其他通道，发送失败 webhook
 ```
 
-### 7.3 数据流向
+### 7.4 数据流向
 
 | 阶段 | 数据位置 | 状态 |
 |------|----------|------|
@@ -444,6 +501,16 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 | 使用前 | 内存 | 解密 |
 | API 调用 | HTTP 请求头 | 明文 (Bearer token) |
 
+### 7.5 校验时机与范围
+
+| 校验类型 | 时机 | 位置 | 说明 |
+|----------|------|------|------|
+| Token 有效性 | 集成创建/更新时 | API 层 | 调用 Meta debug_token |
+| 权限范围检查 | 集成创建/更新时 | API 层 | 检查 whatsapp_business_messaging |
+| 电话号码归属 | 集成创建/更新时 | API 层 | 验证 phoneNumberId |
+| WABA 可访问性 | 集成创建/更新时 | API 层 | 验证 businessAccountId |
+| 二次校验 | 发送消息时 | - | 不存在，直接调用 Meta API |
+
 ## 8. 安全特性
 
 1. **字段级加密**：仅敏感字段加密，非敏感字段明文存储，平衡安全性和可查询性
@@ -452,6 +519,7 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 4. **环境变量密钥**：加密密钥存储在环境变量 `STORE_ENCRYPTION_KEY` 中，不硬编码
 5. **令牌验证**：录入时即验证令牌有效性，避免无效配置
 6. **自动生成**：Verify Token 自动生成，减少用户操作和安全风险
+7. **更新时重新加密**：更新集成时重新加密所有敏感字段，保证加密随机性
 
 ## 9. 代码引用位置汇总
 
@@ -459,15 +527,19 @@ WhatsappBusinessChatProvider.sendMessage() - 调用 Meta Graph API 发送消息
 |------|----------|
 | WhatsApp 凭据定义 | `packages/shared/src/consts/providers/credentials/provider-credentials.ts:1278-1316` |
 | 敏感字段列表 | `packages/shared/src/consts/providers/credentials/secure-credentials.ts:1-11` |
-| 自动生成 Verify Token | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-credentials.utils.ts:11-35` |
+| 自动生成/继承 Verify Token | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-credentials.utils.ts:11-35` |
 | 令牌验证 | `apps/api/src/app/integrations/usecases/whatsapp/whatsapp-validate-token.usecase.ts:41-269` |
 | 加密算法 | `libs/application-generic/src/encryption/cipher.ts:1-28` |
 | 凭据加解密 | `libs/application-generic/src/encryption/encrypt-provider.ts:1-68` |
 | 集成创建 | `apps/api/src/app/integrations/usecases/create-integration/create-integration.usecase.ts:138-222` |
+| 集成更新 | `apps/api/src/app/integrations/usecases/update-integration/update-integration.usecase.ts:183-193` |
 | 解密集成 | `libs/application-generic/src/usecases/get-decrypted-integrations/get-decrypted-integrations.usecase.ts:55-59` |
 | 选择集成 | `libs/application-generic/src/usecases/select-integration/select-integration.usecase.ts:19-80` |
 | Chat Factory | `libs/application-generic/src/factories/chat/chat.factory.ts:16-42` |
 | WhatsApp Handler | `libs/application-generic/src/factories/chat/handlers/whatsapp-business.handler.ts:1-16` |
 | WhatsApp Provider | `packages/providers/src/lib/chat/whatsapp-business/whatsapp-business.provider.ts:15-116` |
 | 发送 Chat 消息 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:92-139` |
-| 重试装饰器 | `libs/application-generic/src/decorators/retry-on-error-decorator.ts:16-82` |
+| 多通道回退 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:216-257` |
+| 队列级重试 | `apps/worker/src/app/workflow/services/standard.worker.ts:230-285` |
+| 退避策略 | `apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts:35` |
+| 重试装饰器（未使用） | `libs/application-generic/src/decorators/retry-on-error-decorator.ts:16-82` |
