@@ -110,13 +110,13 @@ interface WhatsAppValidateTokenResponseDto {
 ```json
 {
   "valid": false,
-  "hasManagementScope": false,
-  "hasMessagingScope": true,
-  "scopes": ["whatsapp_business_messaging"],
+  "hasManagementScope": true,
+  "hasMessagingScope": false,
+  "scopes": ["whatsapp_business_management"],
   "expiresAt": 1767225600,
   "error": {
-    "code": "missing_management_scope",
-    "message": "This token is missing the \"whatsapp_business_management\" permission needed for auto-configure."
+    "code": "missing_messaging_scope",
+    "message": "This token is missing the \"whatsapp_business_messaging\" permission needed to send WhatsApp messages."
   }
 }
 ```
