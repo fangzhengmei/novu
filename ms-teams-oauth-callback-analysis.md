@@ -1,4 +1,4 @@
-# Microsoft Teams 三方授权回调流程分析
+﻿# Microsoft Teams 三方授权回调流程分析
 
 ## 一、整体架构概览
 
@@ -11,7 +11,7 @@ Microsoft Teams 授权回调流程贯穿三个核心阶段：**浏览器跳转�
       ↓
 浏览器跳转到 Microsoft 授权页面
       ↓
-用户授权后回调 → /v1/integrations/chat/oauth/callback
+用户授权后回调 → /integrations/chat/oauth/callback
       ↓
 Controller 接收参数 (handleChatOAuthCallback)
       ↓
@@ -537,7 +537,7 @@ ChannelEndpoint (用户级端点)
 
 ### 8.1 后端路由修正
 
-**⚠️ 之前的理解偏差**：手动补绑的后端路由不是 `/chat/oauth/link-user-url`，而是 `/channel-endpoints/oauth`。
+**⚠️ 已确认**：手动补绑的后端路由是 `/channel-endpoints/oauth`。之前文档中提到的 `/chat/oauth/link-user-url` 是错误的，已全部清理。
 
 **文件**: `apps/api/src/app/integrations/integrations.controller.ts:705`
 
@@ -1061,9 +1061,10 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
 
 | 文件 | 职责 |
 |------|------|
-| `integrations.controller.ts:705` | generateLinkUserOAuthUrl 接口（手动绑定用，路由: `/channel-endpoints/oauth`） |
-| `integrations.controller.ts:684` | generateConnectOAuthUrl 接口（路由: `/channel-connections/oauth`） |
-| `integrations.controller.ts:735` | 回调入口 Controller（路由: `/chat/oauth/callback`） |
+| `integrations.controller.ts:705` | generateLinkUserOAuthUrl 接口（手动绑定用，后端路由: `/integrations/channel-endpoints/oauth`） |
+| `integrations.controller.ts:673` | generateConnectOAuthUrl 接口（后端路由: `/integrations/channel-connections/oauth`） |
+| `integrations.controller.ts:735` | 回调入口 Controller（后端路由: `/integrations/chat/oauth/callback`） |
+| `integrations.controller.ts:636` | 旧版已废弃接口（后端路由: `/integrations/chat/oauth`） |
 | `chat-oauth-callback.usecase.ts` | 按 providerId 路由回调 |
 | `generate-msteams-oauth-url.usecase.ts` | 生成授权 URL、State 编解码验证 |
 | `msteams-oauth-callback.usecase.ts` | MS Teams 回调核心逻辑、返回分流、错误处理 |
@@ -1078,5 +1079,7 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
 | `MsTeamsConnectButton.tsx` | 前端连接按钮组件 |
 | `MsTeamsLinkUser.tsx` | 前端手动绑定组件 |
 | `constants.ts` | connectionIdentifier 生成逻辑 |
-| `inbox-service.ts` | 前端 SDK API 封装 |
+| `inbox-service.ts` | 前端 SDK API 封装（前端调用路径: `/v1/inbox/*`） |
 | `helpers.ts` (channel-endpoints) | 前端 channelEndpoints 方法实现 |
+
+
