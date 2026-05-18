@@ -22,6 +22,9 @@ Slack 连接按钮采用三层架构设计（React → SolidJS 桥接 → SolidJ
 | React 按钮包装器 | `packages/react/src/components/slack-connect-button/SlackConnectButton.tsx` | React 对外导出组件，包裹 NovuUI Provider |
 | React 桥接层 | `packages/react/src/components/slack-connect-button/DefaultSlackConnectButton.tsx` | 通过 `Mounter` 将 React Props 传递给 SolidJS 实现 |
 | SolidJS 底层实现 | `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx` | 核心逻辑：生成 OAuth URL、打开弹窗、轮询连接状态 |
+| SolidJS Hook | `packages/js/src/ui/api/hooks/useChannelConnection.ts` | 封装 channelConnections API，暴露 `generateConnectOAuthUrl` 方法 |
+| ChannelConnections 模块 | `packages/js/src/channel-connections/channel-connections.ts` | SDK 层 channelConnections 模块类定义 |
+| 核心 API 服务 | `packages/js/src/api/inbox-service.ts` | 定义 Inbox API 端点，发送实际 HTTP 请求 |
 | 集成 API 客户端 | `apps/dashboard/src/api/integrations.ts` | `slackQuickSetup()` 调用后端快速设置接口 |
 | Agent API 客户端 | `apps/dashboard/src/api/agents.ts` | `sendAgentWelcomeMessage()` 调用欢迎消息接口 |
 
@@ -29,10 +32,11 @@ Slack 连接按钮采用三层架构设计（React → SolidJS 桥接 → SolidJ
 
 | 模块 | 文件路径 | 核心职责 |
 |------|----------|----------|
-| 集成控制器 | `apps/api/src/app/integrations/integrations.controller.ts` | 暴露 `POST /integrations/:integrationId/slack-quick-setup` 端点 |
+| Inbox 控制器 | `apps/api/src/app/inbox/inbox.controller.ts` | **核心**：暴露 `/inbox/channel-connections/oauth`（生成 OAuth URL）和 `/inbox/channel-connections/:identifier`（轮询）端点 |
+| 集成控制器 | `apps/api/src/app/integrations/integrations.controller.ts` | 暴露 `POST /integrations/:integrationId/slack-quick-setup` 端点（后端 API 用） |
 | Agent 控制器 | `apps/api/src/app/agents/agents.controller.ts` | 暴露 `POST /agents/:identifier/welcome-message` 端点 |
 | Quick Setup UseCase | `apps/api/src/app/integrations/usecases/slack-quick-setup/slack-quick-setup.usecase.ts` | 调用 Slack API 创建 App 并保存凭据 |
-| OAuth URL 生成 | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts` | 生成带签名的 Slack OAuth 授权 URL |
+| OAuth URL 生成 | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url/generate-connect-oauth-url.usecase.ts` | 生成带签名的 Slack OAuth 授权 URL（被 InboxController 调用） |
 | OAuth 回调处理 | `apps/api/src/app/integrations/usecases/chat-oauth-callback/slack-oauth-callback/slack-oauth-callback.usecase.ts` | 处理 Slack 回调，创建 ChannelConnection 和 ChannelEndpoint |
 | 欢迎消息发送 | `apps/api/src/app/agents/usecases/send-agent-welcome-message/send-agent-welcome-message.usecase.ts` | OAuth 成功后发送首条欢迎消息 |
 
@@ -120,6 +124,8 @@ async slackQuickSetup(...) {
 
 ### 3.2 第二段：OAuth 授权与轮询调用链
 
+**⚠️ 关键修正：OAuth URL 生成和轮询都是通过 `/inbox/*` 端点，由 `InboxController` 处理，而非 `IntegrationsController`。**
+
 **代码证据链：**
 
 ```
@@ -143,8 +149,31 @@ async slackQuickSetup(...) {
 2. window.open(url, '_blank') 打开 Slack 授权弹窗
 3. startPolling() 开始轮询
         ↓
+[packages/js/src/ui/api/hooks/useChannelConnection.ts:36-38]
+  generateConnectOAuthUrl = (args) => novuAccessor().channelConnections.generateConnectOAuthUrl(args)
+        ↓
+[packages/js/src/channel-connections/channel-connections.ts:45-53]
+  ChannelConnections.generateConnectOAuthUrl() → 调用 helpers.generateConnectOAuthUrl()
+        ↓
+[packages/js/src/channel-connections/helpers.ts:36-56]
+  generateConnectOAuthUrl() → 调用 apiService.generateConnectOAuthUrl(args)
+        ↓
+[packages/js/src/api/inbox-service.ts:576-594]
+  InboxService.generateConnectOAuthUrl() → POST /inbox/channel-connections/oauth
+        ↓
+[apps/api/src/app/inbox/inbox.controller.ts:816-836]
+  @Post('/channel-connections/oauth') → GenerateConnectOauthUrl.execute()
+        ↓
+返回 OAuth URL → window.open() 打开弹窗 → startPolling() 开始
+        ↓
 [packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx:85-127]
   startPolling() — 每 2.5 秒调用 novuAccessor().channelConnections.get()
+        ↓
+[packages/js/src/api/inbox-service.ts:622-624]
+  InboxService.getChannelConnection() → GET /inbox/channel-connections/:identifier
+        ↓
+[apps/api/src/app/inbox/inbox.controller.ts:700-709]
+  @Get('/channel-connections/:identifier') → GetChannelConnection.execute()
         ↓
 轮询命中 → mutate(response.data) → props.onConnectSuccess?.(connId)
         ↓
@@ -169,6 +198,83 @@ const slackInstallConnectControl =
       />
     </NovuProvider>
   ) : null;
+```
+
+`packages/js/src/api/inbox-service.ts:35-41` — 端点常量定义：
+```typescript
+const INBOX_ROUTE = '/inbox';
+const CHANNEL_CONNECTIONS_ROUTE = `${INBOX_ROUTE}/channel-connections`;
+const CHANNEL_CONNECTIONS_OAUTH_ROUTE = `${CHANNEL_CONNECTIONS_ROUTE}/oauth`;  // /inbox/channel-connections/oauth
+```
+
+`packages/js/src/api/inbox-service.ts:576-594` — OAuth URL 生成 API 调用：
+```typescript
+generateConnectOAuthUrl({
+  integrationIdentifier,
+  connectionIdentifier,
+  subscriberId,
+  context,
+  scope,
+  connectionMode,
+  autoLinkUser,
+}: GenerateConnectOAuthUrlArgs): Promise<{ url: string }> {
+  return this.#httpClient.post(CHANNEL_CONNECTIONS_OAUTH_ROUTE, {  // POST /inbox/channel-connections/oauth
+    integrationIdentifier,
+    connectionIdentifier,
+    subscriberId,
+    context,
+    scope,
+    connectionMode,
+    autoLinkUser,
+  });
+}
+```
+
+`packages/js/src/api/inbox-service.ts:622-624` — 轮询 API 调用：
+```typescript
+getChannelConnection(identifier: string): Promise<ChannelConnectionResponse> {
+  return this.#httpClient.get(`${CHANNEL_CONNECTIONS_ROUTE}/${identifier}`);  // GET /inbox/channel-connections/:identifier
+}
+```
+
+`apps/api/src/app/inbox/inbox.controller.ts:816-836` — 后端 OAuth URL 生成路由：
+```typescript
+@UseGuards(AuthGuard('subscriberJwt'))
+@Post('/channel-connections/oauth')  // 注意：前缀是 /inbox，完整路径是 /inbox/channel-connections/oauth
+async generateConnectOAuthUrl(
+  @SubscriberSession() subscriberSession: SubscriberSession,
+  @Body() body: GenerateConnectOauthUrlRequestDto
+): Promise<GenerateChatOAuthUrlResponseDto> {
+  const url = await this.generateConnectOauthUrlUsecase.execute(
+    GenerateConnectOauthUrlCommand.create({
+      environmentId: subscriberSession._environmentId,
+      organizationId: subscriberSession._organizationId,
+      subscriberId: subscriberSession.subscriberId,
+      integrationIdentifier: body.integrationIdentifier,
+      connectionIdentifier: body.connectionIdentifier,
+      context: body.context,
+      scope: body.scope,
+      connectionMode: body.connectionMode,
+      autoLinkUser: body.autoLinkUser,
+    })
+  );
+
+  return { url };
+}
+```
+
+`apps/api/src/app/inbox/inbox.controller.ts:700-709` — 后端轮询路由：
+```typescript
+@UseGuards(AuthGuard('subscriberJwt'))
+@Get('/channel-connections/:identifier')  // GET /inbox/channel-connections/:identifier
+async getChannelConnection(
+  @SubscriberSession() subscriberSession: SubscriberSession,
+  @Param('identifier') identifier: string
+): Promise<InboxChannelConnectionResponseDto> {
+  const channelConnection = await this.loadChannelConnectionForSubscriber(subscriberSession, identifier);
+
+  return mapChannelConnectionToInboxDto(channelConnection);
+}
 ```
 
 `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx:85-127` — 轮询实现：
@@ -218,7 +324,7 @@ Slack 重定向到: /v1/integrations/chat/oauth/callback?code=xxx&state=xxx
 4. autoLinkUser=true 时，createChannelEndpoint.execute() 创建 SLACK_USER Endpoint
 5. 返回 <script>window.close();</script> 关闭弹窗
         ↓
-ChannelConnection 已写入数据库 → 前端下一次轮询命中
+ChannelConnection 已写入数据库 → 前端下一次轮询命中 GET /inbox/channel-connections/:identifier
 ```
 
 ---
@@ -232,7 +338,7 @@ onConnectSuccess 回调触发 → handleSlackOAuthSuccess()
         ↓
 [slack-setup-guide.tsx:312-336] 调用 sendAgentWelcomeMessage()
         ↓
-[apps/dashboard/src/api/agents.ts:387-399] sendAgentWelcomeMessage() 发送 POST 请求
+[apps/dashboard/src/api/agents.ts:385-399] sendAgentWelcomeMessage() 发送 POST 请求
         ↓
 POST /v1/agents/:identifier/welcome-message
         ↓
@@ -357,7 +463,7 @@ function buildSlackManifestYaml(agent: AgentResponse, webhookHandlerUrl: string,
 
 ### 5.1 安全 State 设计
 
-`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts`
+`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url/generate-connect-oauth-url.usecase.ts`
 
 ```typescript
 private async createSecureState(...): Promise<string> {
@@ -406,7 +512,7 @@ static async validateAndDecodeState(state: string, environmentApiKey: string): P
 ### 5.2 Scope 动态解析
 
 ```typescript
-private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<string[] | undefined> {
+private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise<string[] | undefined> {
   if (command.scope !== undefined) return command.scope;
 
   const isAgentLinked = await this.isIntegrationLinkedToAgent(command.integration);
@@ -474,7 +580,7 @@ private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<s
 ## 七、完整时序图
 
 ```
-用户操作                          前端 (Dashboard)                          后端 (API)                          Slack
+用户操作                          前端 (Dashboard/SDK)                    后端 (API)                           Slack
    │                                  │                                        │                                │
    │ 打开 Agent 集成页面               │                                        │                                │
    ├─────────────────────────────────►│                                        │                                │
@@ -504,15 +610,21 @@ private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<s
    ├─────────────────────────────────►│                                        │                                │
    │                                  │ SlackConnectButton.handleClick()        │                                │
    │                                  │ ── generateConnectOAuthUrl() ──         │                                │
-   │                                  │ POST /integrations/chat/oauth/url                                     │
+   │                                  │   useChannelConnection hook             │                                │
+   │                                  │   → ChannelConnections.generateConnectOAuthUrl                         │
+   │                                  │   → InboxService.generateConnectOAuthUrl                               │
+   │                                  │ POST /inbox/channel-connections/oauth                                  │
    │                                  ├────────────────────────────────────────►│                                │
+   │                                  │                                        │ InboxController                │
+   │                                  │                                        │ @Post('/channel-connections/oauth')                           │
+   │                                  │                                        │ GenerateConnectOauthUrl.execute()                             │
    │                                  │                                        │ 生成带签名的 State             │
    │                                  │                                        │ 构建 OAuth URL                │
    │                                  │◄────────────────────────────────────────┤                                │
    │                                  │ window.open(Slack OAuth URL)           │                                │
    │                                  ├─────────────────────────────────────────┼────────────────────────────────►│
    │                                  │ startPolling()                          │                                │
-   │                                  │ 每 2.5s GET /channel-connections/{id}  │                                │
+   │                                  │ 每 2.5s GET /inbox/channel-connections/{id}                           │
    │                                  │                                        │                                │
    │                                  │              (用户在 Slack 弹窗中授权)  │                                │
    │                                  │                                        │◄────────────────────────────────┤ GET /chat/oauth/callback
@@ -525,6 +637,8 @@ private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<s
    │                                  │                                        │ 创建 ChannelEndpoint (user)   │
    │                                  │                                        │ 返回 <script>close()</script> │
    │                                  │ 轮询命中 connection                     │                                │
+   │                                  │   GET /inbox/channel-connections/{id}  │                                │
+   │                                  │   → InboxController.getChannelConnection()                           │
    │                                  │ onConnectSuccess → handleSlackOAuthSuccess                              │
    │                                  │ POST /agents/{id}/welcome-message                                      │
    │                                  ├────────────────────────────────────────►│                                │
@@ -568,10 +682,24 @@ private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<s
 3. **轮询 + 回调双机制** - OAuth 回调写入数据，前端轮询感知状态变化
 4. **自动用户链接** - OAuth 回调中自动创建 `SLACK_USER` Endpoint，减少用户操作
 5. **三层按钮架构** - React → SolidJS 桥接 → SolidJS 原生，兼顾框架兼容性和性能
-6. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
+6. **Inbox 统一入口** - 所有前端 SDK 调用通过 `/inbox/*` 端点，使用 subscriberJwt 鉴权，权限隔离清晰
+7. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
 
 ### 9.2 潜在优化点
 1. **轮询效率** - 当前 2.5s 轮询可考虑使用 WebSocket 推送替代
 2. **错误重试** - 欢迎消息发送失败没有重试机制
 3. **幂等性** - Quick Setup 和 OAuth 回调需要考虑重复调用的幂等处理
 4. **Manifest 版本** - Slack Manifest API 可能有版本变更，需要监控兼容性
+
+---
+
+## 附录：关键端点对照表
+
+| 操作 | 前端 SDK 端点 | 后端 Controller | 说明 |
+|------|-------------|-----------------|------|
+| 生成 OAuth URL | `POST /inbox/channel-connections/oauth` | InboxController | 前端 SDK 实际使用 |
+| 轮询连接状态 | `GET /inbox/channel-connections/:identifier` | InboxController | 前端 SDK 实际使用 |
+| 生成 OAuth URL (后端 API) | `POST /integrations/channel-connections/oauth` | IntegrationsController | 后端 API 专用，已标记旧端点为 deprecated |
+| Slack OAuth 回调 | `GET /integrations/chat/oauth/callback` | IntegrationsController | Slack 重定向地址 |
+| Quick Setup | `POST /integrations/:id/slack-quick-setup` | IntegrationsController | 创建 Slack App |
+| 发送欢迎消息 | `POST /agents/:identifier/welcome-message` | AgentsController | OAuth 成功后触发 |
