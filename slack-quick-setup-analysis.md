@@ -36,7 +36,8 @@ Slack 连接按钮采用三层架构设计（React → SolidJS 桥接 → SolidJ
 | 集成控制器 | `apps/api/src/app/integrations/integrations.controller.ts` | 暴露 `POST /integrations/:integrationId/slack-quick-setup` 端点（后端 API 用） |
 | Agent 控制器 | `apps/api/src/app/agents/agents.controller.ts` | 暴露 `POST /agents/:identifier/welcome-message` 端点 |
 | Quick Setup UseCase | `apps/api/src/app/integrations/usecases/slack-quick-setup/slack-quick-setup.usecase.ts` | 调用 Slack API 创建 App 并保存凭据 |
-| OAuth URL 生成 | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url/generate-connect-oauth-url.usecase.ts` | 生成带签名的 Slack OAuth 授权 URL（被 InboxController 调用） |
+| **OAuth URL 通用分发器** | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url.usecase.ts` | 根据 `providerId` 分发给具体 Provider 的 OAuth URL 生成器（被 InboxController 调用） |
+| **Slack OAuth URL 生成器** | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts` | 生成带签名的 Slack OAuth 授权 URL（被 GenerateConnectOauthUrl 调用） |
 | OAuth 回调处理 | `apps/api/src/app/integrations/usecases/chat-oauth-callback/slack-oauth-callback/slack-oauth-callback.usecase.ts` | 处理 Slack 回调，创建 ChannelConnection 和 ChannelEndpoint |
 | 欢迎消息发送 | `apps/api/src/app/agents/usecases/send-agent-welcome-message/send-agent-welcome-message.usecase.ts` | OAuth 成功后发送首条欢迎消息 |
 
@@ -124,7 +125,7 @@ async slackQuickSetup(...) {
 
 ### 3.2 第二段：OAuth 授权与轮询调用链
 
-**⚠️ 关键修正：OAuth URL 生成和轮询都是通过 `/inbox/*` 端点，由 `InboxController` 处理，而非 `IntegrationsController`。**
+**⚠️ 关键发现：OAuth URL 生成采用**两层 UseCase 架构**，`GenerateConnectOauthUrl` 是通用分发器，根据 `providerId` 分发给 `GenerateSlackOauthUrl`。**
 
 **代码证据链：**
 
@@ -163,6 +164,21 @@ async slackQuickSetup(...) {
         ↓
 [apps/api/src/app/inbox/inbox.controller.ts:816-836]
   @Post('/channel-connections/oauth') → GenerateConnectOauthUrl.execute()
+        ↓
+[apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url.usecase.ts:18-56]
+  GenerateConnectOauthUrl.execute() → 根据 providerId 分发
+        ↓
+┌─ providerId === Slack / Novu ──┐
+│  [generate-connect-oauth-url.usecase.ts:22-37]
+│  → GenerateSlackOauthUrl.execute()
+│  [apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts:68-86]
+│    1. validateSubscriberIdOrContext()
+│    2. assertResourceExists()
+│    3. getIntegrationCredentials() 获取 clientId
+│    4. createSecureState() 生成带 HMAC 签名的 state
+│    5. resolveBotScopes() 确定 OAuth scope
+│    6. getOAuthUrl() 构建最终 Slack OAuth URL
+└───────────────────────────────────┘
         ↓
 返回 OAuth URL → window.open() 打开弹窗 → startPolling() 开始
         ↓
@@ -260,6 +276,73 @@ async generateConnectOAuthUrl(
   );
 
   return { url };
+}
+```
+
+`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url.usecase.ts:18-56` — **通用分发器**：
+```typescript
+@Injectable()
+export class GenerateConnectOauthUrl {
+  constructor(
+    private generateSlackOAuthUrl: GenerateSlackOauthUrl,
+    private generateMsTeamsOAuthUrl: GenerateMsTeamsOauthUrl,
+    private integrationRepository: IntegrationRepository
+  ) {}
+
+  async execute(command: GenerateConnectOauthUrlCommand): Promise<string> {
+    const integration = await this.getIntegration(command);
+
+    switch (integration.providerId) {
+      case ChatProviderIdEnum.Slack:
+      case ChatProviderIdEnum.Novu:
+        return this.generateSlackOAuthUrl.execute(  // 分发给 Slack 专用生成器
+          GenerateSlackOauthUrlCommand.create({
+            environmentId: command.environmentId,
+            organizationId: command.organizationId,
+            connectionIdentifier: command.connectionIdentifier,
+            subscriberId: command.subscriberId,
+            integration,
+            context: command.context,
+            scope: command.scope,
+            connectionMode: command.connectionMode,
+            autoLinkUser: command.autoLinkUser,
+            mode: 'connect',
+          })
+        );
+
+      case ChatProviderIdEnum.MsTeams:
+        return this.generateMsTeamsOAuthUrl.execute(...);
+
+      default:
+        throw new BadRequestException(`OAuth not supported for provider: ${integration.providerId}`);
+    }
+  }
+}
+```
+
+`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts:68-86` — **Slack 专用生成器**：
+```typescript
+@Injectable()
+export class GenerateSlackOauthUrl {
+  async execute(command: GenerateSlackOauthUrlCommand): Promise<string> {
+    this.validateSubscriberIdOrContext(command);
+    await this.assertResourceExists(command);
+
+    const { clientId } = await this.getIntegrationCredentials(command.integration);
+    const secureState = await this.createSecureState(
+      command.integration,
+      command.subscriberId,
+      command.context,
+      command.connectionIdentifier,
+      command.mode,
+      command.connectionMode,
+      command.autoLinkUser
+    );
+
+    const resolvedScope = command.mode === 'link_user' ? undefined : await this.resolveBotScopes(command);
+
+    return this.getOAuthUrl(clientId!, secureState, resolvedScope, command.userScope, command.mode);
+  }
 }
 ```
 
@@ -412,9 +495,64 @@ async sendWelcomeMessage(...) {
 
 ---
 
-## 四、前端界面引导流程
+## 四、OAuth URL 生成两层 UseCase 架构详解
 
-### 4.1 引导入口：`SlackSetupGuide` 组件
+### 4.1 架构说明
+
+OAuth URL 生成采用**策略模式**设计，分为两层：
+
+```
+InboxController
+    │
+    ▼
+GenerateConnectOauthUrl (通用分发器)
+    │
+    ├─ providerId === Slack/Novu → GenerateSlackOauthUrl
+    ├─ providerId === MsTeams     → GenerateMsTeamsOauthUrl
+    └─ 其他 provider               → BadRequestException
+```
+
+### 4.2 目录结构
+
+```
+apps/api/src/app/integrations/usecases/generate-chat-oath-url/
+├── generate-connect-oauth-url.usecase.ts     # 第一层：通用分发器
+├── generate-connect-oauth-url.command.ts
+├── generate-link-user-oauth-url.usecase.ts
+├── generate-link-user-oauth-url.command.ts
+├── generate-chat-oauth-url.usecase.ts        # 旧版（已废弃）
+├── generate-chat-oauth-url.command.ts
+├── chat-oauth-state.util.ts
+├── chat-oauth.constants.ts
+├── generate-slack-oath-url/                   # Slack 专用
+│   ├── generate-slack-oauth-url.usecase.ts
+│   └── generate-slack-oauth-url.command.ts
+└── generate-msteams-oath-url/                 # MsTeams 专用
+    ├── generate-msteams-oauth-url.usecase.ts
+    └── generate-msteams-oauth-url.command.ts
+```
+
+### 4.3 两层职责划分
+
+| 层级 | 文件 | 职责 |
+|------|------|------|
+| 第一层 | `generate-connect-oauth-url.usecase.ts` | 通用逻辑：查询 Integration，根据 providerId 分发给具体 Provider |
+| 第二层 | `generate-slack-oath-url/generate-slack-oauth-url.usecase.ts` | Slack 专用逻辑：验证资源、获取凭据、生成安全 State、构建 OAuth URL |
+
+### 4.4 GenerateSlackOauthUrl 核心步骤
+
+1. **验证输入**：`validateSubscriberIdOrContext()` - 验证 subscriberId 和 context 的合法性
+2. **资源检查**：`assertResourceExists()` - 确保 Subscriber 存在
+3. **获取凭据**：`getIntegrationCredentials()` - 获取 clientId（支持 Novu 托管凭据）
+4. **生成安全 State**：`createSecureState()` - 包含上下文信息 + HMAC 签名 + 5分钟超时
+5. **解析 Scope**：`resolveBotScopes()` - Agent 模式使用 `SLACK_AGENT_OAUTH_SCOPES`
+6. **构建 URL**：`getOAuthUrl()` - 拼接最终的 Slack OAuth 授权 URL
+
+---
+
+## 五、前端界面引导流程
+
+### 5.1 引导入口：`SlackSetupGuide` 组件
 
 **文件**: `apps/dashboard/src/components/agents/slack-setup-guide.tsx`
 
@@ -437,7 +575,7 @@ const activeSetupMode = isQuickSetupEnabled ? setupMode : 'manual';
 2. **粘贴凭据** — 用户手动复制 App ID、Client ID、Client Secret、Signing Secret
 3. **安装 App 到工作区** — 同上
 
-### 4.2 Slack App Manifest 动态生成
+### 5.2 Slack App Manifest 动态生成
 
 `buildSlackManifestYaml()` 函数根据 Agent 信息动态生成 Slack App 配置：
 
@@ -459,14 +597,24 @@ function buildSlackManifestYaml(agent: AgentResponse, webhookHandlerUrl: string,
 
 ---
 
-## 五、OAuth 安全机制
+## 六、OAuth 安全机制
 
-### 5.1 安全 State 设计
+### 6.1 安全 State 设计
 
-`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url/generate-connect-oauth-url.usecase.ts`
+`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts:168-206`
 
 ```typescript
-private async createSecureState(...): Promise<string> {
+private async createSecureState(
+  integration: IntegrationEntity,
+  subscriberId?: string,
+  context?: ContextPayload,
+  connectionIdentifier?: string,
+  mode?: OAuthMode,
+  connectionMode?: ConnectionMode,
+  autoLinkUser?: boolean
+): Promise<string> {
+  const { _environmentId, _organizationId, identifier, providerId } = integration;
+
   const stateData: StateData = {
     identifier: connectionIdentifier,
     subscriberId,
@@ -492,15 +640,26 @@ private async createSecureState(...): Promise<string> {
 **State 验证**（回调时使用）:
 ```typescript
 static async validateAndDecodeState(state: string, environmentApiKey: string): Promise<StateData> {
-  const { payload, signature } = splitOAuthState(state);
-  const expectedSignature = createHash(environmentApiKey, payload);
-  
-  if (signature !== expectedSignature) throw new Error('Invalid state signature');
-  
-  const data = JSON.parse(payload);
-  if (Date.now() - data.timestamp > FIVE_MINUTES) throw new Error('OAuth state expired');
-  
-  return data;
+  try {
+    const { payload, signature } = splitOAuthState(state);
+
+    const expectedSignature = createHash(environmentApiKey, payload);
+    if (signature !== expectedSignature) {
+      throw new Error('Invalid state signature');
+    }
+
+    const data = JSON.parse(payload);
+
+    // Validate timestamp (5 minutes expiry)
+    const FIVE_MINUTES = 5 * 60 * 1000;
+    if (Date.now() - data.timestamp > FIVE_MINUTES) {
+      throw new Error('OAuth state expired');
+    }
+
+    return data;
+  } catch (error) {
+    throw new BadRequestException('Invalid OAuth state parameter');
+  }
 }
 ```
 
@@ -509,10 +668,10 @@ static async validateAndDecodeState(state: string, environmentApiKey: string): P
 - 5分钟超时防止重放攻击
 - 包含完整上下文（environmentId, organizationId, integrationIdentifier）
 
-### 5.2 Scope 动态解析
+### 6.2 Scope 动态解析
 
 ```typescript
-private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise<string[] | undefined> {
+private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<string[] | undefined> {
   if (command.scope !== undefined) return command.scope;
 
   const isAgentLinked = await this.isIntegrationLinkedToAgent(command.integration);
@@ -527,9 +686,9 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 
 ---
 
-## 六、关键数据流转与存储
+## 七、关键数据流转与存储
 
-### 6.1 Integration 凭据结构
+### 7.1 Integration 凭据结构
 
 ```javascript
 // Integration.credentials (加密存储)
@@ -541,7 +700,7 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 }
 ```
 
-### 6.2 ChannelConnection 结构
+### 7.2 ChannelConnection 结构
 
 ```javascript
 // ChannelConnection (存储工作区连接)
@@ -560,7 +719,7 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 }
 ```
 
-### 6.3 ChannelEndpoint 结构
+### 7.3 ChannelEndpoint 结构
 
 ```javascript
 // ChannelEndpoint (存储用户级端点)
@@ -577,7 +736,7 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 
 ---
 
-## 七、完整时序图
+## 八、完整时序图
 
 ```
 用户操作                          前端 (Dashboard/SDK)                    后端 (API)                           Slack
@@ -618,8 +777,14 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
    │                                  │                                        │ InboxController                │
    │                                  │                                        │ @Post('/channel-connections/oauth')                           │
    │                                  │                                        │ GenerateConnectOauthUrl.execute()                             │
-   │                                  │                                        │ 生成带签名的 State             │
-   │                                  │                                        │ 构建 OAuth URL                │
+   │                                  │                                        │  ├─ 查询 Integration            │
+   │                                  │                                        │  └─ providerId === Slack → GenerateSlackOauthUrl.execute()   │
+   │                                  │                                        │    1. validateSubscriberIdOrContext                            │
+   │                                  │                                        │    2. assertResourceExists                                    │
+   │                                  │                                        │    3. getIntegrationCredentials                                │
+   │                                  │                                        │    4. createSecureState (HMAC 签名)                             │
+   │                                  │                                        │    5. resolveBotScopes                                        │
+   │                                  │                                        │    6. 构建 OAuth URL                                          │
    │                                  │◄────────────────────────────────────────┤                                │
    │                                  │ window.open(Slack OAuth URL)           │                                │
    │                                  ├─────────────────────────────────────────┼────────────────────────────────►│
@@ -656,36 +821,37 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 
 ---
 
-## 八、错误处理与边界情况
+## 九、错误处理与边界情况
 
-### 8.1 Quick Setup 错误处理
+### 9.1 Quick Setup 错误处理
 - **Invalid Token**: 提示用户 Token 无效或过期
 - **Invalid Manifest**: Slack API 拒绝的 manifest 格式错误
 - **Integration 不存在**: 404 错误
 
-### 8.2 OAuth 错误处理
+### 9.2 OAuth 错误处理
 - **State 验证失败**: 签名不匹配或过期（5分钟超时）
 - **Token 交换失败**: Slack 返回错误信息
 - **凭据缺失**: Integration 缺少 clientId/clientSecret
 
-### 8.3 欢迎消息发送失败
+### 9.3 欢迎消息发送失败
 - **Endpoint 不存在**: 用户未完成链接（静默失败，返回 `sent: false`）
 - **Slack API 错误**: 捕获异常并记录日志，不阻塞流程
 
 ---
 
-## 九、设计亮点与可优化点
+## 十、设计亮点与可优化点
 
-### 9.1 设计亮点
+### 10.1 设计亮点
 1. **前后端 Manifest 双生成** - 前端用于显示，后端用于实际创建，确保一致性
 2. **安全 State 设计** - HMAC 签名 + 超时机制，防止 CSRF 和重放攻击
 3. **轮询 + 回调双机制** - OAuth 回调写入数据，前端轮询感知状态变化
 4. **自动用户链接** - OAuth 回调中自动创建 `SLACK_USER` Endpoint，减少用户操作
 5. **三层按钮架构** - React → SolidJS 桥接 → SolidJS 原生，兼顾框架兼容性和性能
 6. **Inbox 统一入口** - 所有前端 SDK 调用通过 `/inbox/*` 端点，使用 subscriberJwt 鉴权，权限隔离清晰
-7. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
+7. **两层 OAuth UseCase 架构** - 通用分发器 + Provider 专用实现，符合开闭原则，易于扩展新的 Chat Provider
+8. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
 
-### 9.2 潜在优化点
+### 10.2 潜在优化点
 1. **轮询效率** - 当前 2.5s 轮询可考虑使用 WebSocket 推送替代
 2. **错误重试** - 欢迎消息发送失败没有重试机制
 3. **幂等性** - Quick Setup 和 OAuth 回调需要考虑重复调用的幂等处理
@@ -697,9 +863,26 @@ private async resolveBotScopes(command: GenerateConnectOauthUrlCommand): Promise
 
 | 操作 | 前端 SDK 端点 | 后端 Controller | 说明 |
 |------|-------------|-----------------|------|
-| 生成 OAuth URL | `POST /inbox/channel-connections/oauth` | InboxController | 前端 SDK 实际使用 |
+| 生成 OAuth URL | `POST /inbox/channel-connections/oauth` | InboxController | 前端 SDK 实际使用，调用 GenerateConnectOauthUrl 分发器 |
 | 轮询连接状态 | `GET /inbox/channel-connections/:identifier` | InboxController | 前端 SDK 实际使用 |
 | 生成 OAuth URL (后端 API) | `POST /integrations/channel-connections/oauth` | IntegrationsController | 后端 API 专用，已标记旧端点为 deprecated |
 | Slack OAuth 回调 | `GET /integrations/chat/oauth/callback` | IntegrationsController | Slack 重定向地址 |
 | Quick Setup | `POST /integrations/:id/slack-quick-setup` | IntegrationsController | 创建 Slack App |
 | 发送欢迎消息 | `POST /agents/:identifier/welcome-message` | AgentsController | OAuth 成功后触发 |
+
+---
+
+## 附录：关键文件路径速查表
+
+| 模块 | 准确路径 |
+|------|---------|
+| OAuth 通用分发器 UseCase | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-connect-oauth-url.usecase.ts` |
+| Slack OAuth 专用 UseCase | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts` |
+| 旧版 Slack OAuth UseCase (已废弃) | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-chat-oauth-url.usecase.ts` |
+| MsTeams OAuth 专用 UseCase | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-msteams-oath-url/generate-msteams-oauth-url.usecase.ts` |
+| Inbox Controller | `apps/api/src/app/inbox/inbox.controller.ts` |
+| Integrations Controller | `apps/api/src/app/integrations/integrations.controller.ts` |
+| Slack Setup Guide | `apps/dashboard/src/components/agents/slack-setup-guide.tsx` |
+| Slack Connect Button (React) | `packages/react/src/components/slack-connect-button/SlackConnectButton.tsx` |
+| Slack Connect Button (SolidJS) | `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx` |
+| Inbox Service (SDK) | `packages/js/src/api/inbox-service.ts` |
