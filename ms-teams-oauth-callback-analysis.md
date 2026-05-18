@@ -287,6 +287,16 @@ MsTeamsOauthCallback.execute(mode='connect')
 
 **结论**：整个链路中 `connectionIdentifier` 完全一致，确保了 ChannelEndpoint 能正确关联到 ChannelConnection。
 
+### 4.3 自定义 connectionIdentifier 的约束
+
+如果调用方传入自定义的 `connectionIdentifier`，必须满足：
+
+1. **手动绑定时必须传入相同值**：使用 `MsTeamsLinkUser` 组件时，如果之前创建 Connection 时用了自定义 identifier，必须通过 `connectionIdentifier` prop 传入相同的值，否则会创建孤立的 ChannelEndpoint。
+
+2. **唯一性约束**：同一环境下 identifier 必须唯一，否则会抛出 409 Conflict 错误。
+
+3. **默认值回退**：如果未传入，前端会自动生成默认值，但此时必须保证 subscriberId 存在（subscriber 模式）或 context 存在（shared 模式）。
+
 ---
 
 ## 五、租户凭据持久化：Admin Consent 模式
@@ -323,10 +333,10 @@ await this.createChannelConnection.execute(
 |------|------|
 | `identifier` | 唯一标识，前端生成：`chconn-msteams-default-{subscriberId}` |
 | `integrationIdentifier` | 关联的集成配置 |
-| `subscriberId` | 关联的订阅者 (可选，shared 模式为 null) |
+| `subscriberId` | 关联的订阅者 (subscriber 模式必填，shared 模式为 null) |
 | `workspace` | 存储 `{ id: tenantId }` - **用户租户 ID，来自 admin_consent 回调** |
 | `auth` | 加密存储的认证信息，这里是 `{ accessToken: 'app-only' }` |
-| `contextKeys` | 上下文标签数组 |
+| `contextKeys` | 上下文标签数组 (shared 模式必填) |
 
 **唯一性约束**: 同一集成 + 订阅者 + 上下文组合只能有一个连接
 
@@ -498,7 +508,7 @@ ChannelConnection (租户级连接)
       │
       ├─ identifier: 'chconn-msteams-default-{subscriberId}'  ⚠️ 前端生成
       ├─ integrationIdentifier: 关联 Integration
-      ├─ subscriberId: 绑定到订阅者
+      ├─ subscriberId: 绑定到订阅者 (subscriber模式) / null (shared模式)
       ├─ workspace: { id: tenantId }  ← ⚠️ 用户租户 ID（来自 admin_consent 回调）
       └─ auth: { accessToken: 'app-only' }
       │
@@ -523,9 +533,106 @@ ChannelEndpoint (用户级端点)
 
 ---
 
-## 八、autoLinkUser 未触发或失败后的绑定闭环
+## 八、手动补绑入口：路由与前端调用映射
 
-### 8.1 触发条件与失败场景
+### 8.1 后端路由修正
+
+**⚠️ 之前的理解偏差**：手动补绑的后端路由不是 `/chat/oauth/link-user-url`，而是 `/channel-endpoints/oauth`。
+
+**文件**: `apps/api/src/app/integrations/integrations.controller.ts:705`
+
+```typescript
+@Post('/channel-endpoints/oauth')
+@ApiResponse(GenerateChatOAuthUrlResponseDto, 201)
+@ApiOperation({
+  summary: 'Generate OAuth URL to link a subscriber user identity',
+  description: `Generate an OAuth URL that links a specific subscriber to their chat identity (Slack user ID or MS Teams user OID). 
+  The generated URL expires after 5 minutes.`,
+})
+@SdkMethodName('generateLinkUserOAuthUrl')
+@RequirePermissions(PermissionsEnum.INTEGRATION_WRITE)
+@ExternalApiAccessible()
+@RequireAuthentication()
+async generateLinkUserOAuthUrl(
+  @UserSession() user: UserSessionData,
+  @Body() body: GenerateLinkUserOauthUrlRequestDto
+): Promise<GenerateChatOAuthUrlResponseDto> {
+  const url = await this.generateLinkUserOauthUrlUsecase.execute(
+    GenerateLinkUserOauthUrlCommand.create({
+      environmentId: user.environmentId,
+      organizationId: user.organizationId,
+      subscriberId: body.subscriberId,
+      integrationIdentifier: body.integrationIdentifier,
+      connectionIdentifier: body.connectionIdentifier,  // ⚠️ 必须与之前的 connection 一致
+      context: body.context,
+      userScope: body.userScope,
+    })
+  );
+  return { url };
+}
+```
+
+### 8.2 前端调用链路
+
+**文件**: `packages/js/src/channel-endpoints/helpers.ts:14`
+
+```
+前端 MsTeamsLinkUser 组件
+      │
+      ▼
+useChannelEndpoint hook
+      │
+      ├─ generateLinkUserOAuthUrl()
+      │
+      ▼
+channelEndpoints.generateLinkUserOAuthUrl(args)
+      │
+      ▼
+apiService.generateLinkUserOAuthUrl(args)
+      │
+      ▼
+POST /v1/inbox/channel-endpoints/oauth  ⚠️ 真实 API 路由
+```
+
+**前端 SDK 代码** (`packages/js/src/api/inbox-service.ts:596`):
+
+```typescript
+generateLinkUserOAuthUrl({
+  integrationIdentifier,
+  connectionIdentifier,
+  subscriberId,
+  context,
+  userScope,
+}: GenerateLinkUserOAuthUrlArgs): Promise<{ url: string }> {
+  return this.#httpClient.post(CHANNEL_ENDPOINTS_OAUTH_ROUTE, {
+    integrationIdentifier,
+    connectionIdentifier,
+    subscriberId,
+    context,
+    userScope,
+  });
+}
+```
+
+**常量定义** (`packages/js/src/api/inbox-service.ts:40-41`):
+```typescript
+const CHANNEL_ENDPOINTS_ROUTE = `${INBOX_ROUTE}/channel-endpoints`;
+const CHANNEL_ENDPOINTS_OAUTH_ROUTE = `${CHANNEL_ENDPOINTS_ROUTE}/oauth`;
+```
+
+### 8.3 路由映射表
+
+| 功能 | 后端 Controller 路由 | 前端 SDK 方法 | 说明 |
+|------|---------------------|-------------|------|
+| 租户级授权 URL | `POST /v1/integrations/channel-connections/oauth` | `channelConnections.generateConnectOAuthUrl()` | 生成 admin_consent URL |
+| 用户级绑定 URL | `POST /v1/integrations/channel-endpoints/oauth` | `channelEndpoints.generateLinkUserOAuthUrl()` | 生成 link_user URL |
+| 回调处理 | `GET /v1/integrations/chat/oauth/callback` | N/A | 统一处理所有 chat OAuth 回调 |
+
+---
+
+## 九、autoLinkUser 未触发或失败后的绑定闭环
+
+### 9.1 触发条件与失败场景
 
 **触发条件矩阵**:
 
@@ -540,7 +647,7 @@ ChannelEndpoint (用户级端点)
 2. State 过期（5 分钟有效期）
 3. 其他生成 URL 时的异常
 
-### 8.2 前端补齐方案：MsTeamsLinkUser 组件
+### 9.2 前端补齐方案：MsTeamsLinkUser 组件
 
 **文件**: `packages/js/src/ui/components/msteams-link-user/MsTeamsLinkUser.tsx`
 
@@ -573,34 +680,23 @@ ChannelEndpoint (用户级端点)
             └─ 超时 → 提示错误
 ```
 
-### 8.3 后端补齐 API
+### 9.3 后端补齐 API
 
 #### 单独的 link_user URL 生成接口
 
-**文件**: `apps/api/src/app/integrations/integrations.controller.ts:716`
+**文件**: `apps/api/src/app/integrations/integrations.controller.ts:705`
 
 ```typescript
-@Post('/chat/oauth/link-user-url')
+@Post('/channel-endpoints/oauth')
 @SdkMethodName('generateLinkUserOAuthUrl')
 async generateLinkUserOAuthUrl(
   @UserSession() user: UserSessionData,
   @Body() body: GenerateLinkUserOauthUrlRequestDto
 ): Promise<GenerateChatOAuthUrlResponseDto> {
-  const url = await this.generateLinkUserOauthUrlUsecase.execute(
-    GenerateLinkUserOauthUrlCommand.create({
-      environmentId: user.environmentId,
-      organizationId: user.organizationId,
-      subscriberId: body.subscriberId,
-      integrationIdentifier: body.integrationIdentifier,
-      connectionIdentifier: body.connectionIdentifier,  // ⚠️ 必须与之前的 connection 一致
-      context: body.context,
-    })
-  );
-  return { url };
+  // ⚠️ 关键: connectionIdentifier 必须与之前创建 ChannelConnection 时使用的标识完全一致
+  // 否则创建的 ChannelEndpoint 无法关联到正确的 Connection
 }
 ```
-
-**关键**: `connectionIdentifier` 必须与之前创建 ChannelConnection 时使用的标识完全一致，否则创建的 ChannelEndpoint 无法关联到正确的 Connection。
 
 #### ChannelEndpoints 查询接口
 
@@ -618,7 +714,7 @@ async listChannelEndpoints(
 }
 ```
 
-### 8.4 绑定闭环时序图
+### 9.4 绑定闭环时序图
 
 ```
 autoLinkUser 失败或未触发
@@ -632,12 +728,12 @@ ChannelConnection 已创建（有 tenantId），但 ChannelEndpoint 不存在
       ▼
 用户点击 "Link Teams User"
       │
-      ├─ 前端调用 generateLinkUserOAuthUrl API
-      │   └─ 传入相同的 connectionIdentifier
-      │
-      ├─ 前端打开 OAuth 弹窗
-      │
-      └─ 前端开始轮询 channelEndpoints.list()
+      ├─ 前端生成相同的 connectionIdentifier: 'chconn-msteams-default-xxx'
+      ├─ 调用 generateLinkUserOAuthUrl API
+      │   └─ POST /v1/integrations/channel-endpoints/oauth
+      │      参数: connectionIdentifier='chconn-msteams-default-xxx'
+      ├─ 打开 OAuth 弹窗
+      └─ 开始轮询 channelEndpoints.list(integrationId, connectionId)
             │
             ▼
 用户完成授权
@@ -654,9 +750,133 @@ ChannelConnection 已创建（有 tenantId），但 ChannelEndpoint 不存在
 
 ---
 
-## 九、未绑定风险分析
+## 十、subscriber 与 shared 两种模式的绑定差异与风险
 
-### 9.1 风险场景
+### 10.1 connectionMode 验证规则
+
+**文件**: `apps/api/src/app/channel-connections/usecases/channel-connection.utils.ts:16`
+
+```typescript
+export function validateConnectionMode({
+  connectionMode,
+  subscriberId,
+  context,
+}: {
+  connectionMode?: ConnectionMode;
+  subscriberId?: string;
+  context?: ContextPayload;
+}): void {
+  if (connectionMode === 'shared') {
+    if (!context) {
+      throw new BadRequestException('context is required when connectionMode is "shared"');
+    }
+    return;
+  }
+
+  if (connectionMode === 'subscriber') {
+    if (!subscriberId) {
+      throw new BadRequestException('subscriberId is required when connectionMode is "subscriber"');
+    }
+    return;
+  }
+
+  if (!subscriberId && !context) {
+    throw new BadRequestException('Either subscriberId or context must be provided');
+  }
+}
+```
+
+### 10.2 两种模式对比
+
+| 维度 | subscriber 模式 | shared 模式 |
+|------|---------------|------------|
+| **必填字段** | `subscriberId` | `context` |
+| **connectionIdentifier 生成** | `chconn-msteams-default-{subscriberId}` | `chconn-msteams-default` (无 subscriberId 时) |
+| **ChannelConnection.subscriberId** | 存储 subscriberId | `null` |
+| **ChannelConnection.contextKeys** | 可选 | 必填（存储 context key 列表）|
+| **autoLinkUser 默认值** | `true`（前端组件默认） | `false` |
+| **适用场景** | 单个用户独立绑定 | 多用户共享同一个租户连接 |
+
+### 10.3 subscriber 模式详解
+
+**特点**:
+- 每个 subscriber 有独立的 ChannelConnection
+- connectionIdentifier 包含 subscriberId，天然隔离
+- autoLinkUser 默认开启，一次点击完成两步绑定
+- ChannelEndpoint 直接绑定到 subscriberId
+
+**数据流**:
+```
+Subscriber A → Connection A (subscriberId=A) → Endpoint A (userId=oid_A)
+Subscriber B → Connection B (subscriberId=B) → Endpoint B (userId=oid_B)
+```
+
+**风险**:
+- 每个 subscriber 都需要管理员授权一次（如果是不同租户）
+- 管理员需要为每个用户单独授权，操作繁琐
+
+### 10.4 shared 模式详解
+
+**特点**:
+- 多个 subscriber 共享同一个 ChannelConnection（同一个租户）
+- connectionIdentifier 不包含 subscriberId（通常基于 context 生成）
+- autoLinkUser 默认关闭，需要单独为每个用户执行 link_user
+- 所有 ChannelEndpoint 关联到同一个 Connection
+
+**数据流**:
+```
+Connection X (shared, context={team: 'sales'})
+      ├─ Endpoint A (subscriberId=A, userId=oid_A)
+      ├─ Endpoint B (subscriberId=B, userId=oid_B)
+      └─ Endpoint C (subscriberId=C, userId=oid_C)
+```
+
+**风险**:
+1. **autoLinkUser 不适用**: shared 模式下 autoLinkUser 默认为 false，即使设为 true 也无法正确绑定（因为 connection 的 subscriberId 为 null）
+2. **必须手动绑定**: 每个用户都需要单独使用 MsTeamsLinkUser 组件完成绑定
+3. **context 一致性**: 所有用户必须使用相同的 context 才能关联到同一个 shared connection
+4. **connectionIdentifier 匹配**: 手动绑定时必须传入与创建 connection 时相同的 connectionIdentifier
+
+### 10.5 shared 模式的绑定闭环
+
+```
+管理员创建 shared Connection (context={team: 'sales'})
+      │
+      ├─ connectionIdentifier = 'chconn-msteams-default-sales-team'
+      └─ 存储 tenantId 到 workspace.id
+      │
+      ▼
+用户 A 打开应用
+      │
+      ├─ 前端使用相同的 connectionIdentifier 查询 Endpoints
+      ├─ 发现未绑定，显示 MsTeamsLinkUser 组件
+      └─ 用户点击绑定 → 完成授权 → 创建 Endpoint A (subscriberId=A)
+      │
+      ▼
+用户 B 打开应用
+      │
+      ├─ 前端使用相同的 connectionIdentifier 查询 Endpoints
+      ├─ 发现未绑定，显示 MsTeamsLinkUser 组件
+      └─ 用户点击绑定 → 完成授权 → 创建 Endpoint B (subscriberId=B)
+      │
+      ▼
+所有用户共享同一个 Connection，但有各自的 Endpoint
+```
+
+### 10.6 模式选择建议
+
+| 场景 | 推荐模式 | 理由 |
+|------|---------|------|
+| 单租户、用户较少 | subscriber 模式 | 简单，一次点击完成绑定 |
+| 单租户、用户较多 | shared 模式 | 管理员只需授权一次 |
+| 多租户 | subscriber 模式 | 每个租户单独授权 |
+| 需要按团队/部门隔离 | shared 模式 | 每个团队一个 shared connection |
+
+---
+
+## 十一、未绑定风险分析
+
+### 11.1 风险场景
 
 | 场景 | 原因 | 后果 |
 |------|------|------|
@@ -665,35 +885,43 @@ ChannelConnection 已创建（有 tenantId），但 ChannelEndpoint 不存在
 | 用户在 link_user 步骤关闭弹窗 | 用户主动中断 | Connection 存在但无 Endpoint |
 | Bot 安装失败 | 权限不足、应用未发布等 | 抛出错误或返回错误页，无 Endpoint |
 | 前端未正确实现轮询 | 未检测到绑定完成 | 前端状态显示异常 |
+| shared 模式下未手动绑定 | 用户不知道需要第二步 | Connection 存在但用户无 Endpoint |
+| connectionIdentifier 不匹配 | 手动绑定时传入错误的 identifier | 创建孤立的 Endpoint，无法关联 Connection |
 
-### 9.2 风险影响
+### 11.2 风险影响
 
 1. **消息发送失败**: 发送消息时找不到 ChannelEndpoint，导致投递失败
 2. **数据不一致**: ChannelConnection 存在但无关联的 ChannelEndpoint，形成"僵尸连接"
-3. **用户体验差**: 用户可能不知道需要手动完成第二步绑定
+3. **孤立 Endpoint**: connectionIdentifier 不匹配时，Endpoint 无法关联到 Connection，发送时缺少 tenantId
+4. **用户体验差**: 用户可能不知道需要手动完成第二步绑定
+5. **shared 模式扩散风险**: 一个 shared connection 下多个用户未绑定，影响范围大
 
-### 9.3 缓解措施
+### 11.3 缓解措施
 
 1. **前端状态检测**: 组件初始化时查询 ChannelEndpoints，明确显示绑定状态
 2. **引导手动绑定**: 未绑定时显示 MsTeamsLinkUser 组件，引导用户完成绑定
-3. **连接清理机制**: 定期清理无 Endpoint 的僵尸 Connection（可选）
-4. **错误监控**: 监控 autoLinkUser 失败率，及时发现配置问题
-5. **文档说明**: 明确告知用户两步授权流程，避免误解
+3. **connectionIdentifier 一致性保障**:
+   - 推荐使用默认生成算法，避免自定义 identifier
+   - 如必须自定义，确保在 ConnectButton 和 LinkUser 组件中传入相同值
+4. **连接清理机制**: 定期清理无 Endpoint 的僵尸 Connection（可选）
+5. **错误监控**: 监控 autoLinkUser 失败率和孤立 Endpoint 数量，及时发现配置问题
+6. **文档说明**: 明确告知用户两种模式的绑定流程差异，避免误解
+7. **shared 模式特殊处理**: 为 shared 模式提供批量绑定功能或管理员视角的绑定状态监控
 
 ---
 
-## 十、凭据服务：MsTeamsTokenService
+## 十二、凭据服务：MsTeamsTokenService
 
 **文件**: `libs/application-generic/src/services/ms-teams-token.service.ts`
 
-### 10.1 两种 Token 类型
+### 12.1 两种 Token 类型
 
 | 方法 | 用途 | 作用域 | 缓存 Key |
 |------|------|--------|----------|
 | `getGraphToken()` | Graph API 调用 (安装 Bot、查询应用等) | `https://graph.microsoft.com/.default` | `msteams:graph-token:{clientId}:{tenantId}:{secretHash}` |
 | `getBotFrameworkToken()` | Bot Framework 发送消息 | `https://api.botframework.com/.default` | `msteams:bot-token:{clientId}:{tenantId}:{secretHash}` |
 
-### 10.2 缓存设计
+### 12.2 缓存设计
 
 - 使用 `@CachedResponse` 装饰器，TTL 55 分钟 (1 小时 token 减 5 分钟缓冲)
 - 缓存 Key 包含 `secretHash` (SHA-256 前 8 位)，密钥轮换后自动失效
@@ -701,9 +929,9 @@ ChannelConnection 已创建（有 tenantId），但 ChannelEndpoint 不存在
 
 ---
 
-## 十一、完整时序与数据流
+## 十三、完整时序与数据流
 
-### 11.1 Admin Consent + autoLinkUser 完整流程
+### 13.1 Admin Consent + autoLinkUser 完整流程
 
 ```
 用户点击 SDK MsTeamsConnectButton (autoLinkUser=true, subscriberId='xxx')
@@ -771,7 +999,7 @@ MsTeamsOauthCallback.execute(mode=connect)
                 返回分流：redirectUrl 或 window.close()
 ```
 
-### 11.2 手动补齐绑定流程
+### 13.2 手动补齐绑定流程
 
 ```
 autoLinkUser 失败 → Connection 存在但无 Endpoint
@@ -784,7 +1012,8 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
       │
       ├─ 前端生成相同的 connectionIdentifier: 'chconn-msteams-default-xxx'
       ├─ 调用 generateLinkUserOAuthUrl API
-      │   └─ 参数: connectionIdentifier='chconn-msteams-default-xxx'
+      │   └─ POST /v1/integrations/channel-endpoints/oauth
+      │      参数: connectionIdentifier='chconn-msteams-default-xxx'
       ├─ 打开 OAuth 弹窗
       └─ 开始轮询 channelEndpoints.list(integrationId, connectionId)
             │
@@ -797,9 +1026,9 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
 
 ---
 
-## 十二、关键设计亮点与注意事项
+## 十四、关键设计亮点与注意事项
 
-### 12.1 设计亮点
+### 14.1 设计亮点
 
 1. **双模式授权**: Admin Consent 做租户级授权，link_user 做用户级绑定，职责分离清晰
 2. **双 tenantId 设计**: Bot 租户 ID（配置）与用户租户 ID（回调）分离，支持多租户场景
@@ -811,26 +1040,30 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
 8. **缓存感知密钥轮换**: 缓存 Key 包含密钥哈希，密钥更新后缓存自动失效
 9. **友好错误处理**: Bot 安装失败时返回 HTML 错误页，而非直接抛出异常
 10. **独立补齐机制**: MsTeamsLinkUser 组件支持手动绑定，形成完整闭环
+11. **模式灵活**: 支持 subscriber 和 shared 两种模式，适应不同业务场景
 
-### 12.2 关键注意事项
+### 14.2 关键注意事项
 
 1. **tenantId 来源混淆**: 必须区分 Bot 租户 ID（集成配置）和用户租户 ID（回调参数），两者用途不同
 2. **connectionIdentifier 一致性**: 手动绑定时必须使用与创建 Connection 时相同的 identifier
-3. **autoLinkUser 严格相等**: 只有 `autoLinkUser === true` 才触发链式调用，注意是严格相等
-4. **链式调用失败不中断**: autoLinkUser 失败只打日志，不影响主流程完成
-5. **link_user 前置条件**: link_user 模式要求集成配置中已存在 tenantId，必须先完成 admin_consent
-6. **返回分流优先级**: autoLinkUser 跳转 > redirectUrl > window.close()，注意提前 return 的情况
-7. **未绑定风险**: autoLinkUser 失败后需要前端引导用户手动完成绑定，否则消息发送会失败
+3. **路由修正**: 手动补绑的后端路由是 `/channel-endpoints/oauth`，不是 `/chat/oauth/link-user-url`
+4. **autoLinkUser 严格相等**: 只有 `autoLinkUser === true` 才触发链式调用，注意是严格相等
+5. **链式调用失败不中断**: autoLinkUser 失败只打日志，不影响主流程完成
+6. **link_user 前置条件**: link_user 模式要求集成配置中已存在 tenantId，必须先完成 admin_consent
+7. **返回分流优先级**: autoLinkUser 跳转 > redirectUrl > window.close()，注意提前 return 的情况
+8. **未绑定风险**: autoLinkUser 失败后需要前端引导用户手动完成绑定，否则消息发送会失败
+9. **shared 模式特殊处理**: shared 模式下 autoLinkUser 不适用，每个用户必须单独绑定
+10. **connectionIdentifier 自定义风险**: 自定义 identifier 时必须确保在 ConnectButton 和 LinkUser 组件中一致
 
 ---
 
-## 十三、核心文件索引
+## 十五、核心文件索引
 
 | 文件 | 职责 |
 |------|------|
-| `integrations.controller.ts:735` | 回调入口 Controller |
-| `integrations.controller.ts:684` | generateConnectOAuthUrl 接口 |
-| `integrations.controller.ts:716` | generateLinkUserOAuthUrl 接口（手动绑定用） |
+| `integrations.controller.ts:705` | generateLinkUserOAuthUrl 接口（手动绑定用，路由: `/channel-endpoints/oauth`） |
+| `integrations.controller.ts:684` | generateConnectOAuthUrl 接口（路由: `/channel-connections/oauth`） |
+| `integrations.controller.ts:735` | 回调入口 Controller（路由: `/chat/oauth/callback`） |
 | `chat-oauth-callback.usecase.ts` | 按 providerId 路由回调 |
 | `generate-msteams-oauth-url.usecase.ts` | 生成授权 URL、State 编解码验证 |
 | `msteams-oauth-callback.usecase.ts` | MS Teams 回调核心逻辑、返回分流、错误处理 |
@@ -838,9 +1071,12 @@ autoLinkUser 失败 → Connection 存在但无 Endpoint
 | `create-channel-endpoint.usecase.ts` | 创建用户级通道端点 |
 | `list-channel-endpoints.usecase.ts` | 查询通道端点列表（前端轮询用） |
 | `resolve-channel-endpoints.usecase.ts` | 发送时解析端点、双 tenantId 组装 |
+| `channel-connection.utils.ts` | connectionMode 验证规则 |
 | `ms-teams-token.service.ts` | Graph/Bot Framework Token 服务 |
 | `msTeams.provider.ts` | MS Teams 消息发送 Provider |
 | `chat-oauth-state.util.ts` | State 编解码工具 |
 | `MsTeamsConnectButton.tsx` | 前端连接按钮组件 |
 | `MsTeamsLinkUser.tsx` | 前端手动绑定组件 |
 | `constants.ts` | connectionIdentifier 生成逻辑 |
+| `inbox-service.ts` | 前端 SDK API 封装 |
+| `helpers.ts` (channel-endpoints) | 前端 channelEndpoints 方法实现 |
