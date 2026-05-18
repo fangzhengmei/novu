@@ -12,33 +12,303 @@ Slack 渠道首次接入包含四个核心阶段，涉及前后端多个模块�
 
 ## 二、模块架构与关键文件
 
-### 2.1 前端层 (Dashboard)
-| 模块 | 文件路径 | 核心职责 |
-|------|----------|----------|
-| 安装引导界面 | `apps/dashboard/src/components/agents/slack-setup-guide.tsx` | 引导用户完成 Quick Setup 或 Manual Setup |
-| 连接按钮组件 | `packages/react/src/components/slack-connect-button/SlackConnectButton.tsx` | 触发 OAuth 流程，轮询连接状态 |
-| 连接按钮实现 | `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx` | SolidJS 版本底层实现 |
-| API 客户端 | `apps/dashboard/src/api/integrations.ts` | 调用 slackQuickSetup 等后端接口 |
-| 欢迎消息 API | `apps/dashboard/src/api/agents.ts` | 调用 sendAgentWelcomeMessage |
+### 2.1 前端层 (Dashboard + React Package + JS Package)
+
+Slack 连接按钮采用三层架构设计（React → SolidJS 桥接 → SolidJS 原生实现）：
+
+| 模块层级 | 文件路径 | 核心职责 |
+|----------|----------|----------|
+| 安装引导界面 | `apps/dashboard/src/components/agents/slack-setup-guide.tsx` | 引导用户完成 Quick Setup 或 Manual Setup，触发欢迎消息 |
+| React 按钮包装器 | `packages/react/src/components/slack-connect-button/SlackConnectButton.tsx` | React 对外导出组件，包裹 NovuUI Provider |
+| React 桥接层 | `packages/react/src/components/slack-connect-button/DefaultSlackConnectButton.tsx` | 通过 `Mounter` 将 React Props 传递给 SolidJS 实现 |
+| SolidJS 底层实现 | `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx` | 核心逻辑：生成 OAuth URL、打开弹窗、轮询连接状态 |
+| 集成 API 客户端 | `apps/dashboard/src/api/integrations.ts` | `slackQuickSetup()` 调用后端快速设置接口 |
+| Agent API 客户端 | `apps/dashboard/src/api/agents.ts` | `sendAgentWelcomeMessage()` 调用欢迎消息接口 |
 
 ### 2.2 后端 API 层
+
 | 模块 | 文件路径 | 核心职责 |
 |------|----------|----------|
-| 集成控制器 | `apps/api/src/app/integrations/integrations.controller.ts` | 暴露 /integrations/slack/quick-setup 等端点 |
-| Quick Setup UseCase | `apps/api/src/app/integrations/usecases/slack-quick-setup/slack-quick-setup.usecase.ts` | 自动创建 Slack App 并保存凭据 |
+| 集成控制器 | `apps/api/src/app/integrations/integrations.controller.ts` | 暴露 `POST /integrations/:integrationId/slack-quick-setup` 端点 |
+| Agent 控制器 | `apps/api/src/app/agents/agents.controller.ts` | 暴露 `POST /agents/:identifier/welcome-message` 端点 |
+| Quick Setup UseCase | `apps/api/src/app/integrations/usecases/slack-quick-setup/slack-quick-setup.usecase.ts` | 调用 Slack API 创建 App 并保存凭据 |
 | OAuth URL 生成 | `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts` | 生成带签名的 Slack OAuth 授权 URL |
-| OAuth 回调处理 | `apps/api/src/app/integrations/usecases/chat-oauth-callback/slack-oauth-callback/slack-oauth-callback.usecase.ts` | 处理 Slack 回调，创建 Channel Connection |
+| OAuth 回调处理 | `apps/api/src/app/integrations/usecases/chat-oauth-callback/slack-oauth-callback/slack-oauth-callback.usecase.ts` | 处理 Slack 回调，创建 ChannelConnection 和 ChannelEndpoint |
 | 欢迎消息发送 | `apps/api/src/app/agents/usecases/send-agent-welcome-message/send-agent-welcome-message.usecase.ts` | OAuth 成功后发送首条欢迎消息 |
 
 ### 2.3 消息提供者层
+
 | 模块 | 文件路径 | 核心职责 |
 |------|----------|----------|
-| Slack Provider | `packages/providers/src/lib/chat/slack/slack.provider.ts` | 底层 Slack API 调用（chat.postMessage） |
+| Slack Provider | `packages/providers/src/lib/chat/slack/slack.provider.ts` | 底层 Slack API 调用（`chat.postMessage`） |
 | Slack Handler | `libs/application-generic/src/factories/chat/handlers/slack.handler.ts` | Provider 工厂包装 |
 
-## 三、前端界面引导流程详解
+---
 
-### 3.1 引导入口：`SlackSetupGuide` 组件
+## 三、三段核心调用关系详解
+
+### 3.1 第一段：Quick Setup 调用链
+
+**代码证据链：**
+
+```
+用户粘贴 Token 并点击 "Create app" 按钮
+        ↓
+[slack-setup-guide.tsx:247] QuickSetupStep 子组件 onClick 触发 mutation.mutate()
+        ↓
+[slack-setup-guide.tsx:196-204] useMutation 调用 slackQuickSetup()
+        ↓
+[apps/dashboard/src/api/integrations.ts:102-111] slackQuickSetup() 发送 POST 请求
+        ↓
+POST /v1/integrations/:integrationId/slack-quick-setup
+        ↓
+[integrations.controller.ts:808-812] @Post('/:integrationId/slack-quick-setup') 路由
+        ↓
+[slack-quick-setup.usecase.ts] SlackQuickSetup.execute()
+        ↓
+Slack API: POST https://slack.com/api/apps.manifest.create
+        ↓
+返回 credentials → encryptCredentials() → 更新 Integration.credentials
+        ↓
+前端 mutation onSuccess: setCredentialsSavedLocally(true)
+```
+
+**关键代码定位：**
+
+`apps/dashboard/src/components/agents/slack-setup-guide.tsx:177-268` — `QuickSetupStep` 子组件：
+```typescript
+function QuickSetupStep({ integrationId, agentId, subscriberId, user, onSuccess }) {
+  const mutation = useMutation({
+    mutationFn: async () => {
+      return slackQuickSetup(
+        integrationId,
+        { configToken: configToken.trim(), agentId, subscriberId, connectionIdentifier },
+        environment
+      );
+    },
+    onSuccess: () => {
+      setConfigToken('');
+      queryClient.invalidateQueries({ queryKey: [QueryKeys.fetchIntegrations, currentEnvironment?._id] });
+      onSuccess();  // 调用父组件的 handleQuickSetupSuccess
+    },
+  });
+
+  return (
+    <Input
+      // ...
+      trailingNode={
+        <button onClick={() => mutation.mutate()} disabled={!configToken.trim() || mutation.isPending}>
+          {mutation.isPending ? 'Creating…' : 'Create app'}
+        </button>
+      }
+    />
+  );
+}
+```
+
+`apps/api/src/app/integrations/integrations.controller.ts:808-812` — 路由定义：
+```typescript
+@Post('/:integrationId/slack-quick-setup')
+@ApiResponse(SlackQuickSetupResponseDto, 201)
+@ApiOperation({ summary: 'Quick-setup a Slack integration' })
+async slackQuickSetup(...) {
+  return await this.slackQuickSetup.execute(...);
+}
+```
+
+---
+
+### 3.2 第二段：OAuth 授权与轮询调用链
+
+**代码证据链：**
+
+```
+用户点击 "Install AgentName ↗" 按钮
+        ↓
+[slack-setup-guide.tsx:368-399] SlackConnectButton 被渲染（包裹在 NovuProvider 中）
+        ↓
+[packages/react/src/components/slack-connect-button/SlackConnectButton.tsx:30-32]
+  React.memo 包装的 SlackConnectButton → SlackConnectButtonInternal
+        ↓
+[packages/react/src/components/slack-connect-button/SlackConnectButton.tsx:9-26]
+  withRenderer → NovuUI → DefaultSlackConnectButton
+        ↓
+[packages/react/src/components/slack-connect-button/DefaultSlackConnectButton.tsx:23-82]
+  Mounter 调用 novuUI.mountComponent({ name: 'SlackConnectButton', props, element })
+        ↓
+[packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx:129-173]
+  SolidJS handleClick() 被触发
+        ↓
+1. 调用 generateConnectOAuthUrl() 获取 OAuth URL
+2. window.open(url, '_blank') 打开 Slack 授权弹窗
+3. startPolling() 开始轮询
+        ↓
+[packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx:85-127]
+  startPolling() — 每 2.5 秒调用 novuAccessor().channelConnections.get()
+        ↓
+轮询命中 → mutate(response.data) → props.onConnectSuccess?.(connId)
+        ↓
+[slack-setup-guide.tsx:312-336] handleSlackOAuthSuccess 回调被触发
+```
+
+**关键代码定位：**
+
+`apps/dashboard/src/components/agents/slack-setup-guide.tsx:368-399` — 按钮渲染：
+```typescript
+const slackInstallConnectControl =
+  user?.externalId && currentEnvironment?.identifier ? (
+    <NovuProvider subscriber={{...}} applicationIdentifier={currentEnvironment.identifier} {...}>
+      <SlackConnectButton
+        integrationIdentifier={selectedIntegrationIdentifier}
+        connectionIdentifier={`${user.externalId}:agent-quickstart:${agent._id}`}
+        connectionMode="subscriber"
+        connectLabel={`Install ${agent.name} ↗`}
+        connectedLabel="Connected to Slack"
+        onConnectSuccess={handleSlackOAuthSuccess}  // 成功后触发欢迎消息
+        // ...
+      />
+    </NovuProvider>
+  ) : null;
+```
+
+`packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx:85-127` — 轮询实现：
+```typescript
+const POLL_INTERVAL_MS = 2500;   // 2.5 秒轮询一次
+const POLL_TIMEOUT_MS = 120_000; // 120 秒超时
+
+const startPolling = () => {
+  const connId = connectionIdentifier();
+  const startedAt = Date.now();
+
+  intervalIdRef.current = setInterval(async () => {
+    try {
+      const response = await novuAccessor().channelConnections.get({ identifier: connId });
+      if (response.data) {
+        clearInterval(intervalIdRef.current);
+        setActionLoading(false);
+        mutate(response.data);
+        props.onConnectSuccess?.(connId);  // 触发成功回调
+        return;
+      }
+    } catch {
+      // ignore transient errors during polling
+    }
+
+    if (Date.now() - startedAt >= POLL_TIMEOUT_MS) {
+      clearInterval(intervalIdRef.current);
+      setActionLoading(false);
+      props.onConnectError?.(new Error('Slack OAuth timed out. Please try again.'));
+    }
+  }, POLL_INTERVAL_MS);
+};
+```
+
+**后端回调链路（与前端轮询并行）：**
+
+```
+用户在 Slack 弹窗中授权
+        ↓
+Slack 重定向到: /v1/integrations/chat/oauth/callback?code=xxx&state=xxx
+        ↓
+[integrations.controller.ts] 路由 → SlackOauthCallback.execute()
+        ↓
+1. decodeSlackState() 验证签名和时效性（5分钟超时）
+2. exchangeCodeForAuthData() 调用 Slack oauth.v2.access
+3. createChannelConnection.execute() 创建 ChannelConnection
+4. autoLinkUser=true 时，createChannelEndpoint.execute() 创建 SLACK_USER Endpoint
+5. 返回 <script>window.close();</script> 关闭弹窗
+        ↓
+ChannelConnection 已写入数据库 → 前端下一次轮询命中
+```
+
+---
+
+### 3.3 第三段：欢迎消息发送调用链
+
+**代码证据链：**
+
+```
+onConnectSuccess 回调触发 → handleSlackOAuthSuccess()
+        ↓
+[slack-setup-guide.tsx:312-336] 调用 sendAgentWelcomeMessage()
+        ↓
+[apps/dashboard/src/api/agents.ts:387-399] sendAgentWelcomeMessage() 发送 POST 请求
+        ↓
+POST /v1/agents/:identifier/welcome-message
+        ↓
+[agents.controller.ts:383-386] @Post('/:identifier/welcome-message') 路由
+        ↓
+[send-agent-welcome-message.usecase.ts] SendAgentWelcomeMessage.execute()
+        ↓
+1. 查询 Agent 和 Integration
+2. 查询 ChannelEndpoint（SLACK_USER 类型）
+3. chatSdkService.sendDirectMessage() → SlackProvider.sendMessage()
+4. conversationService.createOrGetConversation() 创建会话记录
+5. conversationService.persistAgentMessage() 保存消息记录
+        ↓
+返回 { sent: true, conversationId }
+        ↓
+前端设置 URL 参数: onboardingConversationId=xxx
+```
+
+**关键代码定位：**
+
+`apps/dashboard/src/components/agents/slack-setup-guide.tsx:312-336` — 触发欢迎消息：
+```typescript
+const handleSlackOAuthSuccess = useCallback(() => {
+  handleSlackWorkspaceConnected();  // 设置 isSlackWorkspaceConnected = true
+
+  if (currentEnvironment && selectedIntegrationIdentifier) {
+    sendAgentWelcomeMessage(currentEnvironment, agent.identifier, selectedIntegrationIdentifier)
+      .then((res) => {
+        if (res.conversationId) {
+          setSearchParams((prev) => {
+            prev.set('onboardingConversationId', res.conversationId as string);
+            return prev;
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('Failed to send agent welcome message after Slack OAuth:', err);
+      });
+  }
+}, [handleSlackWorkspaceConnected, currentEnvironment, agent.identifier, selectedIntegrationIdentifier, setSearchParams]);
+```
+
+`apps/dashboard/src/api/agents.ts:385-399` — API 客户端：
+```typescript
+type WelcomeMessageResponse = { sent: boolean; conversationId?: string };
+
+export async function sendAgentWelcomeMessage(
+  environment: IEnvironment,
+  agentIdentifier: string,
+  integrationIdentifier: string,
+  conversationId?: string
+): Promise<WelcomeMessageResponse> {
+  const response = await post<{ data: WelcomeMessageResponse }>(
+    `/agents/${encodeURIComponent(agentIdentifier)}/welcome-message`,
+    { environment, body: { integrationIdentifier, conversationId } }
+  );
+
+  return response.data;
+}
+```
+
+`apps/api/src/app/agents/agents.controller.ts:383-386` — 路由定义：
+```typescript
+@Post('/:identifier/welcome-message')
+@HttpCode(HttpStatus.OK)
+@ApiOperation({ summary: 'Send onboarding welcome message' })
+async sendWelcomeMessage(...) {
+  return await this.sendAgentWelcomeMessage.execute(...);
+}
+```
+
+---
+
+## 四、前端界面引导流程
+
+### 4.1 引导入口：`SlackSetupGuide` 组件
 
 **文件**: `apps/dashboard/src/components/agents/slack-setup-guide.tsx`
 
@@ -47,20 +317,21 @@ Slack 渠道首次接入包含四个核心阶段，涉及前后端多个模块�
 
 ```typescript
 const isQuickSetupEnabled = useFeatureFlag(FeatureFlagsKeysEnum.IS_SLACK_QUICK_SETUP_ENABLED, false);
+const [setupMode, setSetupMode] = useState<SetupMode>('quick');
 const activeSetupMode = isQuickSetupEnabled ? setupMode : 'manual';
 ```
 
 #### Quick Setup 流程（3步）
-1. **自动创建 Slack App** - 用户粘贴 App Configuration Token，调用 `slackQuickSetup` API
-2. **安装 App 到工作区** - 点击 `SlackConnectButton` 触发 OAuth
-3. **发送首条消息** - 引导用户在 Slack 中 @ 机器人
+1. **自动创建 Slack App** — 用户粘贴 App Configuration Token，调用 `slackQuickSetup` API
+2. **安装 App 到工作区** — 点击 `SlackConnectButton` 触发 OAuth
+3. **发送首条消息** — 引导用户在 Slack 中 @ 机器人
 
 #### Manual Setup 流程（3步）
-1. **通过 Manifest 创建 App** - 生成 pre-filled 的 Slack App Manifest YAML
-2. **粘贴凭据** - 用户手动复制 App ID、Client ID、Client Secret、Signing Secret
-3. **安装 App 到工作区** - 同上
+1. **通过 Manifest 创建 App** — 生成 pre-filled 的 Slack App Manifest YAML
+2. **粘贴凭据** — 用户手动复制 App ID、Client ID、Client Secret、Signing Secret
+3. **安装 App 到工作区** — 同上
 
-### 3.2 Slack App Manifest 动态生成
+### 4.2 Slack App Manifest 动态生成
 
 `buildSlackManifestYaml()` 函数根据 Agent 信息动态生成 Slack App 配置：
 
@@ -80,165 +351,13 @@ function buildSlackManifestYaml(agent: AgentResponse, webhookHandlerUrl: string,
 - OAuth 回调地址和 Webhook 地址动态根据环境生成
 - 事件订阅包含完整的 Agent 交互所需事件
 
-## 四、Quick Setup：自动创建 Slack App
+---
 
-### 4.1 前端调用
+## 五、OAuth 安全机制
 
-`QuickSetupStep` 子组件处理 Token 输入和 API 调用：
+### 5.1 安全 State 设计
 
-```typescript
-// apps/dashboard/src/components/agents/slack-setup-guide.tsx:196-204
-const mutation = useMutation({
-  mutationFn: async () => {
-    return slackQuickSetup(
-      integrationId,
-      { configToken: configToken.trim(), agentId, subscriberId, connectionIdentifier },
-      environment
-    );
-  },
-  onSuccess: () => {
-    setCredentialsSavedLocally(true);
-    queryClient.invalidateQueries({ queryKey: [QueryKeys.fetchIntegrations, currentEnvironment?._id] });
-  }
-});
-```
-
-### 4.2 后端实现：`SlackQuickSetup` UseCase
-
-**文件**: `apps/api/src/app/integrations/usecases/slack-quick-setup/slack-quick-setup.usecase.ts`
-
-#### 执行流程
-1. **查询 Integration** - 验证 Integration 存在且为 Slack 类型
-2. **构建 Manifest** - 调用 `buildManifest()` 生成 Slack App 配置
-3. **调用 Slack API** - POST 到 `https://slack.com/api/apps.manifest.create`
-4. **保存凭据** - 加密后写入 Integration 文档
-
-#### 核心代码分析
-
-```typescript
-async execute(command: SlackQuickSetupCommand): Promise<SlackQuickSetupResult> {
-  // 1. 验证 Integration
-  const integration = await this.integrationRepository.findOne({...});
-  
-  // 2. 构建 Manifest（与前端逻辑一致，前后端双保险）
-  const manifest = this.buildManifest(integration.name ?? 'Novu Bot', integration.identifier, command.agentId);
-  
-  // 3. 调用 Slack API 创建 App
-  const slackResponse = await this.callManifestCreate(command.configToken, manifest);
-  
-  // 4. 加密并保存凭据
-  const { client_id, client_secret, signing_secret } = slackResponse.credentials;
-  await this.saveCredentials(command, client_id, client_secret, signing_secret, slackResponse.app_id);
-  
-  return {};
-}
-```
-
-#### 凭据保存逻辑
-
-```typescript
-private async saveCredentials(
-  command: SlackQuickSetupCommand,
-  clientId: string,
-  clientSecret: string,
-  signingSecret: string,
-  applicationId?: string
-): Promise<void> {
-  const credentials = encryptCredentials({
-    clientId,
-    secretKey: clientSecret,
-    signingSecret,
-    ...(applicationId && { applicationId }),
-  });
-
-  await this.integrationRepository.update(
-    { _id: command.integrationId, _environmentId: command.environmentId, _organizationId: command.organizationId },
-    {
-      $set: {
-        credentials,
-        active: true,  // 自动激活 Integration
-      },
-    }
-  );
-}
-```
-
-**数据流向**:
-```
-Slack API (apps.manifest.create) 
-    → client_id, client_secret, signing_secret, app_id
-        → encryptCredentials() 
-            → Integration.credentials (加密存储)
-```
-
-## 五、OAuth 授权流程
-
-### 5.1 前端触发：`SlackConnectButton` 组件
-
-**文件**: `packages/js/src/ui/components/slack-connect-button/SlackConnectButton.tsx`
-
-#### 点击处理流程
-```typescript
-const handleClick = async () => {
-  setActionLoading(true);
-  
-  // 1. 请求后端生成 OAuth URL
-  const result = await generateConnectOAuthUrl({
-    integrationIdentifier: integrationIdentifier(),
-    connectionIdentifier: connectionIdentifier(),
-    subscriberId: resolvedSubscriberId,
-    context: ctx,
-    scope: props.scope,
-    connectionMode: mode,
-    autoLinkUser: mode === 'subscriber' ? (props.autoLinkUser ?? true) : false,
-  });
-
-  if (result.data?.url) {
-    // 2. 打开新窗口进行 Slack 授权
-    window.open(result.data.url, '_blank', 'noopener,noreferrer');
-    // 3. 开始轮询连接状态
-    startPolling();
-  }
-};
-```
-
-#### 连接状态轮询
-
-```typescript
-const startPolling = () => {
-  const startedAt = Date.now();
-  intervalIdRef.current = setInterval(async () => {
-    try {
-      const response = await novuAccessor().channelConnections.get({ identifier: connId });
-      if (response.data) {
-        clearInterval(intervalIdRef.current);
-        setActionLoading(false);
-        mutate(response.data);
-        props.onConnectSuccess?.(connId);  // 触发成功回调
-        return;
-      }
-    } catch { /* 忽略 transient errors */ }
-
-    if (Date.now() - startedAt >= POLL_TIMEOUT_MS) {  // 120秒超时
-      clearInterval(intervalIdRef.current);
-      props.onConnectError?.(new Error('Slack OAuth timed out.'));
-    }
-  }, POLL_INTERVAL_MS);  // 2.5秒轮询一次
-};
-```
-
-### 5.2 OAuth URL 生成：`GenerateSlackOauthUrl` UseCase
-
-**文件**: `apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts`
-
-#### 核心逻辑
-1. **验证资源** - 检查 Subscriber 是否存在
-2. **获取凭据** - 从 Integration 或 Novu 托管 Provider 获取 clientId
-3. **创建安全 State** - 包含上下文信息并用 API Key 签名
-4. **确定 Scope** - Agent 模式使用 `SLACK_AGENT_OAUTH_SCOPES`，普通模式使用默认 Scope
-5. **构建 URL** - 生成最终的 Slack OAuth 授权 URL
-
-#### 安全 State 设计
+`apps/api/src/app/integrations/usecases/generate-chat-oath-url/generate-slack-oath-url/generate-slack-oauth-url.usecase.ts`
 
 ```typescript
 private async createSecureState(...): Promise<string> {
@@ -284,7 +403,7 @@ static async validateAndDecodeState(state: string, environmentApiKey: string): P
 - 5分钟超时防止重放攻击
 - 包含完整上下文（environmentId, organizationId, integrationIdentifier）
 
-#### Scope 动态解析
+### 5.2 Scope 动态解析
 
 ```typescript
 private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<string[] | undefined> {
@@ -300,263 +419,11 @@ private async resolveBotScopes(command: GenerateSlackOauthUrlCommand): Promise<s
 }
 ```
 
-### 5.3 OAuth 回调处理：`SlackOauthCallback` UseCase
+---
 
-**文件**: `apps/api/src/app/integrations/usecases/chat-oauth-callback/slack-oauth-callback/slack-oauth-callback.usecase.ts`
+## 六、关键数据流转与存储
 
-#### 执行流程
-1. **解码 State** - 验证签名和时效性
-2. **查询 Integration** - 根据 State 中的信息定位
-3. **交换 Code** - 使用 OAuth code 换取 access_token
-4. **创建连接** - 根据模式创建 Channel Connection 或 Endpoint
-
-#### 核心代码
-
-```typescript
-async execute(command: SlackOauthCallbackCommand): Promise<ChatOauthCallbackResult> {
-  // 1. 解码并验证 State
-  const stateData = await this.decodeSlackState(command.state);
-  
-  // 2. 查询 Integration
-  const integration = await this.getIntegration(stateData);
-  const credentials = await this.getIntegrationCredentials(integration);
-  
-  // 3. 交换授权 Code 为 Access Token
-  const authData = await this.exchangeCodeForAuthData(command.providerCode, credentials);
-
-  // 4. 根据模式创建不同类型的连接
-  if (stateData.mode === 'link_user') {
-    await this.linkUserEndpoint(stateData, integration, authData);
-  } else if (authData.incoming_webhook) {
-    await this.createIncomingWebhookEndpoint(stateData, integration, authData);
-  } else {
-    // 创建 Workspace Connection（Agent 模式）
-    const connection = await this.createChannelConnection.execute(
-      CreateChannelConnectionCommand.create({
-        identifier: stateData.identifier,
-        organizationId: stateData.organizationId,
-        environmentId: stateData.environmentId,
-        integrationIdentifier: integration.identifier,
-        subscriberId: isSharedMode ? undefined : stateData.subscriberId,
-        connectionMode: stateData.connectionMode,
-        auth: { accessToken: authData.access_token },
-        workspace: { id: authData.team.id, name: authData.team.name },
-      })
-    );
-    
-    // 自动链接当前用户为 Slack User Endpoint
-    if (stateData.autoLinkUser === true && stateData.subscriberId && authData.authed_user?.id) {
-      await this.createChannelEndpoint.execute(
-        CreateChannelEndpointCommand.create({
-          type: ENDPOINT_TYPES.SLACK_USER,
-          endpoint: { userId: authData.authed_user.id },
-          // ... 其他字段
-        })
-      );
-    }
-  }
-
-  return { type: ResponseTypeEnum.HTML, result: '<script>window.close();</script>' };
-}
-```
-
-**数据流向**:
-```
-Slack OAuth 回调 (code, state)
-    → 解码 State → 验证签名
-        → oauth.v2.access (换取 access_token)
-            → 创建 ChannelConnection (access_token 存入)
-                → 可选: 创建 ChannelEndpoint (userId)
-                    → 返回关闭窗口脚本
-```
-
-## 六、首条消息发送流程
-
-### 6.1 触发时机
-
-OAuth 成功后，前端在 `handleSlackOAuthSuccess` 回调中触发欢迎消息：
-
-```typescript
-// apps/dashboard/src/components/agents/slack-setup-guide.tsx:312-336
-const handleSlackOAuthSuccess = useCallback(() => {
-  handleSlackWorkspaceConnected();
-  
-  if (currentEnvironment && selectedIntegrationIdentifier) {
-    sendAgentWelcomeMessage(currentEnvironment, agent.identifier, selectedIntegrationIdentifier)
-      .then((res) => {
-        if (res.conversationId) {
-          setSearchParams((prev) => {
-            prev.set('onboardingConversationId', res.conversationId as string);
-            return prev;
-          });
-        }
-      })
-      .catch((err) => console.warn('Failed to send agent welcome message:', err));
-  }
-}, [...]);
-```
-
-### 6.2 后端实现：`SendAgentWelcomeMessage` UseCase
-
-**文件**: `apps/api/src/app/agents/usecases/send-agent-welcome-message/send-agent-welcome-message.usecase.ts`
-
-#### 执行流程
-1. **查询 Agent** - 根据 identifier 定位
-2. **查询 Integration** - 验证集成存在
-3. **查询 Endpoint** - 查找用户的 Slack User Endpoint
-4. **发送消息** - 通过 Chat SDK 发送 DM
-5. **创建会话** - 保存 Conversation 和 Message 记录
-
-#### 核心代码
-
-```typescript
-private async sendWelcomeMessage(command: SendAgentWelcomeMessageCommand): Promise<{ sent: boolean; conversationId?: string }> {
-  // 1. 查询 Agent 和 Integration
-  const agent = await this.agentRepository.findOne({ identifier: command.agentIdentifier, ... });
-  const integration = await this.integrationRepository.findOne({ identifier: command.integrationIdentifier, ... });
-  
-  // 2. 查找用户的 Slack Endpoint
-  const platform = resolveAgentPlatform(integration.providerId);  // SLACK
-  const endpointConfig = PLATFORM_ENDPOINT_CONFIG[platform];
-  const endpoint = await this.channelEndpointRepository.findOne({
-    integrationIdentifier: command.integrationIdentifier,
-    type: endpointConfig.endpointType,  // SLACK_USER
-  });
-  
-  const platformUserId = (endpoint.endpoint as Record<string, string>)[endpointConfig.identityField];  // userId
-  
-  // 3. 发送欢迎消息
-  const welcomeText = getWelcomeText(platform);  // "Your Slack app is connected!..."
-  const sent = await this.chatSdkService.sendDirectMessage(
-    agent._id,
-    command.integrationIdentifier,
-    platformUserId,
-    { markdown: welcomeText }
-  );
-  
-  // 4. 创建 Conversation 记录
-  const conversation = await this.conversationService.createOrGetConversation({
-    agentId: agent._id,
-    platform,
-    integrationId: integration._id,
-    platformThreadId: sent.platformThreadId,
-    participantId: `${platform}:${platformUserId}`,
-    platformUserId,
-    firstMessageText: welcomeText,
-  });
-  
-  // 5. 持久化 Agent 消息
-  await this.conversationService.persistAgentMessage({
-    conversationId: conversation._id,
-    platformMessageId: sent.messageId,
-    agentIdentifier: command.agentIdentifier,
-    content: welcomeText,
-    ...
-  });
-  
-  return { sent: true, conversationId: conversation._id };
-}
-```
-
-### 6.3 底层消息发送：`SlackProvider`
-
-**文件**: `packages/providers/src/lib/chat/slack/slack.provider.ts`
-
-```typescript
-async sendMessage(data: IChatOptions, ...): Promise<ISendMessageSuccessResponse> {
-  const response = await this.sendMessageToEndpoint(data, data.channelData, ...);
-  
-  return {
-    id: response.headers['x-slack-req-id'] || `webhook-id-${Date.now()}`,
-    date: new Date().toISOString(),
-  };
-}
-
-private async sendAppMessageToUser(data: IChatOptions, channelData: SlackUserData, ...) {
-  const { endpoint, token } = channelData;
-  
-  return await this.axiosInstance.post(
-    `${this.slackAPI}/chat.postMessage`,
-    {
-      text: data.content,
-      blocks: data.blocks,
-      channel: endpoint.userId,  // 直接发送到用户 ID（DM）
-      ...(data.customData || {}),
-    },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,  // 使用 ChannelConnection 中的 accessToken
-      },
-    }
-  );
-}
-```
-
-## 七、完整时序图
-
-```
-用户操作                          前端 (Dashboard)                     后端 (API)                         Slack
-   │                                  │                                   │                                │
-   │ 打开 Agent 集成页面               │                                   │                                │
-   ├─────────────────────────────────►│                                   │                                │
-   │                                  │ 渲染 SlackSetupGuide              │                                │
-   │                                  │  (显示 Quick Setup / Manual)      │                                │
-   │                                  │                                   │                                │
-   │ 粘贴 App Config Token            │                                   │                                │
-   ├─────────────────────────────────►│                                   │                                │
-   │                                  │ POST /integrations/{id}/slack/quick-setup                        │
-   │                                  ├──────────────────────────────────►│                                │
-   │                                  │                                   │ 验证 Integration                │
-   │                                  │                                   │ 构建 Manifest                   │
-   │                                  │                                   ├───────────────────────────────►│ apps.manifest.create
-   │                                  │                                   │                                │
-   │                                  │                                   │◄───────────────────────────────┤ 返回 credentials
-   │                                  │                                   │ 加密保存 credentials            │
-   │                                  │◄──────────────────────────────────┤                                │
-   │                                  │ 显示 "App created!"               │                                │
-   │                                  │                                   │                                │
-   │ 点击 "Install App" 按钮           │                                   │                                │
-   ├─────────────────────────────────►│                                   │                                │
-   │                                  │ POST /integrations/chat/oauth/url                                │
-   │                                  ├──────────────────────────────────►│                                │
-   │                                  │                                   │ 生成带签名的 State              │
-   │                                  │                                   │ 构建 OAuth URL                 │
-   │                                  │◄──────────────────────────────────┤                                │
-   │                                  │ window.open(Slack OAuth URL)      │                                │
-   │                                  ├───────────────────────────────────┼───────────────────────────────►│
-   │                                  │ 开始轮询 channelConnections        │                                │
-   │                                  │  (每 2.5s 一次，超时 120s)        │                                │
-   │                                  │                                   │                                │
-   │                                  │              (用户在 Slack 授权)  │                                │
-   │                                  │                                   │◄───────────────────────────────┤ OAuth Callback (code, state)
-   │                                  │                                   │ 解码验证 State                  │
-   │                                  │                                   │ oauth.v2.access               │
-   │                                  │                                   ├───────────────────────────────►│
-   │                                  │                                   │                                │
-   │                                  │                                   │◄───────────────────────────────┤ 返回 access_token
-   │                                  │                                   │ 创建 ChannelConnection        │
-   │                                  │                                   │ 创建 ChannelEndpoint (user)    │
-   │                                  │                                   │ 返回 <script>close()</script> │
-   │                                  │ 轮询命中 connection                │                                │
-   │                                  │ 触发 onConnectSuccess             │                                │
-   │                                  │ POST /agents/{id}/welcome-message │                                │
-   │                                  ├──────────────────────────────────►│                                │
-   │                                  │                                   │ 查询 ChannelEndpoint           │
-   │                                  │                                   │ chat.postMessage               │
-   │                                  │                                   ├───────────────────────────────►│
-   │                                  │                                   │                                │
-   │                                  │                                   │◄───────────────────────────────┤ 消息发送成功
-   │                                  │                                   │ 创建 Conversation              │
-   │                                  │                                   │ 持久化 Message                  │
-   │                                  │◄──────────────────────────────────┤                                │
-   │                                  │ 显示欢迎消息已发送                 │                                │
-   │                                  │                                   │                                │
-```
-
-## 八、关键数据流转与存储
-
-### 8.1 Integration 凭据结构
+### 6.1 Integration 凭据结构
 
 ```javascript
 // Integration.credentials (加密存储)
@@ -568,7 +435,7 @@ private async sendAppMessageToUser(data: IChatOptions, channelData: SlackUserDat
 }
 ```
 
-### 8.2 ChannelConnection 结构
+### 6.2 ChannelConnection 结构
 
 ```javascript
 // ChannelConnection (存储工作区连接)
@@ -587,7 +454,7 @@ private async sendAppMessageToUser(data: IChatOptions, channelData: SlackUserDat
 }
 ```
 
-### 8.3 ChannelEndpoint 结构
+### 6.3 ChannelEndpoint 结构
 
 ```javascript
 // ChannelEndpoint (存储用户级端点)
@@ -602,32 +469,108 @@ private async sendAppMessageToUser(data: IChatOptions, channelData: SlackUserDat
 }
 ```
 
-## 九、错误处理与边界情况
+---
 
-### 9.1 Quick Setup 错误处理
+## 七、完整时序图
+
+```
+用户操作                          前端 (Dashboard)                          后端 (API)                          Slack
+   │                                  │                                        │                                │
+   │ 打开 Agent 集成页面               │                                        │                                │
+   ├─────────────────────────────────►│                                        │                                │
+   │                                  │ 渲染 SlackSetupGuide                   │                                │
+   │                                  │  (显示 Quick Setup / Manual)           │                                │
+   │                                  │                                        │                                │
+   │ 粘贴 App Config Token            │                                        │                                │
+   ├─────────────────────────────────►│                                        │                                │
+   │                                  │ QuickSetupStep onClick                 │                                │
+   │                                  │ ── mutation.mutate() ──                │                                │
+   │                                  │ ── slackQuickSetup() ──                │                                │
+   │                                  │ POST /integrations/{id}/slack-quick-setup                              │
+   │                                  ├────────────────────────────────────────►│                                │
+   │                                  │                                        │ 验证 Integration               │
+   │                                  │                                        │ 构建 Manifest                  │
+   │                                  │                                        ├────────────────────────────────►│ apps.manifest.create
+   │                                  │                                        │                                │
+   │                                  │                                        │◄────────────────────────────────┤ 返回 credentials
+   │                                  │                                        │ encryptCredentials()           │
+   │                                  │                                        │ 更新 Integration               │
+   │                                  │◄────────────────────────────────────────┤                                │
+   │                                  │ setCredentialsSavedLocally(true)        │                                │
+   │                                  │ 刷新 integrations 查询                  │                                │
+   │                                  │ 显示 "App created!"                     │                                │
+   │                                  │                                        │                                │
+   │ 点击 "Install AgentName ↗"       │                                        │                                │
+   ├─────────────────────────────────►│                                        │                                │
+   │                                  │ SlackConnectButton.handleClick()        │                                │
+   │                                  │ ── generateConnectOAuthUrl() ──         │                                │
+   │                                  │ POST /integrations/chat/oauth/url                                     │
+   │                                  ├────────────────────────────────────────►│                                │
+   │                                  │                                        │ 生成带签名的 State             │
+   │                                  │                                        │ 构建 OAuth URL                │
+   │                                  │◄────────────────────────────────────────┤                                │
+   │                                  │ window.open(Slack OAuth URL)           │                                │
+   │                                  ├─────────────────────────────────────────┼────────────────────────────────►│
+   │                                  │ startPolling()                          │                                │
+   │                                  │ 每 2.5s GET /channel-connections/{id}  │                                │
+   │                                  │                                        │                                │
+   │                                  │              (用户在 Slack 弹窗中授权)  │                                │
+   │                                  │                                        │◄────────────────────────────────┤ GET /chat/oauth/callback
+   │                                  │                                        │ 解码验证 State                 │
+   │                                  │                                        │ POST oauth.v2.access          │
+   │                                  │                                        ├────────────────────────────────►│
+   │                                  │                                        │                                │
+   │                                  │                                        │◄────────────────────────────────┤ 返回 access_token
+   │                                  │                                        │ 创建 ChannelConnection        │
+   │                                  │                                        │ 创建 ChannelEndpoint (user)   │
+   │                                  │                                        │ 返回 <script>close()</script> │
+   │                                  │ 轮询命中 connection                     │                                │
+   │                                  │ onConnectSuccess → handleSlackOAuthSuccess                              │
+   │                                  │ POST /agents/{id}/welcome-message                                      │
+   │                                  ├────────────────────────────────────────►│                                │
+   │                                  │                                        │ 查询 ChannelEndpoint          │
+   │                                  │                                        │ POST chat.postMessage         │
+   │                                  │                                        ├────────────────────────────────►│
+   │                                  │                                        │                                │
+   │                                  │                                        │◄────────────────────────────────┤ 消息发送成功
+   │                                  │                                        │ 创建 Conversation             │
+   │                                  │                                        │ 持久化 Message                 │
+   │                                  │◄────────────────────────────────────────┤                                │
+   │                                  │ URL 增加 onboardingConversationId       │                                │
+   │                                  │                                        │                                │
+```
+
+---
+
+## 八、错误处理与边界情况
+
+### 8.1 Quick Setup 错误处理
 - **Invalid Token**: 提示用户 Token 无效或过期
 - **Invalid Manifest**: Slack API 拒绝的 manifest 格式错误
 - **Integration 不存在**: 404 错误
 
-### 9.2 OAuth 错误处理
+### 8.2 OAuth 错误处理
 - **State 验证失败**: 签名不匹配或过期（5分钟超时）
 - **Token 交换失败**: Slack 返回错误信息
 - **凭据缺失**: Integration 缺少 clientId/clientSecret
 
-### 9.3 欢迎消息发送失败
-- **Endpoint 不存在**: 用户未完成链接（静默失败，返回 sent: false）
+### 8.3 欢迎消息发送失败
+- **Endpoint 不存在**: 用户未完成链接（静默失败，返回 `sent: false`）
 - **Slack API 错误**: 捕获异常并记录日志，不阻塞流程
 
-## 十、设计亮点与可优化点
+---
 
-### 10.1 设计亮点
+## 九、设计亮点与可优化点
+
+### 9.1 设计亮点
 1. **前后端 Manifest 双生成** - 前端用于显示，后端用于实际创建，确保一致性
 2. **安全 State 设计** - HMAC 签名 + 超时机制，防止 CSRF 和重放攻击
 3. **轮询 + 回调双机制** - OAuth 回调写入数据，前端轮询感知状态变化
-4. **自动用户链接** - OAuth 回调中自动创建 SLACK_USER Endpoint，减少用户操作
-5. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
+4. **自动用户链接** - OAuth 回调中自动创建 `SLACK_USER` Endpoint，减少用户操作
+5. **三层按钮架构** - React → SolidJS 桥接 → SolidJS 原生，兼顾框架兼容性和性能
+6. **Provider 抽象** - SlackProvider 与业务逻辑分离，便于替换和测试
 
-### 10.2 潜在优化点
+### 9.2 潜在优化点
 1. **轮询效率** - 当前 2.5s 轮询可考虑使用 WebSocket 推送替代
 2. **错误重试** - 欢迎消息发送失败没有重试机制
 3. **幂等性** - Quick Setup 和 OAuth 回调需要考虑重复调用的幂等处理
