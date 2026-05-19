@@ -180,9 +180,26 @@ BaseCommand (create() + 验证)
 
 **关键修正说明**：
 - ~~所有业务 UseCase Command 必须继承 EnvironmentWithUserCommand~~ → **按场景分层继承**
-- API 入口层的命令（如 TriggerEvent）仍使用 `EnvironmentWithUserCommand`，确保用户、组织、环境三重非空
-- Worker 层的命令（如 SendWebhook）使用 `EnvironmentCommand`，仅需 envId + orgId 即可满足隔离要求
-- 此修正**不影响租户隔离主结论**：核心隔离字段 envId / orgId 在所有生产路径的 Command 中均为强制非空，仓储层 `T_Enforcement` 类型约束提供最终防线
+- ~~核心隔离字段 envId / orgId 在所有生产路径的 Command 中均为强制非空~~ → **按基类分层强制**
+
+**各基类强制字段分布**（实际使用场景）：
+
+| 基类 | environmentId | organizationId | userId | 继承示例 | 占比 |
+|------|--------------|----------------|--------|---------|------|
+| `EnvironmentWithUserCommand` | ✅ 强制 | ✅ 强制 | ✅ 强制 | TriggerEvent, ProcessTenant, UpdateTenant | 约 60% |
+| `EnvironmentCommand` | ✅ 强制 | ✅ 强制 | ❌ 无 | SendWebhook, CreateOrUpdateSubscriber, GetTenant | 约 35% |
+| `OrganizationLevelCommand` | ❌ 可选 | ✅ 强制 | ❌ 无 | TierRestrictionsValidate | &lt; 1% |
+| `EnvironmentLevelCommand` | ✅ 强制 | ❌ 可选 | ❌ 无 | ExecuteBridgeRequest, GetDecryptedSecretKey | &lt; 1% |
+| `BaseCommand` | ❌ 无 | ❌ 无 | ❌ 无 | VerifyPayload, MergePreferences | &lt; 1% |
+
+**触发链路隔离约束验证**：
+- `TriggerEventBaseCommand extends EnvironmentWithUserCommand` → envId + orgId + userId 全部 `@IsNotEmpty()`
+- `ProcessTenantCommand extends EnvironmentWithUserCommand` → 同上
+- `TriggerMulticastCommand` / `TriggerBroadcastCommand` 包含 `environmentId: string; organizationId: string`（从 BaseTriggerCommand 继承）
+- `mapSubscribersToJobs()` 构建 Job 时，`environmentId` 和 `organizationId` 直接从 Command 拷贝，无客户端污染路径
+- 最终仓储层 `T_Enforcement` 交叉类型提供编译时最终防线
+
+**结论**：触发链路（Trigger → ProcessTenant → Job 分发）全程满足 envId + orgId 双强制，隔离约束未受基类分层影响。
 
 ### 3.3 租户上下文 DTO
 
@@ -848,7 +865,9 @@ if (tenantProcessed) {
 | 认证策略 | `apps/api/src/app/auth/services/passport/apikey.strategy.ts` | API Key 认证与熔断 |
 | 守卫 | `apps/api/src/app/auth/framework/community.user.auth.guard.ts` | 认证方案路由 |
 | 会话装饰器 | `libs/application-generic/src/decorators/user-session.decorator.ts` | 用户会话安全提取 |
-| Command 基类 | `libs/application-generic/src/commands/project.command.ts` | EnvironmentWithUserCommand 定义 |
+| Command 基类 | `libs/application-generic/src/commands/project.command.ts` | EnvironmentWithUserCommand / EnvironmentCommand 定义 |
+| 基类根 | `libs/application-generic/src/commands/base.command.ts` | BaseCommand + CommandValidationException 定义 |
+| 认证基类 | `libs/application-generic/src/commands/authenticated.command.ts` | AuthenticatedCommand / OrganizationCommand 定义 |
 | 基础仓储 | `libs/dal/src/repositories/base-repository.ts` | V1 通用数据访问 |
 | 基础仓储 | `libs/dal/src/repositories/base-repository-v2.ts` | V2 类型安全数据访问 |
 | 强制类型 | `libs/dal/src/types/enforce.ts` | EnforceEnvId / EnforceOrgId 定义 |
