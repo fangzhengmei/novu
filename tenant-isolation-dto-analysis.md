@@ -192,11 +192,20 @@ BaseCommand (create() + 验证)
 | `EnvironmentLevelCommand` | ✅ 强制 | ❌ 可选 | ❌ 无 | ExecuteBridgeRequest, GetDecryptedSecretKey | &lt; 1% |
 | `BaseCommand` | ❌ 无 | ❌ 无 | ❌ 无 | VerifyPayload, MergePreferences | &lt; 1% |
 
-**触发链路隔离约束验证**：
-- `TriggerEventBaseCommand extends EnvironmentWithUserCommand` → envId + orgId + userId 全部 `@IsNotEmpty()`
-- `ProcessTenantCommand extends EnvironmentWithUserCommand` → 同上
-- `TriggerMulticastCommand` / `TriggerBroadcastCommand` 包含 `environmentId: string; organizationId: string`（从 BaseTriggerCommand 继承）
-- `mapSubscribersToJobs()` 构建 Job 时，`environmentId` 和 `organizationId` 直接从 Command 拷贝，无客户端污染路径
+**触发链路真实继承关系与隔离验证**：
+```
+EnvironmentWithUserCommand (envId ✅ orgId ✅ userId ✅)
+    └── TriggerEventBaseCommand (identifier, payload, overrides, transactionId, tenant...)
+          ├── TriggerEventMulticastCommand (to, addressingType: MULTICAST)
+          │     └── TriggerMulticastCommand (扩展自 multicast 目录)
+          └── TriggerEventBroadcastCommand (addressingType: BROADCAST)
+                └── TriggerBroadcastCommand (扩展自 broadcast 目录)
+```
+- `TriggerEventBaseCommand extends EnvironmentWithUserCommand` → envId + orgId + userId 全部 `@IsNotEmpty()`（编译时强制）
+- `TriggerEventMulticastCommand extends TriggerEventBaseCommand` → 继承所有强制字段，新增 `to` 收件人
+- `TriggerEventBroadcastCommand extends TriggerEventBaseCommand` → 继承所有强制字段，无收件人（广播模式）
+- `ProcessTenantCommand extends EnvironmentWithUserCommand` → 独立命令，同样满足三字段强制
+- `mapSubscribersToJobs()` 构建 Job 时，`environmentId` 和 `organizationId` 从 Command 直接拷贝，无客户端污染路径
 - 最终仓储层 `T_Enforcement` 交叉类型提供编译时最终防线
 
 **结论**：触发链路（Trigger → ProcessTenant → Job 分发）全程满足 envId + orgId 双强制，隔离约束未受基类分层影响。
