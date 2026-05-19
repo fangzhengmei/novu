@@ -152,21 +152,37 @@ export type UserSessionData = {
 
 ### 3.2 Command 基类体系
 
-**EnvironmentWithUserCommand** (`libs/application-generic/src/commands/project.command.ts:40-49`)：
-```typescript
-export abstract class EnvironmentWithUserCommand extends BaseCommand {
-  @IsNotEmpty()
-  readonly environmentId: string;    // 强制非空
-
-  @IsNotEmpty()
-  readonly organizationId: string;   // 强制非空
-
-  @IsNotEmpty()
-  readonly userId: string;
-}
+**完整基类层次** (`libs/application-generic/src/commands/`)：
+```
+BaseCommand (create() + 验证)
+├── AuthenticatedCommand (userId: string)
+│   └── OrganizationCommand (organizationId: string)
+├── EnvironmentLevelCommand (environmentId ✅, organizationId ❓)
+├── EnvironmentLevelWithUserCommand (environmentId ✅, organizationId ❓, userId ✅)
+├── OrganizationLevelCommand (environmentId ❓, organizationId ✅)
+├── OrganizationLevelWithUserCommand (environmentId ❓, organizationId ✅, userId ✅)
+├── EnvironmentWithUserCommand (environmentId ✅, organizationId ✅, userId ✅)  ← API 层主力
+├── EnvironmentWithUserObjectCommand (user: UserSessionData)
+│   ├── PaginatedListCommand
+│   └── CursorBasedPaginatedCommand
+├── EnvironmentWithSubscriber (envId ✅, orgId ✅, subscriberId ✅)
+└── EnvironmentCommand (environmentId ✅, organizationId ✅)  ← Worker 层主力（无 userId）
 ```
 
-**所有业务 UseCase Command 必须继承此类**，确保租户上下文在编译时非空。
+**各基类用途与继承情况**：
+
+| 基类 | 强制字段 | 典型使用场景 | 继承示例 |
+|------|---------|-------------|---------|
+| `EnvironmentWithUserCommand` | envId + orgId + userId | API 层业务操作（需审计用户） | `TriggerEventBaseCommand`, `ProcessTenantCommand`, `UpdateTenantCommand` |
+| `EnvironmentCommand` | envId + orgId | Worker 内部异步任务（无需用户上下文） | `SendWebhookMessageCommand`, `UpdateSubscriberCommand`, `GetTenantCommand` |
+| `EnvironmentLevelCommand` | envId（orgId 可选） | 环境级只读操作，组织上下文可选 | 极少使用 |
+| `BaseCommand` | 无 | 纯工具类命令，无租户上下文 | `VerifyPayloadCommand`, `MergePreferencesCommand` |
+
+**关键修正说明**：
+- ~~所有业务 UseCase Command 必须继承 EnvironmentWithUserCommand~~ → **按场景分层继承**
+- API 入口层的命令（如 TriggerEvent）仍使用 `EnvironmentWithUserCommand`，确保用户、组织、环境三重非空
+- Worker 层的命令（如 SendWebhook）使用 `EnvironmentCommand`，仅需 envId + orgId 即可满足隔离要求
+- 此修正**不影响租户隔离主结论**：核心隔离字段 envId / orgId 在所有生产路径的 Command 中均为强制非空，仓储层 `T_Enforcement` 类型约束提供最终防线
 
 ### 3.3 租户上下文 DTO
 
