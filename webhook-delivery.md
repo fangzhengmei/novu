@@ -4,24 +4,32 @@
 
 ## 1. 架构概述
 
-Novu 的出站 Webhook 系统采用 **Svix** 作为第三方 webhook 服务提供商，负责处理签名、重试、去重等底层复杂度。平台本身专注于业务事件的触发和 payload 构造。
+Novu 存在 **两条独立的签名链路**，用于不同的通信场景：
 
 ```
-业务事件触发 → SendWebhookMessage → Svix API → 用户回调端点
-     ↓                ↓
-  生成 eventId    构造 WrapperDto
-                   注入签名
-                   管理重试
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              出站 Webhook (Svix)                          │
+│  业务事件 → SendWebhookMessage → Svix API → svix-signature → 用户回调端点   │
+│     (MESSAGE_SENT, WORKFLOW_DELETED 等 17 种事件)                          │
+└───────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         入站 Bridge (novu-signature)                      │
+│  Novu 平台 → ExecuteFrameworkRequest → novu-signature → 用户 Bridge 端点   │
+│     (工作流发现、执行、预览等内部通信)                                      │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
 **核心代码位置**：
 - `libs/application-generic/src/webhooks/` - 核心 webhook 逻辑
 - `apps/api/src/app/outbound-webhooks/` - Webhook Portal API
 - `packages/shared/src/webhooks/` - 事件类型定义
+- `packages/framework/src/handler.ts` - Bridge 签名验证
+- `libs/application-generic/src/utils/hmac.ts` - novu-signature 签名生成
 
 ---
 
-## 2. 事件流转机制
+## 2. 事件语义与触发矩阵
 
 ### 2.1 事件类型定义
 
@@ -56,69 +64,204 @@ export enum WebhookEventEnum {
 }
 ```
 
-### 2.2 事件触发点
+### 2.2 完整触发矩阵
 
-#### 2.2.1 工作流变更
-**文件**：`libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:113-134`
+| 事件类型 | 触发场景 | 触发文件位置 | Payload 字段 |
+|---------|---------|-------------|-------------|
+| **WORKFLOW_CREATED** | 创建新工作流 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:113-121` | `object` |
+| **WORKFLOW_UPDATED** | 更新工作流 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:123-134` | `object`, `previousObject` |
+| **WORKFLOW_DELETED** | 删除工作流 | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:50-58` | `object` |
+| **WORKFLOW_PUBLISHED** | 工作流同步/发布到环境 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:149-160` | `object`, `previousObject` |
+| **MESSAGE_SENT** | 消息发送成功（全渠道） | Email: `send-message-email.usecase.ts:487-497`<br>SMS: `send-message-sms.usecase.ts:356-370`<br>Push: `send-message-push.usecase.ts:644-655`<br>In-App: `send-message-in-app.usecase.ts:307-318`<br>Chat: `send-message-chat.usecase.ts:805-818` | `object`, `providerResponseId` |
+| **MESSAGE_FAILED** | 消息发送失败（仅 Email/SMS/Push） | Email: `send-message-email.usecase.ts:553-564`<br>SMS: `send-message-sms.usecase.ts:372-382`<br>Push: `send-message-push.usecase.ts:726-741` | `object`, `error` |
+| **MESSAGE_SENT** (⚠️ Chat 失败特例) | **Chat 发送失败** 时错误使用 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854-867` | `object`, `error` |
+| **MESSAGE_DELIVERED** | 第三方回调投递成功 | `apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts` (provider 驱动) | - |
+| **MESSAGE_SEEN** | 用户查看消息 | `apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts:77-105` | `object` |
+| **MESSAGE_READ** / **MESSAGE_UNREAD** | 用户标记消息已读/未读 | 批量: `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:83-86`<br>单个: `mark-notification-as.usecase.ts` (调用批量)<br>按条件: `update-all-notifications.usecase.ts:121-124` | `object` |
+| **MESSAGE_ARCHIVED** / **MESSAGE_UNARCHIVED** | 用户归档/取消归档 | 批量: `mark-many-notifications-as.usecase.ts:88-91`<br>按条件: `update-all-notifications.usecase.ts:126-129` | `object` |
+| **MESSAGE_SNOOZED** / **MESSAGE_UNSNOOZED** | 用户稍后提醒/取消 | 批量: `mark-many-notifications-as.usecase.ts:93-97`<br>Snooze: `snooze-notification.usecase.ts` (调用 `markNotificationAsSnoozed` → 最终调用批量)<br>Unsnooze: `unsnooze-notification.usecase.ts` (调用批量)<br>定时唤醒: `process-unsnooze-job.usecase.ts` | `object` |
+| **MESSAGE_DELETED** | 用户删除消息 | 批量删除: `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts:77, 120-137`<br>按条件删除: `delete-all-notifications.usecase.ts:115, 147-164` | `object` |
+| **PREFERENCE_UPDATED** | 用户更新通知偏好 | `apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts:78-88` | `object` |
+| **EMAIL_RECEIVED** | 入站邮件到达 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:121-127` | `object` (domain, route, mail) |
 
-- **创建工作流**：触发 `WORKFLOW_CREATED`，payload 包含 `object`（当前状态）
-- **更新工作流**：触发 `WORKFLOW_UPDATED`，payload 包含 `object`（当前状态）和 `previousObject`（变更前状态）
+### 2.3 重点路径详细分析
 
-#### 2.2.2 消息发送成功/失败
-各渠道发送用例中触发：
-- **Email**：`apps/worker/src/app/workflow/usecases/send-message/send-message-email.usecase.ts:487-497, 553-564`
-- **SMS**：`apps/worker/src/app/workflow/usecases/send-message/send-message-sms.usecase.ts:356-382`
-- **Push**：`apps/worker/src/app/workflow/usecases/send-message/send-message-push.usecase.ts:644-655, 726-741`
-- **In-App**：`apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts:307-318`
-- **Chat**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:805-855`
+#### 2.3.1 ⚠️ Chat 发送失败事件类型不一致
 
-**成功时 payload 示例**：
+**文件**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:825-873`
+
+**发现问题**：Chat 渠道发送失败时，使用的事件类型是 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，这与其他渠道（Email/SMS/Push）不一致。
+
 ```typescript
-{
-  eventType: WebhookEventEnum.MESSAGE_SENT,
-  objectType: WebhookObjectTypeEnum.MESSAGE,
-  payload: {
-    object: messageWebhookMapper(message, subscriberId, {
-      providerResponseId: result.id,
-    }),
-  },
-  organizationId,
-  environmentId,
-}
-```
-
-**失败时 payload 示例（Push）**：
-```typescript
-{
-  eventType: WebhookEventEnum.MESSAGE_FAILED,
-  objectType: WebhookObjectTypeEnum.MESSAGE,
-  payload: {
-    object: messageWebhookMapper(message, subscriberId),
-    error: {
-      push: {
-        reason: isTokenInvalid ? 'token_invalid' : 'generic_error',
-        deviceToken: deviceToken,
+// Chat 失败时的代码（错误实现）
+private async handleMessageSendError(...) {
+  await this.sendWebhookMessage.execute({
+    eventType: WebhookEventEnum.MESSAGE_SENT,  // ❌ 应该是 MESSAGE_FAILED
+    objectType: WebhookObjectTypeEnum.MESSAGE,
+    payload: {
+      object: messageWebhookMapper(message, command.subscriberId, { channelData: redactedChannelData }),
+      error: {
+        message: this.getErrorMessage(error) || 'Error while sending chat with provider',
       },
-      message: e.message || 'Error while sending push',
     },
-  },
-  organizationId,
-  environmentId,
+    organizationId: command.organizationId,
+    environmentId: command.environmentId,
+  });
+}
+
+// 对比 Email 失败时的正确实现
+await this.sendWebhookMessage.execute({
+  eventType: WebhookEventEnum.MESSAGE_FAILED,  // ✅ 正确
+  ...
+});
+```
+
+**接收方注意**：处理 Chat 渠道的失败事件时，需要检查 `eventType === 'message.sent'` 且存在 `error` 字段，才能判定为发送失败。
+
+#### 2.3.2 工作流删除
+
+**文件**：`apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:39-59`
+
+触发时机：用户调用 API 删除工作流时，在删除相关实体（控制值、消息模板、偏好、翻译组）之后触发。
+
+```typescript
+async execute(command: DeleteWorkflowCommand): Promise<void> {
+  const workflowEntity = await this.getWorkflowByIdsUseCase.execute(...);
+
+  await this.deleteRelatedEntities(command, workflowEntity);  // 先删除实体
+
+  await this.sendWebhookMessage.execute({
+    eventType: WebhookEventEnum.WORKFLOW_DELETED,
+    objectType: WebhookObjectTypeEnum.WORKFLOW,
+    payload: { object: workflowEntity },  // 包含已删除工作流的完整信息
+    organizationId: command.organizationId,
+    environmentId: command.environmentId,
+  });
 }
 ```
 
-#### 2.2.3 消息状态变更（已读/已看等）
-**文件**：`apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts:77-105`
+#### 2.3.3 工作流发布/同步
 
-- 用户标记消息为已看 → `MESSAGE_SEEN`
-- 用户标记消息为已读/未读 → `MESSAGE_READ` / `MESSAGE_UNREAD`
+**文件**：`apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:149-160`
 
-#### 2.2.4 偏好更新
-**文件**：`apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts:78-88`
+触发时机：工作流从一个环境同步到另一个环境（如开发 → 生产）时。
 
-- 用户更新通知偏好 → `PREFERENCE_UPDATED`
+```typescript
+// 更新源工作流的发布信息
+await this.notificationTemplateRepository.updatePublishFields(
+  sourceWorkflow._id,
+  command.user.environmentId,
+  command.user._id,
+  command.session
+);
 
-### 2.3 事件投递流程
+if (this.sendWebhookMessage) {
+  await this.sendWebhookMessage.execute({
+    eventType: WebhookEventEnum.WORKFLOW_PUBLISHED,
+    objectType: WebhookObjectTypeEnum.WORKFLOW,
+    payload: {
+      object: upsertedWorkflow,        // 目标环境的新工作流状态
+      previousObject: sourceWorkflow,  // 源环境的原始工作流状态
+    },
+    organizationId: command.user.organizationId,
+    environmentId: command.user.environmentId,  // 注意：是源环境 ID
+  });
+}
+```
+
+#### 2.3.4 消息归档/取消归档
+
+**文件**：`apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:81-99`
+
+触发流程：
+1. `MarkNotificationAs`（单个）→ 调用 `MarkManyNotificationsAs`（批量）
+2. 批量更新消息状态
+3. 按 `archived` 值决定触发 `MESSAGE_ARCHIVED` 或 `MESSAGE_UNARCHIVED`
+
+```typescript
+const eventTypes: WebhookEventEnum[] = [];
+
+if (command.read !== undefined) {
+  const eventType = command.read ? WebhookEventEnum.MESSAGE_READ : WebhookEventEnum.MESSAGE_UNREAD;
+  eventTypes.push(eventType);
+}
+
+if (command.archived !== undefined) {
+  const eventType = command.archived ? WebhookEventEnum.MESSAGE_ARCHIVED : WebhookEventEnum.MESSAGE_UNARCHIVED;
+  eventTypes.push(eventType);
+}
+
+if (command.snoozedUntil !== undefined) {
+  const eventType = command.snoozedUntil ? WebhookEventEnum.MESSAGE_SNOOZED : WebhookEventEnum.MESSAGE_UNSNOOZED;
+  eventTypes.push(eventType);
+}
+
+// 批量发送 webhook（每批 100 条）
+await this.processWebhooksInBatches(eventTypes, updatedMessages, command, environment);
+```
+
+#### 2.3.5 消息稍后提醒（Snooze/Unsnooze）
+
+**触发场景**：
+1. **用户主动 Snooze**：`SnoozeNotification.execute()` → 创建定时 Unsnooze Job → 调用 `markNotificationAsSnoozed()` → `MarkManyNotificationsAs` 触发 `MESSAGE_SNOOZED`
+   - 文件：`apps/api/src/app/inbox/usecases/snooze-notification/snooze-notification.usecase.ts:60-64`
+
+2. **用户主动 Unsnooze**：`UnsnoozeNotification.execute()` → 删除定时 Job → 调用 `markNotificationAs()` → `MarkManyNotificationsAs` 触发 `MESSAGE_UNSNOOZED`
+   - 文件：`apps/api/src/app/inbox/usecases/unsnooze-notification/unsnooze-notification.usecase.ts:58-77`
+
+3. **定时自动唤醒**：`ProcessUnsnoozeJob.execute()` → 更新 `snoozedUntil: null` → 触发 `MESSAGE_UNSNOOZED`
+   - 文件：`apps/worker/src/app/workflow/usecases/process-unsnooze-job/process-unsnooze-job.usecase.ts`
+
+#### 2.3.6 消息删除
+
+**批量删除**：`DeleteManyNotifications.execute()` → 删除数据库记录 → 触发 `MESSAGE_DELETED`
+- 文件：`apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts:47-77`
+
+**按条件删除**：`DeleteAllNotifications.execute()` → 按过滤器删除 → 触发 `MESSAGE_DELETED`
+- 文件：`apps/api/src/app/inbox/usecases/delete-all-notifications/delete-all-notifications.usecase.ts:69-115`
+
+**批量处理策略**：每 100 条消息为一批，并发发送 webhook。
+
+#### 2.3.7 入站邮件
+
+**文件**：`libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:112-133`
+
+触发时机：用户回复邮件（Reply-to 或入站域名路由）时。
+
+```typescript
+async deliverToWebhook(params: {
+  environmentId: string;
+  organizationId: string;
+  domain: RoutableDomain;
+  route: DomainRouteEntity;
+  mail: InboundDomainRouteMailInput;
+}): Promise<{ latencyMs: number; skipped: boolean }> {
+  const payload = this.buildDomainRouteWebhookPayload(params.domain, params.route, params.mail);
+  const result = await this.sendWebhookMessage.execute({
+    environmentId: params.environmentId,
+    organizationId: params.organizationId,
+    eventType: WebhookEventEnum.EMAIL_RECEIVED,
+    objectType: WebhookObjectTypeEnum.EMAIL_INBOUND,
+    payload: { object: payload },
+  });
+  return { latencyMs: Date.now() - started, skipped: result === undefined };
+}
+```
+
+**入站邮件 Payload 结构**：
+```typescript
+{
+  domain: { id, name, data },       // 域名配置
+  route: { address, data },         // 路由配置
+  mail: {                           // 邮件内容
+    from, to, subject, html, text,
+    headers, attachments, messageId,
+    inReplyTo, references, date, cc
+  }
+}
+```
+
+### 2.4 事件投递流程
 
 **核心文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:20-80`
 
@@ -127,8 +270,8 @@ async execute(command: SendWebhookMessageCommand): Promise<{ eventId: string } |
   // 1. 检查 Svix 客户端是否可用
   if (!this.svix) return;
 
-  // 2. 获取环境配置，检查 webhookAppId
-  const environment = await this.environmentRepository.findOne({ _id: command.environmentId });
+  // 2. 获取环境配置，检查 webhookAppId（优先使用传入的 environment，减少 DB 查询）
+  const environment = command.environment || await this.environmentRepository.findOne({ _id: command.environmentId });
   const appId = environment.webhookAppId;
   if (!appId) return;
 
@@ -156,7 +299,7 @@ async execute(command: SendWebhookMessageCommand): Promise<{ eventId: string } |
 }
 ```
 
-### 2.4 Payload 结构
+### 2.5 Payload 结构
 
 **文件**：`libs/application-generic/src/webhooks/dtos/webhook-payload.dto.ts:4-40`
 
@@ -171,7 +314,7 @@ export class WrapperDto<T> {
 }
 ```
 
-### 2.5 消息 Mapper
+### 2.6 消息 Mapper
 
 **文件**：`libs/application-generic/src/webhooks/mappers/message.mapper.ts:5-79`
 
@@ -183,20 +326,46 @@ export class WrapperDto<T> {
 
 ---
 
-## 3. 签名生成与验证机制
+## 3. 两条签名链路深度对比
 
-### 3.1 出站 Webhook 签名（Svix 处理）
+### 3.1 链路概览
 
-Novu 使用 **Svix** 作为 webhook 服务，签名由 Svix 自动生成和附加。
+| 维度 | Svix 出站签名 | Framework novu-signature 验签 |
+|-----|--------------|-----------------------------|
+| **使用场景** | Novu 向用户回调业务事件（17 种 webhook 事件） | Novu 调用用户 Bridge 端点（工作流发现、执行、预览） |
+| **签名头部** | `svix-signature` | `novu-signature` |
+| **签名格式** | `t=<timestamp>,v1=<signature>` | `t=<unix-ms>,v1=<hex-hmac>` |
+| **签名算法** | HMAC-SHA256 | HMAC-SHA256 |
+| **签名密钥** | Svix 为每个 endpoint 生成的 Signing Secret | 用户环境的 `secretKey`（Novu 平台存储，加密保存） |
+| **签名生成方** | Svix 服务自动生成 | Novu 平台（`buildNovuSignatureHeader`） |
+| **签名验证方** | 用户代码（使用 Svix SDK） | Novu Framework Handler（用户 Bridge 端） |
+| **时间戳容忍度** | Svix 默认 5 分钟 | Novu Framework 固定 5 分钟 |
+| **重放防护** | ✅ 时间戳 + 事件 ID | ✅ 时间戳 |
+| **恒时比较** | ✅ Svix SDK 实现 | ✅ `timingSafeEqual` 手动实现 |
+| **开关控制** | `SVIX_API_KEY` 环境变量 | `strictAuthentication` 开关 |
 
-**签名头部**：`svix-signature`
-**签名算法**：HMAC-SHA256
-**签名格式**：`t=<timestamp>,v1=<signature>`
+### 3.2 链路一：Svix 出站签名（用户接收 Novu 事件）
 
-Svix 签名机制特性：
-- 包含时间戳防止重放攻击
-- 多版本签名支持（v1 为当前版本）
-- 用户使用 Svix 提供的签名密钥进行验证
+**签名生成**：由 Svix 服务在投递时自动生成，使用用户在 Svix Portal 中配置的 Signing Secret。
+
+**签名验证**（用户端实现）：
+```javascript
+import { Webhook } from 'svix';
+
+const webhook = new Webhook(process.env.SVIX_WEBHOOK_SECRET);
+
+app.post('/webhook', (req, res) => {
+  const payload = JSON.stringify(req.body);
+  const headers = req.headers;
+
+  try {
+    const verified = webhook.verify(payload, headers);
+    res.status(200).send('OK');
+  } catch (err) {
+    res.status(400).send('Invalid signature');
+  }
+});
+```
 
 **Svix 客户端初始化**：`libs/application-generic/src/webhooks/services/svix-provider.service.ts:1-18`
 
@@ -205,30 +374,62 @@ export const SvixProviderService: Provider<SvixClient> = {
   provide: 'SVIX_CLIENT',
   useFactory: (): SvixClient => {
     const apiKey = process.env.SVIX_API_KEY;
-    if (!apiKey) return null;
+    if (!apiKey) return null;  // 未配置则禁用 webhook 功能
     return new Svix(apiKey);
   },
 };
 ```
 
-### 3.2 入站请求签名验证（Framework Handler）
+### 3.3 链路二：novu-signature 验签（Novu 调用用户 Bridge）
+
+#### 3.3.1 签名生成（Novu 平台端）
+
+**文件**：`libs/application-generic/src/utils/hmac.ts:6-12`
+
+```typescript
+export function buildNovuSignatureHeader(secretKey: string, payload: unknown): string {
+  const timestamp = Date.now();
+  const publicKey = `${timestamp}.${JSON.stringify(payload)}`;
+  const hmac = createHmac('sha256', secretKey).update(publicKey).digest('hex');
+
+  return `t=${timestamp},v1=${hmac}`;
+}
+```
+
+**调用点**：`libs/application-generic/src/usecases/execute-bridge-request/execute-framework-request.usecase.ts:140-148`
+
+```typescript
+private async buildRequestHeaders(command: ExecuteBridgeRequestCommand) {
+  const novuSignatureHeader = await this.buildRequestSignature(command);
+
+  return {
+    [HttpRequestHeaderKeysEnum.BYPASS_TUNNEL_REMINDER]: 'true',
+    [HttpRequestHeaderKeysEnum.CONTENT_TYPE]: 'application/json',
+    [HttpHeaderKeysEnum.NOVU_SIGNATURE]: novuSignatureHeader,  // 注入签名
+  };
+}
+
+private async buildRequestSignature(command: ExecuteBridgeRequestCommand) {
+  const secretKey = await this.getDecryptedSecretKey.execute(
+    GetDecryptedSecretKeyCommand.create({ environmentId: command.environmentId })
+  );
+
+  return buildNovuSignatureHeader(secretKey, command.event || {});
+}
+```
+
+#### 3.3.2 签名验证（用户 Bridge 端）
 
 **文件**：`packages/framework/src/handler.ts:371-396`
 
-用于验证来自 Novu 平台的入站请求签名（如 Bridge 回调）。
-
-**签名头部**：`novu-signature`
-**签名格式**：`t=<unix-ms>,v1=<hex-hmac>`
-
-**验证流程**：
 ```typescript
 private async validateHmac(payload: unknown, hmacHeader: string | null): Promise<void> {
-  // 1. 检查是否启用 HMAC
+  // 1. 检查是否启用 HMAC（受 strictAuthentication 控制）
   if (!this.hmacEnabled) return;
-  
+
   // 2. 检查签名头部是否存在
   if (!hmacHeader) throw new SignatureNotFoundError();
-  
+
   // 3. 检查签名密钥是否配置
   if (!this.client.secretKey) throw new SigningKeyNotFoundError();
 
@@ -236,13 +437,13 @@ private async validateHmac(payload: unknown, hmacHeader: string | null): Promise
   const parsed = parseSignatureHeader(hmacHeader);
   if (!parsed.v1 || parsed.t === undefined) throw new SignatureInvalidError();
 
-  // 5. 检查时间戳（防重放攻击）
+  // 5. 检查时间戳（防重放攻击，5分钟容忍度）
   const now = Date.now();
   if (parsed.t < now - SIGNATURE_TIMESTAMP_TOLERANCE || parsed.t > now + SIGNATURE_TIMESTAMP_TOLERANCE) {
     throw new SignatureExpiredError();
   }
 
-  // 6. 计算本地签名
+  // 6. 计算本地签名（使用 Web Crypto API，跨平台兼容）
   const localHash = await createHmacSubtle(
     this.client.secretKey,
     `${parsed.t}.${JSON.stringify(payload)}`
@@ -261,11 +462,11 @@ export const SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES = 5;
 export const SIGNATURE_TIMESTAMP_TOLERANCE = SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES * 60 * 1000; // 5分钟
 ```
 
-### 3.3 核心加密工具
+#### 3.3.3 核心加密工具
 
 **文件**：`packages/framework/src/utils/crypto.utils.ts:11-60`
 
-#### HMAC 生成（跨平台兼容）
+##### HMAC 生成（跨平台兼容 Web Crypto API）
 ```typescript
 export const createHmacSubtle = async (secretKey: string, data: string): Promise<string> => {
   const encoder = new TextEncoder();
@@ -285,7 +486,7 @@ export const createHmacSubtle = async (secretKey: string, data: string): Promise
 };
 ```
 
-#### 恒定时间比较（防时序攻击）
+##### 恒定时间比较（防时序攻击）
 ```typescript
 export const timingSafeEqual = (a: string, b: string): boolean => {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -299,7 +500,7 @@ export const timingSafeEqual = (a: string, b: string): boolean => {
 };
 ```
 
-#### 签名头部解析
+##### 签名头部解析
 **文件**：`packages/framework/src/handler.ts:415-439`
 
 ```typescript
@@ -318,24 +519,141 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
 }
 ```
 
-### 3.4 签名错误类型
+#### 3.3.4 签名错误类型
 
 **文件**：`packages/framework/src/errors/signature.errors.ts:4-57`
 
-| 错误类型 | 场景 |
-|---------|------|
-| `SignatureNotFoundError` | 请求缺少 `novu-signature` 头部 |
-| `SignatureInvalidError` | 签名格式不正确 |
-| `SignatureExpiredError` | 签名时间戳超出 5 分钟容忍范围 |
-| `SignatureMismatchError` | 签名验证失败 |
-| `SigningKeyNotFoundError` | 服务端未配置签名密钥 |
-| `SignatureVersionInvalidError` | 签名版本不支持 |
+| 错误类型 | 场景 | HTTP 状态码 |
+|---------|------|------------|
+| `SignatureNotFoundError` | 请求缺少 `novu-signature` 头部 | 401 |
+| `SignatureInvalidError` | 签名格式不正确 | 401 |
+| `SignatureExpiredError` | 签名时间戳超出 5 分钟容忍范围 | 401 |
+| `SignatureMismatchError` | 签名验证失败 | 401 |
+| `SigningKeyNotFoundError` | 服务端未配置签名密钥 | 500 |
+| `SignatureVersionInvalidError` | 签名版本不支持 | 401 |
 
 ---
 
-## 4. 失败重试与去重机制
+## 4. strictAuthentication 开关深度分析
 
-### 4.1 失败重试（Svix 自动处理）
+### 4.1 开关定义
+
+**文件**：`packages/framework/src/types/config.types.ts:15-25`
+
+```typescript
+export type ClientOptions = {
+  /**
+   * Explicitly use HMAC signature verification.
+   * Setting this to `false` will enable Novu to communicate with your Bridge API
+   * without requiring a valid HMAC signature.
+   * This is useful for local development and testing.
+   *
+   * In production you must specify an `secretKey` and set this to `true`.
+   *
+   * Defaults to true.
+   */
+  strictAuthentication?: boolean;
+};
+```
+
+### 4.2 开关优先级与默认值
+
+**文件**：`packages/framework/src/client.ts:53-95`
+
+```typescript
+function isRuntimeInDevelopment() {
+  return ['development', undefined, 'dev'].includes(process.env.NODE_ENV);
+}
+
+private buildOptions(providedOptions?: ClientOptions) {
+  const builtConfiguration: Required<ClientOptions> = {
+    apiUrl: resolveApiUrl(providedOptions?.apiUrl),
+    secretKey: resolveSecretKey(providedOptions?.secretKey),
+    strictAuthentication: !isRuntimeInDevelopment(),  // 默认：开发环境 false，生产 true
+    verbose: isRuntimeInDevelopment(),
+  };
+
+  // 优先级 1：显式传入的参数
+  if (providedOptions?.strictAuthentication !== undefined) {
+    builtConfiguration.strictAuthentication = providedOptions.strictAuthentication;
+  }
+  // 优先级 2：环境变量 NOVU_STRICT_AUTHENTICATION_ENABLED
+  else if (process.env.NOVU_STRICT_AUTHENTICATION_ENABLED !== undefined) {
+    builtConfiguration.strictAuthentication = process.env.NOVU_STRICT_AUTHENTICATION_ENABLED === 'true';
+  }
+  // 优先级 3：默认值（!isRuntimeInDevelopment()）
+
+  return builtConfiguration;
+}
+```
+
+**优先级总结**：
+1. **最高**：显式传入 `strictAuthentication` 参数
+2. **其次**：环境变量 `NOVU_STRICT_AUTHENTICATION_ENABLED`
+3. **最低**：默认值（`NODE_ENV` 为 `development`/`dev`/`undefined` 时为 `false`，否则为 `true`）
+
+### 4.3 开关影响范围
+
+**文件**：`packages/framework/src/handler.ts:80-88`
+
+```typescript
+constructor(options: INovuRequestHandlerOptions<Input, Output>) {
+  this.handler = options.handler;
+  this.client = options.client ? options.client : new Client();
+  this.workflows = options.workflows || [];
+  this.agents = options.agents || [];
+  this.http = initApiClient(this.client.secretKey, this.client.apiUrl);
+  this.frameworkName = options.frameworkName;
+  this.hmacEnabled = this.client.strictAuthentication;  // ⚠️ 直接关联
+  this.client.addAgents(this.agents);
+}
+```
+
+**当 `strictAuthentication = false` 时**：
+- `this.hmacEnabled = false`
+- `validateHmac()` 方法直接 `return`，跳过所有签名验证
+- 即使请求不带 `novu-signature` 头部也能通过
+- **仅用于开发/测试环境**
+
+**当 `strictAuthentication = true` 时**：
+- `this.hmacEnabled = true`
+- 所有请求必须携带有效的 `novu-signature` 头部
+- 缺少头部、签名过期、签名不匹配都会抛出相应错误
+
+### 4.4 生产环境强制启用
+
+**文件**：`apps/api/src/app/environments-v1/novu-bridge-client.ts:127-132`
+
+Novu 托管的 Bridge 端点强制启用严格认证：
+
+```typescript
+const novuRequestHandler = new NovuRequestHandler({
+  frameworkName,
+  workflows,
+  client: new Client({ secretKey, strictAuthentication: true, verbose: false }),  // 强制 true
+  handler: this.novuHandler.handler,
+});
+```
+
+### 4.5 测试环境禁用
+
+**文件**：`apps/dashboard/tests/utils/test-bridge-server.ts:14`
+
+```typescript
+this.client = new Client({ strictAuthentication: false, secretKey, apiUrl });
+```
+
+**文件**：`apps/api/e2e/test-bridge-server.ts:9`
+
+```typescript
+public client = new Client({ strictAuthentication: false });
+```
+
+---
+
+## 5. 失败重试与去重机制
+
+### 5.1 出站 Webhook 重试（Svix 自动处理）
 
 Svix 作为专业的 webhook 服务提供完善的重试机制：
 
@@ -343,7 +661,7 @@ Svix 作为专业的 webhook 服务提供完善的重试机制：
 **重试次数**：Svix 默认最多重试 25 次，时间跨度约 3 天
 **成功判定**：接收方返回 2xx 状态码视为成功
 
-### 4.2 内部 Webhook Filter 重试策略
+### 5.2 内部 Webhook Filter 重试策略
 
 **文件**：`apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts:11-36`
 
@@ -352,7 +670,7 @@ Svix 作为专业的 webhook 服务提供完善的重试机制：
 ```typescript
 public async execute(command: WebhookFilterBackoffStrategyCommand): Promise<number> {
   const { attemptsMade, eventError: error, eventJob } = command;
-  
+
   // 记录重试执行详情
   await this.createExecutionDetails.execute(
     CreateExecutionDetailsCommand.create({
@@ -377,7 +695,17 @@ public async execute(command: WebhookFilterBackoffStrategyCommand): Promise<numb
 - 第 3 次重试：0-8 秒
 - ...
 
-### 4.3 去重机制
+### 5.3 Bridge 请求重试
+
+**文件**：`libs/application-generic/src/usecases/execute-bridge-request/execute-framework-request.usecase.ts:116-118`
+
+```typescript
+retry: {
+  limit: retriesLimit,  // 默认 DEFAULT_RETRIES_LIMIT = 3
+},
+```
+
+### 5.4 去重机制
 
 #### 事件 ID 去重
 **文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:49`
@@ -396,9 +724,9 @@ const eventId = `evt_${generateObjectId()}`;
 
 ---
 
-## 5. 接收方身份验证与历史投递回溯
+## 6. 接收方身份验证与历史投递回溯
 
-### 5.1 Webhook Portal 访问管理
+### 6.1 Webhook Portal 访问管理
 
 **文件**：`apps/api/src/app/outbound-webhooks/outbound-webhooks.controller.ts:13-57`
 
@@ -451,7 +779,7 @@ async execute(command: GetWebhookPortalTokenCommand): Promise<GetWebhookPortalTo
 }
 ```
 
-### 5.2 App ID 生成规则
+### 6.2 App ID 生成规则
 
 **文件**：`libs/application-generic/src/webhooks/utils/app-id.ts:7-9`
 
@@ -461,14 +789,14 @@ export function generateWebhookAppId(organizationId: OrganizationId, environment
 }
 ```
 
-### 5.3 企业版 vs 社区版差异
+### 6.3 企业版 vs 社区版差异
 
 **文件**：`apps/api/src/app/outbound-webhooks/outbound-webhooks.module.ts:14-50`
 
 - **企业版**：完整的 Svix 集成，包含所有 webhook 功能
 - **社区版**：使用 `NoopSendWebhookMessage` 空实现，webhook 功能被禁用
 
-### 5.4 历史投递回溯
+### 6.4 历史投递回溯
 
 #### 通过 Event ID 追踪
 每个 webhook payload 包含唯一的 `id` 字段（即 `eventId`），可用于：
@@ -498,9 +826,9 @@ export function generateWebhookAppId(organizationId: OrganizationId, environment
 
 ---
 
-## 6. 入站 Webhook 处理（平台接收第三方回调）
+## 7. 入站 Webhook 处理（平台接收第三方回调）
 
-### 6.1 入口端点
+### 7.1 入口端点
 
 **文件**：`apps/webhook/src/webhooks/webhooks.controller.ts:12-46`
 
@@ -515,7 +843,7 @@ export class WebhooksController {
 }
 ```
 
-### 6.2 处理流程
+### 7.2 处理流程
 
 **文件**：`apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts:24-141`
 
@@ -523,28 +851,28 @@ export class WebhooksController {
 async execute(command: WebhookCommand): Promise<IWebhookResult[]> {
   // 1. 查找集成配置
   const integration = await this.integrationRepository.findOne(query);
-  
+
   // 2. 创建对应 provider handler
   this.createProvider(integration, command.type);
-  
+
   // 3. 从回调中提取消息 ID
   const messageIdentifiers = this.provider.getMessageId(body);
-  
+
   // 4. 逐条处理事件
   for (const messageIdentifier of messageIdentifiers) {
     // 查找消息
     const message = await this.messageRepository.findOne({ identifier: messageIdentifier });
-    
+
     // 解析事件类型（delivered, bounced, clicked 等）
     const event = this.provider.parseEventBody(body, messageIdentifier);
-    
+
     // 创建执行详情
     await this.createExecutionDetails.execute({ message, webhook, webhookEvent, channel });
   }
 }
 ```
 
-### 6.3 Provider 接口要求
+### 7.3 Provider 接口要求
 
 **文件**：`packages/stateless/src/lib/provider/provider.interface.ts`
 
@@ -554,21 +882,25 @@ async execute(command: WebhookCommand): Promise<IWebhookResult[]> {
 
 ---
 
-## 7. 关键配置项
+## 8. 关键配置项
 
 ### 环境变量
 - `SVIX_API_KEY` - Svix API 密钥，未配置时 webhook 功能禁用
 - `NOVU_ENTERPRISE` - 是否为企业版，决定是否启用完整 webhook 功能
 - `STORE_NOTIFICATION_CONTENT` - 是否存储通知内容
+- `NOVU_STRICT_AUTHENTICATION_ENABLED` - Bridge 签名验证开关（默认生产环境 true）
+- `NODE_ENV` - 影响 `strictAuthentication` 默认值
 
 ### 数据库字段
 - `environment.webhookAppId` - 环境对应的 Svix 应用 ID
+- `environment.bridge.url` / `environment.echo.url` - Bridge 端点 URL
+- `environment.apiKeys[].key` - 环境 API 密钥（加密存储）
 
 ---
 
-## 8. 接收方集成指南
+## 9. 接收方集成指南
 
-### 8.1 验证 Svix 签名（接收方实现）
+### 9.1 验证 Svix 签名（接收 Novu 出站事件）
 
 使用 Svix 官方 SDK 验证签名：
 
@@ -583,7 +915,37 @@ app.post('/webhook', (req, res) => {
 
   try {
     const verified = webhook.verify(payload, headers);
-    // 处理验证通过的请求
+
+    // 处理不同事件类型
+    const { type, data } = verified;
+    switch (type) {
+      case 'message.sent':
+        // ⚠️ 注意：Chat 失败时也是 message.sent，但有 error 字段
+        if (data.error) {
+          console.log('消息发送失败:', data.error.message);
+        } else {
+          console.log('消息发送成功:', data.object._id);
+        }
+        break;
+      case 'message.failed':
+        // Email/SMS/Push 失败（注意 Chat 不会触发这个）
+        console.log('消息发送失败:', data.error.message);
+        break;
+      case 'workflow.deleted':
+        console.log('工作流已删除:', data.object._id);
+        break;
+      case 'workflow.published':
+        console.log('工作流已发布:', data.object.name);
+        break;
+      case 'message.archived':
+        console.log('消息已归档:', data.object._id);
+        break;
+      case 'email.received':
+        console.log('收到入站邮件:', data.object.mail.subject);
+        break;
+      // ... 其他事件类型
+    }
+
     res.status(200).send('OK');
   } catch (err) {
     res.status(400).send('Invalid signature');
@@ -591,33 +953,97 @@ app.post('/webhook', (req, res) => {
 });
 ```
 
-### 8.2 去重处理（接收方实现）
+### 9.2 去重处理（接收方实现）
 
 ```javascript
 const processedEventIds = new Set();
 
 app.post('/webhook', (req, res) => {
   const eventId = req.body.id;
-  
+
   if (processedEventIds.has(eventId)) {
     return res.status(200).send('Already processed');
   }
-  
+
   processedEventIds.add(eventId);
   // 处理事件...
 });
 ```
 
-### 8.3 回溯历史
+### 9.3 Bridge 端签名验证（使用 Novu Framework）
+
+```typescript
+import { Client, NovuHandler, NovuRequestHandler } from '@novu/framework/nest';
+
+// 生产环境：强制启用严格认证
+const client = new Client({
+  secretKey: process.env.NOVU_SECRET_KEY,
+  strictAuthentication: process.env.NODE_ENV === 'production',
+});
+
+const handler = new NovuRequestHandler({
+  frameworkName: 'express',
+  workflows: [myWorkflow],
+  client,
+  handler: ({ step, payload }) => {
+    // 工作流逻辑
+  },
+});
+
+// 所有请求会自动验证 novu-signature 头部
+app.post('/bridge', handler.createHandler());
+```
+
+### 9.4 回溯历史
 
 1. 通过 Novu API 获取 Svix Portal 访问令牌
+   ```bash
+   GET /v2/outbound-webhooks/portal/token
+   ```
 2. 登录 Svix Portal 查看完整投递历史
 3. 使用 `eventId` 搜索特定事件
 4. 查看每次投递的请求/响应详情和重试记录
 
 ---
 
-## 9. 核心文件索引
+## 10. 已知问题与注意事项
+
+### 10.1 ⚠️ Chat 发送失败事件类型不一致
+
+**问题**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854`
+
+Chat 渠道发送失败时，使用的事件类型是 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，与其他渠道不一致。
+
+**接收方处理建议**：
+```typescript
+if (event.type === 'message.sent') {
+  if (event.data.error) {
+    // Chat 发送失败
+    handleChatFailure(event.data);
+  } else {
+    // 发送成功
+    handleSuccess(event.data);
+  }
+} else if (event.type === 'message.failed') {
+  // Email/SMS/Push 发送失败
+  handleOtherFailure(event.data);
+}
+```
+
+### 10.2 两条签名链路使用不同密钥
+
+- **Svix 出站**：使用 Svix Signing Secret（在 Svix Portal 中获取）
+- **Bridge 入站**：使用 Novu 环境 Secret Key（在 Novu 管理后台获取）
+
+不要混淆这两个密钥。
+
+### 10.3 社区版不支持出站 Webhook
+
+社区版使用 `NoopSendWebhookMessage` 空实现，所有 `sendWebhookMessage.execute()` 调用直接返回 `undefined`，不会发送任何 webhook。
+
+---
+
+## 11. 核心文件索引
 
 | 模块 | 文件路径 | 功能 |
 |-----|---------|-----|
@@ -630,6 +1056,16 @@ app.post('/webhook', (req, res) => {
 | Portal API | `apps/api/src/app/outbound-webhooks/outbound-webhooks.controller.ts` | Portal 访问 API |
 | 重试策略 | `apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts` | webhook filter 重试 |
 | 入站处理 | `apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts` | 第三方回调处理 |
-| 签名验证 | `packages/framework/src/handler.ts` | HMAC 签名验证逻辑 |
+| Bridge 签名生成 | `libs/application-generic/src/utils/hmac.ts` | novu-signature 签名生成 |
+| Bridge 请求执行 | `libs/application-generic/src/usecases/execute-bridge-request/execute-framework-request.usecase.ts` | Bridge 请求执行与签名注入 |
+| Bridge 签名验证 | `packages/framework/src/handler.ts` | HMAC 签名验证逻辑 |
 | 加密工具 | `packages/framework/src/utils/crypto.utils.ts` | HMAC 生成和恒时比较 |
 | 签名错误 | `packages/framework/src/errors/signature.errors.ts` | 签名相关错误类型 |
+| Client 配置 | `packages/framework/src/client.ts` | strictAuthentication 开关逻辑 |
+| 配置类型 | `packages/framework/src/types/config.types.ts` | ClientOptions 类型定义 |
+| Chat 发送 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts` | Chat 渠道发送（含失败处理） |
+| 工作流删除 | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts` | 工作流删除触发 |
+| 工作流发布 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts` | 工作流发布触发 |
+| 消息批量操作 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts` | 归档/已读/稍后 触发 |
+| 消息删除 | `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts` | 消息删除触发 |
+| 入站邮件 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts` | 入站邮件触发 |
