@@ -1,6 +1,8 @@
 # Webhook 回调机制深度分析
 
-本文档详细分析 Novu 平台向用户回调 webhook 的完整机制，包括事件流转、签名生成、失败重试与去重机制，以及接收方如何验证身份与回溯历史投递。
+本文档详细分析 Novu 平台向用户回调 webhook 的完整机制，**所有事件触发点均基于 `sendWebhookMessage.execute()` 真实调用点核实**，包括事件流转、签名生成、失败重试与去重机制，以及接收方如何验证身份与回溯历史投递。
+
+---
 
 ## 1. 架构概述
 
@@ -29,7 +31,9 @@ Novu 存在 **两条独立的签名链路**，用于不同的通信场景：
 
 ---
 
-## 2. 事件语义与触发矩阵
+## 2. 事件触发矩阵（基于真实调用点）
+
+> **⚠️ 重要说明**：本矩阵完全基于 `sendWebhookMessage.execute()` 方法的真实调用点构建，每个事件都标注了精确的文件和行号作为代码证据。
 
 ### 2.1 事件类型定义
 
@@ -66,70 +70,214 @@ export enum WebhookEventEnum {
 
 ### 2.2 完整触发矩阵
 
-| 事件类型 | 触发场景 | 触发文件位置 | Payload 字段 |
-|---------|---------|-------------|-------------|
-| **WORKFLOW_CREATED** | 创建新工作流 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:113-121` | `object` |
-| **WORKFLOW_UPDATED** | 更新工作流 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:123-134` | `object`, `previousObject` |
-| **WORKFLOW_DELETED** | 删除工作流 | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:50-58` | `object` |
-| **WORKFLOW_PUBLISHED** | 工作流同步/发布到环境 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:149-160` | `object`, `previousObject` |
-| **MESSAGE_SENT** | 消息发送成功（全渠道） | Email: `send-message-email.usecase.ts:487-497`<br>SMS: `send-message-sms.usecase.ts:356-370`<br>Push: `send-message-push.usecase.ts:644-655`<br>In-App: `send-message-in-app.usecase.ts:307-318`<br>Chat: `send-message-chat.usecase.ts:805-818` | `object`, `providerResponseId` |
-| **MESSAGE_FAILED** | 消息发送失败（仅 Email/SMS/Push） | Email: `send-message-email.usecase.ts:553-564`<br>SMS: `send-message-sms.usecase.ts:372-382`<br>Push: `send-message-push.usecase.ts:726-741` | `object`, `error` |
-| **MESSAGE_SENT** (⚠️ Chat 失败特例) | **Chat 发送失败** 时错误使用 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854-867` | `object`, `error` |
-| **MESSAGE_DELIVERED** | 第三方回调投递成功 | `apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts` (provider 驱动) | - |
-| **MESSAGE_SEEN** | 用户查看消息 | `apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts:77-105` | `object` |
-| **MESSAGE_READ** / **MESSAGE_UNREAD** | 用户标记消息已读/未读 | 批量: `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:83-86`<br>单个: `mark-notification-as.usecase.ts` (调用批量)<br>按条件: `update-all-notifications.usecase.ts:121-124` | `object` |
-| **MESSAGE_ARCHIVED** / **MESSAGE_UNARCHIVED** | 用户归档/取消归档 | 批量: `mark-many-notifications-as.usecase.ts:88-91`<br>按条件: `update-all-notifications.usecase.ts:126-129` | `object` |
-| **MESSAGE_SNOOZED** / **MESSAGE_UNSNOOZED** | 用户稍后提醒/取消 | 批量: `mark-many-notifications-as.usecase.ts:93-97`<br>Snooze: `snooze-notification.usecase.ts` (调用 `markNotificationAsSnoozed` → 最终调用批量)<br>Unsnooze: `unsnooze-notification.usecase.ts` (调用批量)<br>定时唤醒: `process-unsnooze-job.usecase.ts` | `object` |
-| **MESSAGE_DELETED** | 用户删除消息 | 批量删除: `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts:77, 120-137`<br>按条件删除: `delete-all-notifications.usecase.ts:115, 147-164` | `object` |
-| **PREFERENCE_UPDATED** | 用户更新通知偏好 | `apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts:78-88` | `object` |
-| **EMAIL_RECEIVED** | 入站邮件到达 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:121-127` | `object` (domain, route, mail) |
+| # | 事件类型 | 触发场景 | 代码位置 | Payload 字段 |
+|---|---------|---------|---------|-------------|
+| **1** | `WORKFLOW_CREATED` | 创建新工作流 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:125` | `object` |
+| **2** | `WORKFLOW_UPDATED` | 更新工作流（v1 API） | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts:114` | `object`, `previousObject` |
+| **3** | `WORKFLOW_UPDATED` | 部分更新工作流（v2 API） | `apps/api/src/app/workflows-v2/usecases/patch-workflow/patch-workflow.usecase.ts:57` | `object`, `previousObject` |
+| **4** | `WORKFLOW_DELETED` | 删除工作流（删除实体后触发） | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:50` | `object` |
+| **5** | `WORKFLOW_PUBLISHED` | 工作流同步/发布到环境 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:150` | `object`, `previousObject` |
+| **6** | `MESSAGE_SENT` | **Email** 发送成功 | `apps/worker/src/app/workflow/usecases/send-message/send-message-email.usecase.ts:487` | `object`, `providerResponseId` |
+| **7** | `MESSAGE_FAILED` | **Email** 发送失败 | `apps/worker/src/app/workflow/usecases/send-message/send-message-email.usecase.ts:553` | `object`, `error` |
+| **8** | `MESSAGE_SENT` | **SMS** 发送成功 | `apps/worker/src/app/workflow/usecases/send-message/send-message-sms.usecase.ts:356` | `object`, `providerResponseId` |
+| **9** | `MESSAGE_FAILED` | **SMS** 发送失败 | `apps/worker/src/app/workflow/usecases/send-message/send-message-sms.usecase.ts:381` | `object`, `error` |
+| **10** | `MESSAGE_SENT` | **Push** 发送成功 | `apps/worker/src/app/workflow/usecases/send-message/send-message-push.usecase.ts:644` | `object`, `providerResponseId`, `deviceToken` |
+| **11** | `MESSAGE_FAILED` | **Push** 发送失败 | `apps/worker/src/app/workflow/usecases/send-message/send-message-push.usecase.ts:726` | `object`, `error.push.reason`, `error.push.deviceToken`, `error.message` |
+| **12** | `MESSAGE_SENT` | **Chat** 发送成功 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:805` | `object`, `providerResponseId`, `channelData` |
+| **13** | `MESSAGE_SENT` | ⚠️ **Chat 发送失败**（错误使用 MESSAGE_SENT） | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854` | `object`, `error.message` |
+| **14** | `MESSAGE_SENT` | **In-App** 发送成功（第1个事件） | `apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts:307` | `object`, `providerResponseId` |
+| **15** | `MESSAGE_DELIVERED` | **In-App** 投递成功（第2个事件，仅此一处主动触发！） | `apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts:319` | `object`, `providerResponseId` |
+| **16** | `MESSAGE_SEEN` / `MESSAGE_READ` / `MESSAGE_UNREAD` | Widget 单个标记消息状态 | `apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts:184` | `object` |
+| **17** | `MESSAGE_SEEN` / `MESSAGE_READ` / `MESSAGE_UNREAD` | Widget 批量标记消息状态 | `apps/api/src/app/widgets/usecases/mark-all-messages-as/mark-all-messages-as.usecase.ts:71` | `object` |
+| **18** | `MESSAGE_SEEN` / `MESSAGE_READ` / `MESSAGE_UNREAD` | Widget 按 mark 标记状态 | `apps/api/src/app/widgets/usecases/mark-message-as-by-mark/mark-message-as-by-mark.usecase.ts:80` | `object` |
+| **19** | `MESSAGE_SEEN` | Inbox 批量标记已看（100条一批） | `apps/api/src/app/inbox/usecases/mark-notifications-as-seen/mark-notifications-as-seen.usecase.ts:185` | `object` |
+| **20** | `MESSAGE_READ` / `MESSAGE_UNREAD` | Inbox 批量标记已读/未读 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:149` | `object` |
+| **21** | `MESSAGE_ARCHIVED` / `MESSAGE_UNARCHIVED` | Inbox 批量归档/取消归档 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:149` | `object` |
+| **22** | `MESSAGE_SNOOZED` / `MESSAGE_UNSNOOZED` | Inbox 批量稍后/取消稍后 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:149` | `object` |
+| **23** | `MESSAGE_READ` / `MESSAGE_UNREAD` | Inbox 按条件标记已读/未读 | `apps/api/src/app/inbox/usecases/update-all-notifications/update-all-notifications.usecase.ts:170` | `object` |
+| **24** | `MESSAGE_ARCHIVED` / `MESSAGE_UNARCHIVED` | Inbox 按条件归档/取消归档 | `apps/api/src/app/inbox/usecases/update-all-notifications/update-all-notifications.usecase.ts:170` | `object` |
+| **25** | `MESSAGE_SNOOZED` / `MESSAGE_UNSNOOZED` | Inbox 按条件稍后/取消稍后 | `apps/api/src/app/inbox/usecases/update-all-notifications/update-all-notifications.usecase.ts:170` | `object` |
+| **26** | `MESSAGE_DELETED` | Inbox 批量删除消息 | `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts:127` | `object` |
+| **27** | `MESSAGE_DELETED` | Inbox 按条件删除消息 | `apps/api/src/app/inbox/usecases/delete-all-notifications/delete-all-notifications.usecase.ts:154` | `object` |
+| **28** | `PREFERENCE_UPDATED` | 通知偏好更新 | `apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts:78` | `object`, `subscriberId` |
+| **29** | `EMAIL_RECEIVED` | 入站邮件到达 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:121` | `object` (domain, route, mail) |
 
-### 2.3 重点路径详细分析
+### 2.3 各渠道 MESSAGE_SENT / MESSAGE_FAILED / MESSAGE_DELIVERED 对比表
 
-#### 2.3.1 ⚠️ Chat 发送失败事件类型不一致
+| 渠道 | 发送成功 | 发送失败 | 主动触发 MESSAGE_DELIVERED |
+|-----|---------|---------|--------------------------|
+| **Email** | ✅ `MESSAGE_SENT`（L487） | ✅ `MESSAGE_FAILED`（L553） | ❌ 依赖第三方回调 |
+| **SMS** | ✅ `MESSAGE_SENT`（L356） | ✅ `MESSAGE_FAILED`（L381） | ❌ 依赖第三方回调 |
+| **Push** | ✅ `MESSAGE_SENT`（L644） | ✅ `MESSAGE_FAILED`（L726） | ❌ 依赖第三方回调 |
+| **Chat** | ✅ `MESSAGE_SENT`（L805） | ⚠️ **`MESSAGE_SENT`**（L854，错误！） | ❌ 依赖第三方回调 |
+| **In-App** | ✅ `MESSAGE_SENT`（L307） | ❌ 无失败 webhook | ✅ `MESSAGE_DELIVERED`（L319，仅此一处） |
 
-**文件**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:825-873`
+> **⚠️ 关键发现**：
+> 1. **Chat 发送失败事件类型不一致**：Chat 渠道发送失败时使用 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，与其他渠道不一致。接收方必须检查 `eventType === 'message.sent' && data.error` 才能判定 Chat 发送失败。
+> 2. **MESSAGE_DELIVERED 仅 In-App 主动触发**：其他渠道的 `MESSAGE_DELIVERED` 依赖第三方 webhook 回调（通过 `apps/webhook` 服务），不由 `sendWebhookMessage` 主动触发。
+> 3. **In-App 成功触发两个事件**：In-App 发送成功后会连续触发 `MESSAGE_SENT` 和 `MESSAGE_DELIVERED` 两个事件。
 
-**发现问题**：Chat 渠道发送失败时，使用的事件类型是 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，这与其他渠道（Email/SMS/Push）不一致。
+---
 
-```typescript
-// Chat 失败时的代码（错误实现）
-private async handleMessageSendError(...) {
-  await this.sendWebhookMessage.execute({
-    eventType: WebhookEventEnum.MESSAGE_SENT,  // ❌ 应该是 MESSAGE_FAILED
-    objectType: WebhookObjectTypeEnum.MESSAGE,
-    payload: {
-      object: messageWebhookMapper(message, command.subscriberId, { channelData: redactedChannelData }),
-      error: {
-        message: this.getErrorMessage(error) || 'Error while sending chat with provider',
-      },
-    },
-    organizationId: command.organizationId,
-    environmentId: command.environmentId,
-  });
-}
+## 3. 各链路详细调用链与代码证据
 
-// 对比 Email 失败时的正确实现
-await this.sendWebhookMessage.execute({
-  eventType: WebhookEventEnum.MESSAGE_FAILED,  // ✅ 正确
-  ...
-});
+### 3.1 消息状态变更（归档/稍后/删除）完整链路
+
+#### 3.1.1 调用链总览
+
+所有消息状态变更操作最终都会汇聚到 `MarkManyNotificationsAs` 或对应批量用例，由其统一触发 webhook。
+
+```
+单个操作入口
+├─→ MarkNotificationAs.execute()               [mark-notification-as.usecase.ts:22]
+│   └─→ MarkManyNotificationsAs.execute()      [mark-many-notifications-as.usecase.ts:42]
+│       └─→ buildEventTypes()                  [mark-many-notifications-as.usecase.ts:81-97]
+│       └─→ processWebhooksInBatches()         [mark-many-notifications-as.usecase.ts:99]
+│           └─→ sendWebhookMessage.execute()   [mark-many-notifications-as.usecase.ts:149]
+
+批量操作入口
+├─→ MarkManyNotificationsAs.execute()          [直接调用]
+│   └─→ ...（同上）
+
+按条件操作入口
+├─→ UpdateAllNotifications.execute()           [update-all-notifications.usecase.ts]
+│   └─→ sendWebhookMessage.execute()           [update-all-notifications.usecase.ts:170]
+
+删除操作入口
+├─→ DeleteManyNotifications.execute()          [delete-many-notifications.usecase.ts]
+│   └─→ sendWebhookMessage.execute()           [delete-many-notifications.usecase.ts:127]
+└─→ DeleteAllNotifications.execute()           [delete-all-notifications.usecase.ts]
+    └─→ sendWebhookMessage.execute()           [delete-all-notifications.usecase.ts:154]
 ```
 
-**接收方注意**：处理 Chat 渠道的失败事件时，需要检查 `eventType === 'message.sent'` 且存在 `error` 字段，才能判定为发送失败。
+#### 3.1.2 事件类型映射逻辑（精确代码）
 
-#### 2.3.2 工作流删除
+**文件**：`apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:81-97`
 
-**文件**：`apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:39-59`
+```typescript
+const eventTypes: WebhookEventEnum[] = [];
 
-触发时机：用户调用 API 删除工作流时，在删除相关实体（控制值、消息模板、偏好、翻译组）之后触发。
+// 已读/未读
+if (command.read !== undefined) {
+  const eventType = command.read ? WebhookEventEnum.MESSAGE_READ : WebhookEventEnum.MESSAGE_UNREAD;
+  eventTypes.push(eventType);
+}
+
+// 归档/取消归档
+if (command.archived !== undefined) {
+  const eventType = command.archived ? WebhookEventEnum.MESSAGE_ARCHIVED : WebhookEventEnum.MESSAGE_UNARCHIVED;
+  eventTypes.push(eventType);
+}
+
+// 稍后/取消稍后（注意：null 表示取消稍后）
+if (command.snoozedUntil !== undefined) {
+  // do not change to !== null, as null is a indication of unsnooze
+  const eventType = command.snoozedUntil ? WebhookEventEnum.MESSAGE_SNOOZED : WebhookEventEnum.MESSAGE_UNSNOOZED;
+  eventTypes.push(eventType);
+}
+
+await this.processWebhooksInBatches(eventTypes, updatedMessages, command, environment);
+```
+
+#### 3.1.3 批量处理策略
+
+**文件**：`apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:113-145`
+
+```typescript
+private async processWebhooksInBatches(
+  eventTypes: WebhookEventEnum[],
+  messages: MessageEntity[],
+  command: MarkManyNotificationsAsCommand,
+  environment: EnvironmentEntity
+): Promise<void> {
+  const BATCH_SIZE = 100;
+  const messageChunks = this.chunkArray(messages, BATCH_SIZE);
+
+  for (const messageChunk of messageChunks) {
+    const webhookPromises: Promise<{ eventId: string } | undefined>[] = [];
+
+    for (const eventType of eventTypes) {
+      webhookPromises.push(...this.buildWebhookPromises(eventType, messageChunk, command, environment));
+    }
+
+    await Promise.all(webhookPromises);  // 每批并发发送
+  }
+}
+```
+
+### 3.2 Snooze/Unsnooze（稍后提醒）完整链路
+
+#### 3.2.1 用户主动 Snooze
+
+**文件**：`apps/api/src/app/inbox/usecases/snooze-notification/snooze-notification.usecase.ts:51-93`
+
+```typescript
+public async execute(command: SnoozeNotificationCommand): Promise<InboxNotificationDto> {
+  // 1. 验证 snooze 时长
+  // 2. 查找通知
+
+  await this.messageRepository.withTransaction(async () => {
+    scheduledJob = await this.createScheduledUnsnoozeJob(notification, snoozeDurationMs); // 创建定时唤醒 Job
+    snoozedNotification = await this.markNotificationAsSnoozed(command); // → MarkNotificationAs → MarkManyNotificationsAs → MESSAGE_SNOOZED
+    await this.enqueueJob(scheduledJob, snoozeDurationMs); // 加入延迟队列
+  });
+
+  return snoozedNotification;
+}
+
+// 调用 markNotificationAsSnoozed → 最终触发 MESSAGE_SNOOZED
+private async markNotificationAsSnoozed(command: SnoozeNotificationCommand) {
+  return this.markNotificationAs.execute(
+    MarkNotificationAsCommand.create({
+      environmentId: command.environmentId,
+      organizationId: command.organizationId,
+      subscriberId: command.subscriberId,
+      notificationId: command.notificationId,
+      snoozedUntil: command.snoozeUntil,  // 非 null 值 → MESSAGE_SNOOZED
+      contextKeys: command.contextKeys,
+    })
+  );
+}
+```
+
+#### 3.2.2 用户主动 Unsnooze
+
+**文件**：`apps/api/src/app/inbox/usecases/unsnooze-notification/unsnooze-notification.usecase.ts:27-103`
+
+```typescript
+async execute(command: UnsnoozeNotificationCommand): Promise<InboxNotificationDto> {
+  // 1. 查找 snoozed 通知
+
+  await this.messageRepository.withTransaction(async () => {
+    scheduledJob = await this.jobRepository.findOneAndDelete(...); // 删除定时 Job
+    unsnoozedNotification = await this.markNotificationAs.execute(
+      MarkNotificationAsCommand.create({
+        ...
+        snoozedUntil: null,  // null 值 → MESSAGE_UNSNOOZED
+      })
+    );
+  });
+
+  return unsnoozedNotification;
+}
+```
+
+#### 3.2.3 定时自动唤醒（ProcessUnsnoozeJob）
+
+**注意**：`ProcessUnsnoozeJob` 用例本身不直接调用 `sendWebhookMessage.execute()`，而是通过更新消息状态触发后续流程。
+
+### 3.3 工作流删除链路
+
+**文件**：`apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts:39-58`
 
 ```typescript
 async execute(command: DeleteWorkflowCommand): Promise<void> {
   const workflowEntity = await this.getWorkflowByIdsUseCase.execute(...);
 
-  await this.deleteRelatedEntities(command, workflowEntity);  // 先删除实体
+  // 先删除所有关联实体
+  await this.deleteRelatedEntities(command, workflowEntity);
 
+  // 删除完成后触发 webhook
   await this.sendWebhookMessage.execute({
     eventType: WebhookEventEnum.WORKFLOW_DELETED,
     objectType: WebhookObjectTypeEnum.WORKFLOW,
@@ -140,13 +288,16 @@ async execute(command: DeleteWorkflowCommand): Promise<void> {
 }
 ```
 
-#### 2.3.3 工作流发布/同步
+### 3.4 工作流发布/同步链路
 
-**文件**：`apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:149-160`
-
-触发时机：工作流从一个环境同步到另一个环境（如开发 → 生产）时。
+**文件**：`apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts:135-160`
 
 ```typescript
+// 执行工作流同步（upsert 到目标环境）
+const upsertedWorkflow = await this.upsertWorkflowUseCase.execute(
+  UpsertWorkflowCommand.create(...)
+);
+
 // 更新源工作流的发布信息
 await this.notificationTemplateRepository.updatePublishFields(
   sourceWorkflow._id,
@@ -155,6 +306,7 @@ await this.notificationTemplateRepository.updatePublishFields(
   command.session
 );
 
+// 触发 WORKFLOW_PUBLISHED 事件
 if (this.sendWebhookMessage) {
   await this.sendWebhookMessage.execute({
     eventType: WebhookEventEnum.WORKFLOW_PUBLISHED,
@@ -169,64 +321,9 @@ if (this.sendWebhookMessage) {
 }
 ```
 
-#### 2.3.4 消息归档/取消归档
+### 3.5 入站邮件链路
 
-**文件**：`apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts:81-99`
-
-触发流程：
-1. `MarkNotificationAs`（单个）→ 调用 `MarkManyNotificationsAs`（批量）
-2. 批量更新消息状态
-3. 按 `archived` 值决定触发 `MESSAGE_ARCHIVED` 或 `MESSAGE_UNARCHIVED`
-
-```typescript
-const eventTypes: WebhookEventEnum[] = [];
-
-if (command.read !== undefined) {
-  const eventType = command.read ? WebhookEventEnum.MESSAGE_READ : WebhookEventEnum.MESSAGE_UNREAD;
-  eventTypes.push(eventType);
-}
-
-if (command.archived !== undefined) {
-  const eventType = command.archived ? WebhookEventEnum.MESSAGE_ARCHIVED : WebhookEventEnum.MESSAGE_UNARCHIVED;
-  eventTypes.push(eventType);
-}
-
-if (command.snoozedUntil !== undefined) {
-  const eventType = command.snoozedUntil ? WebhookEventEnum.MESSAGE_SNOOZED : WebhookEventEnum.MESSAGE_UNSNOOZED;
-  eventTypes.push(eventType);
-}
-
-// 批量发送 webhook（每批 100 条）
-await this.processWebhooksInBatches(eventTypes, updatedMessages, command, environment);
-```
-
-#### 2.3.5 消息稍后提醒（Snooze/Unsnooze）
-
-**触发场景**：
-1. **用户主动 Snooze**：`SnoozeNotification.execute()` → 创建定时 Unsnooze Job → 调用 `markNotificationAsSnoozed()` → `MarkManyNotificationsAs` 触发 `MESSAGE_SNOOZED`
-   - 文件：`apps/api/src/app/inbox/usecases/snooze-notification/snooze-notification.usecase.ts:60-64`
-
-2. **用户主动 Unsnooze**：`UnsnoozeNotification.execute()` → 删除定时 Job → 调用 `markNotificationAs()` → `MarkManyNotificationsAs` 触发 `MESSAGE_UNSNOOZED`
-   - 文件：`apps/api/src/app/inbox/usecases/unsnooze-notification/unsnooze-notification.usecase.ts:58-77`
-
-3. **定时自动唤醒**：`ProcessUnsnoozeJob.execute()` → 更新 `snoozedUntil: null` → 触发 `MESSAGE_UNSNOOZED`
-   - 文件：`apps/worker/src/app/workflow/usecases/process-unsnooze-job/process-unsnooze-job.usecase.ts`
-
-#### 2.3.6 消息删除
-
-**批量删除**：`DeleteManyNotifications.execute()` → 删除数据库记录 → 触发 `MESSAGE_DELETED`
-- 文件：`apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts:47-77`
-
-**按条件删除**：`DeleteAllNotifications.execute()` → 按过滤器删除 → 触发 `MESSAGE_DELETED`
-- 文件：`apps/api/src/app/inbox/usecases/delete-all-notifications/delete-all-notifications.usecase.ts:69-115`
-
-**批量处理策略**：每 100 条消息为一批，并发发送 webhook。
-
-#### 2.3.7 入站邮件
-
-**文件**：`libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:112-133`
-
-触发时机：用户回复邮件（Reply-to 或入站域名路由）时。
+**文件**：`libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts:112-132`
 
 ```typescript
 async deliverToWebhook(params: {
@@ -236,15 +333,21 @@ async deliverToWebhook(params: {
   route: DomainRouteEntity;
   mail: InboundDomainRouteMailInput;
 }): Promise<{ latencyMs: number; skipped: boolean }> {
+  const started = Date.now();
   const payload = this.buildDomainRouteWebhookPayload(params.domain, params.route, params.mail);
+
   const result = await this.sendWebhookMessage.execute({
     environmentId: params.environmentId,
     organizationId: params.organizationId,
     eventType: WebhookEventEnum.EMAIL_RECEIVED,
     objectType: WebhookObjectTypeEnum.EMAIL_INBOUND,
-    payload: { object: payload },
+    payload: { object: payload as unknown as Record<string, unknown> },
   });
-  return { latencyMs: Date.now() - started, skipped: result === undefined };
+
+  return {
+    latencyMs: Date.now() - started,
+    skipped: result === undefined,
+  };
 }
 ```
 
@@ -261,9 +364,66 @@ async deliverToWebhook(params: {
 }
 ```
 
-### 2.4 事件投递流程
+### 3.6 Chat 发送失败不一致问题详细分析
 
-**核心文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:20-80`
+**文件**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:825-873`
+
+```typescript
+private async handleMessageSendError(
+  command: SendMessageChatCommand,
+  message: MessageEntity,
+  error: Error,
+  channelData: ChatProviderData,
+  redactedChannelData: Record<string, unknown>
+): Promise<{ status: SendMessageStatus; errorMessage: DetailEnum }> {
+  // ... 更新消息状态为 FAILED ...
+
+  // ⚠️ 错误：使用 MESSAGE_SENT 而非 MESSAGE_FAILED
+  await this.sendWebhookMessage.execute({
+    eventType: WebhookEventEnum.MESSAGE_SENT,  // ❌ 应该是 MESSAGE_FAILED
+    objectType: WebhookObjectTypeEnum.MESSAGE,
+    payload: {
+      object: messageWebhookMapper(message, command.subscriberId, {
+        channelData: redactedChannelData,
+      }),
+      error: {
+        message: this.getErrorMessage(error) || 'Error while sending chat with provider',
+      },
+    },
+    organizationId: command.organizationId,
+    environmentId: command.environmentId,
+  });
+
+  return {
+    status: SendMessageStatus.FAILED,  // 返回状态是 FAILED，但事件类型是 SENT
+    errorMessage: DetailEnum.PROVIDER_ERROR,
+  };
+}
+```
+
+**接收方兼容处理**：
+```typescript
+if (event.type === 'message.sent') {
+  if (event.data.error) {
+    // Chat 发送失败（特殊情况）
+    handleChatFailure(event.data);
+  } else {
+    // 发送成功（所有渠道）
+    handleSuccess(event.data);
+  }
+} else if (event.type === 'message.failed') {
+  // Email/SMS/Push 发送失败
+  handleOtherFailure(event.data);
+}
+```
+
+---
+
+## 4. 事件投递流程
+
+### 4.1 SendWebhookMessage 核心逻辑
+
+**文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:20-80`
 
 ```typescript
 async execute(command: SendWebhookMessageCommand): Promise<{ eventId: string } | undefined> {
@@ -299,7 +459,7 @@ async execute(command: SendWebhookMessageCommand): Promise<{ eventId: string } |
 }
 ```
 
-### 2.5 Payload 结构
+### 4.2 Payload 结构
 
 **文件**：`libs/application-generic/src/webhooks/dtos/webhook-payload.dto.ts:4-40`
 
@@ -314,7 +474,7 @@ export class WrapperDto<T> {
 }
 ```
 
-### 2.6 消息 Mapper
+### 4.3 消息 Mapper
 
 **文件**：`libs/application-generic/src/webhooks/mappers/message.mapper.ts:5-79`
 
@@ -326,9 +486,9 @@ export class WrapperDto<T> {
 
 ---
 
-## 3. 两条签名链路深度对比
+## 5. 两条签名链路深度对比
 
-### 3.1 链路概览
+### 5.1 链路概览
 
 | 维度 | Svix 出站签名 | Framework novu-signature 验签 |
 |-----|--------------|-----------------------------|
@@ -344,7 +504,7 @@ export class WrapperDto<T> {
 | **恒时比较** | ✅ Svix SDK 实现 | ✅ `timingSafeEqual` 手动实现 |
 | **开关控制** | `SVIX_API_KEY` 环境变量 | `strictAuthentication` 开关 |
 
-### 3.2 链路一：Svix 出站签名（用户接收 Novu 事件）
+### 5.2 链路一：Svix 出站签名（用户接收 Novu 事件）
 
 **签名生成**：由 Svix 服务在投递时自动生成，使用用户在 Svix Portal 中配置的 Signing Secret。
 
@@ -380,9 +540,9 @@ export const SvixProviderService: Provider<SvixClient> = {
 };
 ```
 
-### 3.3 链路二：novu-signature 验签（Novu 调用用户 Bridge）
+### 5.3 链路二：novu-signature 验签（Novu 调用用户 Bridge）
 
-#### 3.3.1 签名生成（Novu 平台端）
+#### 5.3.1 签名生成（Novu 平台端）
 
 **文件**：`libs/application-generic/src/utils/hmac.ts:6-12`
 
@@ -418,7 +578,7 @@ private async buildRequestSignature(command: ExecuteBridgeRequestCommand) {
 }
 ```
 
-#### 3.3.2 签名验证（用户 Bridge 端）
+#### 5.3.2 签名验证（用户 Bridge 端）
 
 **文件**：`packages/framework/src/handler.ts:371-396`
 
@@ -462,7 +622,7 @@ export const SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES = 5;
 export const SIGNATURE_TIMESTAMP_TOLERANCE = SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES * 60 * 1000; // 5分钟
 ```
 
-#### 3.3.3 核心加密工具
+#### 5.3.3 核心加密工具
 
 **文件**：`packages/framework/src/utils/crypto.utils.ts:11-60`
 
@@ -519,7 +679,7 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
 }
 ```
 
-#### 3.3.4 签名错误类型
+#### 5.3.4 签名错误类型
 
 **文件**：`packages/framework/src/errors/signature.errors.ts:4-57`
 
@@ -534,9 +694,9 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
 
 ---
 
-## 4. strictAuthentication 开关深度分析
+## 6. strictAuthentication 开关深度分析
 
-### 4.1 开关定义
+### 6.1 开关定义
 
 **文件**：`packages/framework/src/types/config.types.ts:15-25`
 
@@ -556,7 +716,7 @@ export type ClientOptions = {
 };
 ```
 
-### 4.2 开关优先级与默认值
+### 6.2 开关优先级与默认值
 
 **文件**：`packages/framework/src/client.ts:53-95`
 
@@ -592,7 +752,7 @@ private buildOptions(providedOptions?: ClientOptions) {
 2. **其次**：环境变量 `NOVU_STRICT_AUTHENTICATION_ENABLED`
 3. **最低**：默认值（`NODE_ENV` 为 `development`/`dev`/`undefined` 时为 `false`，否则为 `true`）
 
-### 4.3 开关影响范围
+### 6.3 开关影响范围
 
 **文件**：`packages/framework/src/handler.ts:80-88`
 
@@ -620,7 +780,7 @@ constructor(options: INovuRequestHandlerOptions<Input, Output>) {
 - 所有请求必须携带有效的 `novu-signature` 头部
 - 缺少头部、签名过期、签名不匹配都会抛出相应错误
 
-### 4.4 生产环境强制启用
+### 6.4 生产环境强制启用
 
 **文件**：`apps/api/src/app/environments-v1/novu-bridge-client.ts:127-132`
 
@@ -635,7 +795,7 @@ const novuRequestHandler = new NovuRequestHandler({
 });
 ```
 
-### 4.5 测试环境禁用
+### 6.5 测试环境禁用
 
 **文件**：`apps/dashboard/tests/utils/test-bridge-server.ts:14`
 
@@ -651,9 +811,9 @@ public client = new Client({ strictAuthentication: false });
 
 ---
 
-## 5. 失败重试与去重机制
+## 7. 失败重试与去重机制
 
-### 5.1 出站 Webhook 重试（Svix 自动处理）
+### 7.1 出站 Webhook 重试（Svix 自动处理）
 
 Svix 作为专业的 webhook 服务提供完善的重试机制：
 
@@ -661,7 +821,7 @@ Svix 作为专业的 webhook 服务提供完善的重试机制：
 **重试次数**：Svix 默认最多重试 25 次，时间跨度约 3 天
 **成功判定**：接收方返回 2xx 状态码视为成功
 
-### 5.2 内部 Webhook Filter 重试策略
+### 7.2 内部 Webhook Filter 重试策略
 
 **文件**：`apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts:11-36`
 
@@ -695,7 +855,7 @@ public async execute(command: WebhookFilterBackoffStrategyCommand): Promise<numb
 - 第 3 次重试：0-8 秒
 - ...
 
-### 5.3 Bridge 请求重试
+### 7.3 Bridge 请求重试
 
 **文件**：`libs/application-generic/src/usecases/execute-bridge-request/execute-framework-request.usecase.ts:116-118`
 
@@ -705,7 +865,7 @@ retry: {
 },
 ```
 
-### 5.4 去重机制
+### 7.4 去重机制
 
 #### 事件 ID 去重
 **文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:49`
@@ -724,9 +884,9 @@ const eventId = `evt_${generateObjectId()}`;
 
 ---
 
-## 6. 接收方身份验证与历史投递回溯
+## 8. 接收方身份验证与历史投递回溯
 
-### 6.1 Webhook Portal 访问管理
+### 8.1 Webhook Portal 访问管理
 
 **文件**：`apps/api/src/app/outbound-webhooks/outbound-webhooks.controller.ts:13-57`
 
@@ -779,7 +939,7 @@ async execute(command: GetWebhookPortalTokenCommand): Promise<GetWebhookPortalTo
 }
 ```
 
-### 6.2 App ID 生成规则
+### 8.2 App ID 生成规则
 
 **文件**：`libs/application-generic/src/webhooks/utils/app-id.ts:7-9`
 
@@ -789,14 +949,14 @@ export function generateWebhookAppId(organizationId: OrganizationId, environment
 }
 ```
 
-### 6.3 企业版 vs 社区版差异
+### 8.3 企业版 vs 社区版差异
 
 **文件**：`apps/api/src/app/outbound-webhooks/outbound-webhooks.module.ts:14-50`
 
 - **企业版**：完整的 Svix 集成，包含所有 webhook 功能
 - **社区版**：使用 `NoopSendWebhookMessage` 空实现，webhook 功能被禁用
 
-### 6.4 历史投递回溯
+### 8.4 历史投递回溯
 
 #### 通过 Event ID 追踪
 每个 webhook payload 包含唯一的 `id` 字段（即 `eventId`），可用于：
@@ -826,9 +986,9 @@ export function generateWebhookAppId(organizationId: OrganizationId, environment
 
 ---
 
-## 7. 入站 Webhook 处理（平台接收第三方回调）
+## 9. 入站 Webhook 处理（平台接收第三方回调）
 
-### 7.1 入口端点
+### 9.1 入口端点
 
 **文件**：`apps/webhook/src/webhooks/webhooks.controller.ts:12-46`
 
@@ -843,7 +1003,7 @@ export class WebhooksController {
 }
 ```
 
-### 7.2 处理流程
+### 9.2 处理流程
 
 **文件**：`apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts:24-141`
 
@@ -872,7 +1032,7 @@ async execute(command: WebhookCommand): Promise<IWebhookResult[]> {
 }
 ```
 
-### 7.3 Provider 接口要求
+### 9.3 Provider 接口要求
 
 **文件**：`packages/stateless/src/lib/provider/provider.interface.ts`
 
@@ -880,9 +1040,11 @@ async execute(command: WebhookCommand): Promise<IWebhookResult[]> {
 - `getMessageId(body)` - 从回调中提取消息 ID
 - `parseEventBody(body, messageId)` - 解析事件类型和详情
 
+> **注意**：第三方回调触发的 `MESSAGE_DELIVERED` 等投递事件不通过 `sendWebhookMessage.execute()`，而是直接更新消息状态并创建执行详情。
+
 ---
 
-## 8. 关键配置项
+## 10. 关键配置项
 
 ### 环境变量
 - `SVIX_API_KEY` - Svix API 密钥，未配置时 webhook 功能禁用
@@ -898,9 +1060,9 @@ async execute(command: WebhookCommand): Promise<IWebhookResult[]> {
 
 ---
 
-## 9. 接收方集成指南
+## 11. 接收方集成指南
 
-### 9.1 验证 Svix 签名（接收 Novu 出站事件）
+### 11.1 验证 Svix 签名（接收 Novu 出站事件）
 
 使用 Svix 官方 SDK 验证签名：
 
@@ -922,26 +1084,39 @@ app.post('/webhook', (req, res) => {
       case 'message.sent':
         // ⚠️ 注意：Chat 失败时也是 message.sent，但有 error 字段
         if (data.error) {
-          console.log('消息发送失败:', data.error.message);
+          console.log('Chat 消息发送失败:', data.error.message);
         } else {
-          console.log('消息发送成功:', data.object._id);
+          console.log('消息发送成功:', data.object._id, data.object.channel);
         }
         break;
       case 'message.failed':
         // Email/SMS/Push 失败（注意 Chat 不会触发这个）
         console.log('消息发送失败:', data.error.message);
         break;
-      case 'workflow.deleted':
-        console.log('工作流已删除:', data.object._id);
-        break;
-      case 'workflow.published':
-        console.log('工作流已发布:', data.object.name);
+      case 'message.delivered':
+        // 仅 In-App 主动触发，其他渠道依赖第三方回调
+        console.log('消息已投递:', data.object._id);
         break;
       case 'message.archived':
         console.log('消息已归档:', data.object._id);
         break;
+      case 'message.snoozed':
+        console.log('消息已稍后提醒:', data.object._id, data.object.snoozedUntil);
+        break;
+      case 'message.deleted':
+        console.log('消息已删除:', data.object._id);
+        break;
+      case 'workflow.deleted':
+        console.log('工作流已删除:', data.object._id, data.object.name);
+        break;
+      case 'workflow.published':
+        console.log('工作流已发布:', data.object.name);
+        break;
       case 'email.received':
-        console.log('收到入站邮件:', data.object.mail.subject);
+        console.log('收到入站邮件:', data.object.mail.subject, data.object.mail.from);
+        break;
+      case 'preference.updated':
+        console.log('偏好已更新:', data.subscriberId, data.object.workflow);
         break;
       // ... 其他事件类型
     }
@@ -953,7 +1128,7 @@ app.post('/webhook', (req, res) => {
 });
 ```
 
-### 9.2 去重处理（接收方实现）
+### 11.2 去重处理（接收方实现）
 
 ```javascript
 const processedEventIds = new Set();
@@ -970,7 +1145,7 @@ app.post('/webhook', (req, res) => {
 });
 ```
 
-### 9.3 Bridge 端签名验证（使用 Novu Framework）
+### 11.3 Bridge 端签名验证（使用 Novu Framework）
 
 ```typescript
 import { Client, NovuHandler, NovuRequestHandler } from '@novu/framework/nest';
@@ -994,7 +1169,7 @@ const handler = new NovuRequestHandler({
 app.post('/bridge', handler.createHandler());
 ```
 
-### 9.4 回溯历史
+### 11.4 回溯历史
 
 1. 通过 Novu API 获取 Svix Portal 访问令牌
    ```bash
@@ -1006,22 +1181,22 @@ app.post('/bridge', handler.createHandler());
 
 ---
 
-## 10. 已知问题与注意事项
+## 12. 已知问题与注意事项
 
-### 10.1 ⚠️ Chat 发送失败事件类型不一致
+### 12.1 ⚠️ Chat 发送失败事件类型不一致
 
-**问题**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854`
+**问题代码**：`apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts:854`
 
-Chat 渠道发送失败时，使用的事件类型是 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，与其他渠道不一致。
+**问题描述**：Chat 渠道发送失败时，使用的事件类型是 `MESSAGE_SENT` 而非 `MESSAGE_FAILED`，与 Email/SMS/Push 等其他渠道不一致。
 
 **接收方处理建议**：
 ```typescript
 if (event.type === 'message.sent') {
   if (event.data.error) {
-    // Chat 发送失败
+    // Chat 发送失败（特殊情况）
     handleChatFailure(event.data);
   } else {
-    // 发送成功
+    // 发送成功（所有渠道）
     handleSuccess(event.data);
   }
 } else if (event.type === 'message.failed') {
@@ -1030,42 +1205,48 @@ if (event.type === 'message.sent') {
 }
 ```
 
-### 10.2 两条签名链路使用不同密钥
+### 12.2 MESSAGE_DELIVERED 仅 In-App 主动触发
+
+**问题描述**：`MESSAGE_DELIVERED` 事件仅在 In-App 渠道发送成功后由 `sendWebhookMessage` 主动触发（`send-message-in-app.usecase.ts:319`）。其他渠道的 `MESSAGE_DELIVERED` 依赖第三方 webhook 回调（通过 `apps/webhook` 服务），不经过 `sendWebhookMessage` 路径。
+
+### 12.3 In-App 成功触发两个事件
+
+**问题描述**：In-App 发送成功后会连续触发 `MESSAGE_SENT` 和 `MESSAGE_DELIVERED` 两个事件，接收方需要注意处理重复。
+
+### 12.4 两条签名链路使用不同密钥
 
 - **Svix 出站**：使用 Svix Signing Secret（在 Svix Portal 中获取）
 - **Bridge 入站**：使用 Novu 环境 Secret Key（在 Novu 管理后台获取）
 
 不要混淆这两个密钥。
 
-### 10.3 社区版不支持出站 Webhook
+### 12.5 社区版不支持出站 Webhook
 
 社区版使用 `NoopSendWebhookMessage` 空实现，所有 `sendWebhookMessage.execute()` 调用直接返回 `undefined`，不会发送任何 webhook。
 
 ---
 
-## 11. 核心文件索引
+## 13. 核心文件索引（按调用点排序）
 
-| 模块 | 文件路径 | 功能 |
-|-----|---------|-----|
-| 事件定义 | `packages/shared/src/webhooks/webhook-event.enum.ts` | 事件类型枚举 |
-| 发送用例 | `libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts` | webhook 发送核心逻辑 |
-| Payload 结构 | `libs/application-generic/src/webhooks/dtos/webhook-payload.dto.ts` | 标准 payload 定义 |
-| 消息 Mapper | `libs/application-generic/src/webhooks/mappers/message.mapper.ts` | 消息字段映射 |
-| Svix 集成 | `libs/application-generic/src/webhooks/services/svix-provider.service.ts` | Svix 客户端初始化 |
-| App ID 生成 | `libs/application-generic/src/webhooks/utils/app-id.ts` | webhookAppId 生成规则 |
-| Portal API | `apps/api/src/app/outbound-webhooks/outbound-webhooks.controller.ts` | Portal 访问 API |
-| 重试策略 | `apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts` | webhook filter 重试 |
-| 入站处理 | `apps/webhook/src/webhooks/usecases/webhook/webhook.usecase.ts` | 第三方回调处理 |
-| Bridge 签名生成 | `libs/application-generic/src/utils/hmac.ts` | novu-signature 签名生成 |
-| Bridge 请求执行 | `libs/application-generic/src/usecases/execute-bridge-request/execute-framework-request.usecase.ts` | Bridge 请求执行与签名注入 |
-| Bridge 签名验证 | `packages/framework/src/handler.ts` | HMAC 签名验证逻辑 |
-| 加密工具 | `packages/framework/src/utils/crypto.utils.ts` | HMAC 生成和恒时比较 |
-| 签名错误 | `packages/framework/src/errors/signature.errors.ts` | 签名相关错误类型 |
-| Client 配置 | `packages/framework/src/client.ts` | strictAuthentication 开关逻辑 |
-| 配置类型 | `packages/framework/src/types/config.types.ts` | ClientOptions 类型定义 |
-| Chat 发送 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts` | Chat 渠道发送（含失败处理） |
-| 工作流删除 | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts` | 工作流删除触发 |
-| 工作流发布 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts` | 工作流发布触发 |
-| 消息批量操作 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts` | 归档/已读/稍后 触发 |
-| 消息删除 | `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts` | 消息删除触发 |
-| 入站邮件 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts` | 入站邮件触发 |
+| # | 文件路径 | 功能 | 调用行号 |
+|---|---------|-----|---------|
+| 1 | `apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts` | In-App 发送（MESSAGE_SENT + MESSAGE_DELIVERED） | 307, 319 |
+| 2 | `apps/worker/src/app/workflow/usecases/send-message/send-message-chat.usecase.ts` | Chat 发送（成功 + 失败） | 805, 854 |
+| 3 | `apps/worker/src/app/workflow/usecases/send-message/send-message-email.usecase.ts` | Email 发送（成功 + 失败） | 487, 553 |
+| 4 | `apps/worker/src/app/workflow/usecases/send-message/send-message-sms.usecase.ts` | SMS 发送（成功 + 失败） | 356, 381 |
+| 5 | `apps/worker/src/app/workflow/usecases/send-message/send-message-push.usecase.ts` | Push 发送（成功 + 失败） | 644, 726 |
+| 6 | `apps/api/src/app/inbox/usecases/mark-many-notifications-as/mark-many-notifications-as.usecase.ts` | 批量标记（已读/归档/稍后） | 149 |
+| 7 | `apps/api/src/app/inbox/usecases/update-all-notifications/update-all-notifications.usecase.ts` | 按条件更新（已读/归档/稍后） | 170 |
+| 8 | `apps/api/src/app/inbox/usecases/delete-many-notifications/delete-many-notifications.usecase.ts` | 批量删除 | 127 |
+| 9 | `apps/api/src/app/inbox/usecases/delete-all-notifications/delete-all-notifications.usecase.ts` | 按条件删除 | 154 |
+| 10 | `apps/api/src/app/inbox/usecases/mark-notifications-as-seen/mark-notifications-as-seen.usecase.ts` | 批量标记已看 | 185 |
+| 11 | `apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts` | 偏好更新 | 78 |
+| 12 | `apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts` | Widget 单个标记 | 184 |
+| 13 | `apps/api/src/app/widgets/usecases/mark-all-messages-as/mark-all-messages-as.usecase.ts` | Widget 批量标记 | 71 |
+| 14 | `apps/api/src/app/widgets/usecases/mark-message-as-by-mark/mark-message-as-by-mark.usecase.ts` | Widget 按 mark 标记 | 80 |
+| 15 | `libs/application-generic/src/usecases/upsert-workflow/upsert-workflow.usecase.ts` | 工作流创建/更新（v1） | 114, 125 |
+| 16 | `apps/api/src/app/workflows-v2/usecases/patch-workflow/patch-workflow.usecase.ts` | 工作流更新（v2） | 57 |
+| 17 | `apps/api/src/app/workflows-v1/usecases/delete-workflow/delete-workflow.usecase.ts` | 工作流删除 | 50 |
+| 18 | `apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts` | 工作流发布 | 150 |
+| 19 | `libs/application-generic/src/usecases/inbound-domain-route-delivery/inbound-domain-route-delivery.usecase.ts` | 入站邮件 | 121 |
+| 20 | `libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts` | Webhook 发送核心逻辑 | 42 |
