@@ -598,107 +598,208 @@ return { eventId };
 - 返回 `{ eventId: string }`，调用方可通过返回值确认发送成功
 - 记录两条 `debug` 级日志（尝试发送 + 发送成功）
 
-#### 4.2.3 各调用方错误处理模式分析
+#### 4.2.3 各调用方错误处理模式分析（修正版）
 
-基于 29 个真实调用点的分析，调用方分为 **4 种错误处理模式**：
+> **⚠️ 重要修正**：经逐个复核，实际为 **25 个独立调用点**（之前的 29 个统计错误地将同一段代码处理多种事件类型计为多个调用点）。以下是精确的分型统计，每个模式都附具体的代码证据。
 
-| 模式 | 调用方数量 | try-catch | 检查返回值 | 依赖存在性检查 | 行为特征 |
-|-----|-----------|-----------|-----------|---------------|---------|
-| **A: Fire-and-Forget** | 25/29 | ❌ 无 | ❌ 不检查 | ❌ 不检查 | 环境不存在时中断流程，其他情况静默 |
-| **B: 有 try-catch** | 1/29 | ✅ 有 | ❌ 不检查 | ❌ 不检查 | 所有异常都捕获，记录额外日志后继续 |
-| **C: 检查返回值** | 1/29 | ❌ 无 | ✅ 检查 `result === undefined` | ❌ 不检查 | 通过返回值区分是否跳过 |
-| **D: 检查依赖存在** | 1/29 | ❌ 无 | ❌ 不检查 | ✅ `if (this.sendWebhookMessage)` | 依赖不存在时完全不调用 |
-| **E: 传入 environment** | 1/29 | ❌ 无 | ❌ 不检查 | ❌ 不检查 | 避免环境不存在异常 |
+##### 分类维度定义
 
-##### 模式 A: Fire-and-Forget（绝大多数调用方）
+在分类前，先明确定义 6 个语义维度：
 
-**代表调用方**：
-- Email 发送成功/失败: `send-message-email.usecase.ts:487, 553`
-- SMS 发送成功/失败: `send-message-sms.usecase.ts:356, 381`
-- Push 发送成功: `send-message-push.usecase.ts:644`
-- In-App 发送成功/送达: `send-message-in-app.usecase.ts:307, 319`
-- Chat 发送成功/失败: `send-message-chat.usecase.ts:805, 854`
-- 工作流删除: `delete-workflow.usecase.ts:50`
-- 工作流更新/创建: `patch-workflow.usecase.ts:57`, `upsert-workflow.usecase.ts:114, 125`
-- 偏好更新: `update-preferences.usecase.ts:78`
-- Widget 各种标记: `mark-message-as.usecase.ts:184` 等
-- 消息批量状态变更: `mark-many-notifications-as.usecase.ts:149`
+| 维度 | 说明 | 代码判断依据 |
+|-----|------|-------------|
+| **外层 try-catch** | 调用点所在函数是否有外层 try-catch 包裹整个发送流程 | 调用点是否在 `try {}` 块内 |
+| **独立 try-catch** | 调用点本身是否有自己独立的 try-catch 包裹 | `try { await sendWebhookMessage.execute(...) } catch (e) { ... }` |
+| **catch 内调用** | 调用点是否在某个 catch 块内（「二次调用」场景） | 调用点是否在 `catch {}` 块内 |
+| **返回值检查** | 是否检查返回值区分成功/跳过 | `const result = await ...; if (result === undefined) ...` |
+| **依赖存在性检查** | 是否先检查 `sendWebhookMessage` 是否存在 | `if (this.sendWebhookMessage) { await ... }` |
+| **传入 environment** | 是否传入已查询的 environment 对象 | `sendWebhookMessage.execute({ ..., environment: environment })` |
 
-**代码特征**：
+##### 6 种模式精确分类
+
+基于 25 个调用点的逐个复核，共分为 **6 种模式**：
+
+| 模式 | 调用点数量 | 外层 try-catch | 独立 try-catch | catch 内调用 | 返回值检查 | 依赖检查 | 传入 environment | 代码证据 |
+|-----|-----------|---------------|---------------|-------------|-----------|---------|-----------------|---------|
+| **A1: 外层 try-catch 保护的 Fire-and-Forget** | 7/25 | ✅ 有 | ❌ 无 | ❌ 否 | ❌ 无 | ❌ 无 | ❌ 无 | 见下方详细列表 |
+| **A1C: A1 + catch 内二次调用** | 3/25 | ✅ 有 | ❌ 无 | ✅ 是 | ❌ 无 | ❌ 无 | ❌ 无 | 见下方详细列表 |
+| **A2: 无外层保护的 Fire-and-Forget** | 8/25 | ❌ 无 | ❌ 无 | ❌ 否 | ❌ 无 | ❌ 无 | ❌ 无 | 见下方详细列表 |
+| **A3: 传入 environment 的 Fire-and-Forget** | 4/25 | ❌ 无 | ❌ 无 | ❌ 否 | ❌ 无 | ❌ 无 | ✅ 有 | 见下方详细列表 |
+| **B: 独立 try-catch 保护** | 1/25 | ✅ 有 | ✅ 有 | ✅ 是 | ❌ 无 | ❌ 无 | ❌ 无 | Push 失败路径 |
+| **C: 检查返回值** | 1/25 | ❌ 无 | ❌ 无 | ❌ 否 | ✅ 有 | ❌ 无 | ❌ 无 | 入站邮件 |
+| **D: 检查依赖存在性** | 1/25 | ❌ 无 | ❌ 无 | ❌ 否 | ❌ 无 | ✅ 有 | ❌ 无 | 工作流发布 |
+
+**总计**：7 + 3 + 8 + 4 + 1 + 1 + 1 = **25 个调用点** ✅
+
+---
+
+##### 各模式调用点详细清单（附精确代码位置）
+
+###### 模式 A1: 外层 try-catch 保护的 Fire-and-Forget（7 个）
+
+所有调用点都在外层 try-catch 的 try 块内，但本身没有独立 try-catch。
+
+| # | 调用点 | 文件位置 |
+|---|-------|---------|
+| 1 | Email 发送成功 | `send-message-email.usecase.ts:487` |
+| 2 | SMS 发送成功 | `send-message-sms.usecase.ts:356` |
+| 3 | Push 发送成功 | `send-message-push.usecase.ts:644` |
+| 4 | Chat 发送成功 | `send-message-chat.usecase.ts:805` |
+| 5 | Inbox 批量标记已看 | `mark-notifications-as-seen.usecase.ts:185` |
+| 6 | Widget 单个标记 | `mark-message-as.usecase.ts:184` |
+| 7 | Widget 批量标记 | `mark-all-messages-as.usecase.ts:71` |
+
+**代码特征（以 Email 成功为例）**：
 ```typescript
-await this.sendWebhookMessage.execute({ ... });
-// 无 try-catch，不检查返回值，继续执行
+// send-message-email.usecase.ts:476-497
+try {
+  const result = await mailHandler.send({ ... });
+
+  await this.sendWebhookMessage.execute({  // L487 - 在 try 块内，无独立保护
+    eventType: WebhookEventEnum.MESSAGE_SENT,
+    ...
+  });
+
+  return { status: SendMessageStatus.SUCCESS };
+} catch (error) {
+  // 处理发送失败
+}
+```
+
+**行为说明**：
+- 如果 `sendWebhookMessage` 抛出「环境不存在」异常，会被**外层 catch 捕获**
+- 外层 catch 会执行失败路径逻辑（包括触发 MESSAGE_FAILED webhook）
+- 其他分支（无 SVIX_CLIENT、无 webhookAppId、Svix 异常）均静默返回 `undefined`，外层 try 继续执行
+
+---
+
+###### 模式 A1C: A1 + catch 内二次调用（3 个）
+
+调用点在外层 catch 块内，属于「发送失败后的二次 webhook 通知」。
+
+| # | 调用点 | 文件位置 |
+|---|-------|---------|
+| 1 | Email 发送失败 | `send-message-email.usecase.ts:553` |
+| 2 | SMS 发送失败 | `send-message-sms.usecase.ts:381` |
+| 3 | Chat 发送失败（⚠️ 错误使用 MESSAGE_SENT） | `send-message-chat.usecase.ts:854` |
+
+**代码特征（以 Email 失败为例）**：
+```typescript
+// send-message-email.usecase.ts:535-564
+catch (error) {
+  await this.sendErrorStatus(...);
+
+  await this.sendWebhookMessage.execute({  // L553 - 在 catch 块内！
+    eventType: WebhookEventEnum.MESSAGE_FAILED,
+    ...
+  });
+
+  return { status: SendMessageStatus.FAILED };
+}
+```
+
+**关键语义差异**：
+- 这是「catch 内的二次调用」—— 如果这次 webhook 调用抛出「环境不存在」异常，**外层 catch 已经在执行中，不会再次捕获**
+- 异常会直接向上抛出，可能中断整个失败处理流程
+- 对比：模式 A1 的异常会被外层 catch 捕获并触发失败 webhook
+
+---
+
+###### 模式 B: 独立 try-catch 保护（1 个）—— Push 失败路径
+
+**调用点**：Push 发送失败 - `send-message-push.usecase.ts:726`
+
+**代码证据**：
+```typescript
+// send-message-push.usecase.ts:658-750
+catch (e) {
+  // ... 记录日志 ...
+
+  try {  // ⚠️ Push 失败路径独有：独立 try-catch 包裹 webhook 调用
+    // ... 检查 token 是否无效 ...
+
+    await this.sendWebhookMessage.execute({  // L726
+      eventType: WebhookEventEnum.MESSAGE_FAILED,
+      ...
+    });
+  } catch (err) {
+    Logger.error(
+      { jobId: command.jobId },
+      `Error sending webhook message for jobId ${command.jobId} ${err.message || err.toString()}`,
+      LOG_CONTEXT
+    );
+  }
+
+  return { success: false, error: e };
+}
+```
+
+**与 Email/SMS/Chat 失败路径的关键区别**：
+
+| 维度 | Push 失败（模式 B） | Email/SMS/Chat 失败（模式 A1C） |
+|-----|-------------------|-----------------------------|
+| 独立 try-catch | ✅ 有 | ❌ 无 |
+| 环境不存在异常 | ✅ 被捕获，仅记录日志 | ❌ 向外抛出，可能中断流程 |
+| 额外日志 | ✅ 包含 `jobId` 的额外日志 | ❌ 依赖 sendWebhookMessage 内部日志 |
+| 执行保证 | ✅ 即使 webhook 失败，也能继续返回失败状态 | ❌ webhook 失败可能导致无法正确返回 |
+
+> **⚠️ 设计不一致**：为什么只有 Push 失败路径有独立 try-catch？代码中没有注释说明，可能是历史遗留或某次 bugfix 的产物。
+
+---
+
+###### 模式 A2: 无外层保护的 Fire-and-Forget（8 个）
+
+调用点没有任何 try-catch 保护，环境不存在异常会直接向上抛出。
+
+| # | 调用点 | 文件位置 |
+|---|-------|---------|
+| 1 | In-App 发送成功 | `send-message-in-app.usecase.ts:307` |
+| 2 | In-App 投递成功 | `send-message-in-app.usecase.ts:319` |
+| 3 | Widget 按 mark 标记 | `mark-message-as-by-mark.usecase.ts:80` |
+| 4 | 偏好更新 | `update-preferences.usecase.ts:78` |
+| 5 | 工作流更新（v1 upsert） | `upsert-workflow.usecase.ts:114` |
+| 6 | 工作流创建（v1 upsert） | `upsert-workflow.usecase.ts:125` |
+| 7 | 工作流更新（v2 patch） | `patch-workflow.usecase.ts:57` |
+| 8 | 工作流删除 | `delete-workflow.usecase.ts:50` |
+
+**代码特征（以 In-App 为例）**：
+```typescript
+// send-message-in-app.usecase.ts:67-322
+public async execute(command: SendMessageChannelCommand): Promise<SendMessageResult> {
+  // ... 各种操作 ...
+
+  await this.sendWebhookMessage.execute({  // L307 - 无外层 try-catch 保护
+    eventType: WebhookEventEnum.MESSAGE_SENT,
+    ...
+  });
+
+  await this.sendWebhookMessage.execute({  // L319 - 也无外层 try-catch 保护
+    eventType: WebhookEventEnum.MESSAGE_DELIVERED,
+    ...
+  });
+}
 ```
 
 **风险**：
-- 如果遇到「分支 2：环境不存在」，会直接抛出异常，**中断整个业务流程**
-- 其他分支（无 SVIX_CLIENT、无 webhookAppId、Svix 异常）均静默跳过，调用方无感知
+- 这 8 个调用点如果遇到「环境不存在」异常，会**直接中断整个业务流程**
+- In-App 尤其危险：连续两个调用点，任何一个抛出都会中断
 
-##### 模式 B: 有 try-catch（Push 发送失败路径）
+---
 
-**调用方**：`send-message-push.usecase.ts:726`
+###### 模式 A3: 传入 environment 的 Fire-and-Forget（4 个）
 
-**代码**：
+调用点传入了已查询的 `environment` 对象，**消除了「环境不存在」异常的可能性**。
+
+| # | 调用点 | 文件位置 |
+|---|-------|---------|
+| 1 | Inbox 批量标记（已读/归档/稍后） | `mark-many-notifications-as.usecase.ts:149` |
+| 2 | Inbox 按条件更新 | `update-all-notifications.usecase.ts:170` |
+| 3 | Inbox 批量删除 | `delete-many-notifications.usecase.ts:127` |
+| 4 | Inbox 按条件删除 | `delete-all-notifications.usecase.ts:154` |
+
+**代码证据**：
 ```typescript
-try {
-  await this.sendWebhookMessage.execute({ ... });
-} catch (err) {
-  Logger.error(
-    { jobId: command.jobId },
-    `Error sending webhook message for jobId ${command.jobId} ${err.message || err.toString()}`,
-    LOG_CONTEXT
-  );
-}
-// 继续执行，返回 { success: false, error: e }
-```
-
-**行为**：
-- 捕获所有异常（包括分支 2 的环境不存在）
-- 记录额外的错误日志（包含 `jobId`）
-- 不向外抛出，继续执行
-- **Push 发送失败是唯一有 try-catch 保护的调用点**
-
-##### 模式 C: 检查返回值（入站邮件）
-
-**调用方**：`inbound-domain-route-delivery.usecase.ts:121`
-
-**代码**：
-```typescript
-const result = await this.sendWebhookMessage.execute({ ... });
-
-return {
-  latencyMs: Date.now() - started,
-  skipped: result === undefined,  // 明确标识是否跳过
-};
-```
-
-**行为**：
-- 保存返回值，通过 `result === undefined` 区分是否成功发送
-- 不捕获异常，环境不存在时仍会中断
-- **入站邮件是唯一检查返回值的调用方**
-
-##### 模式 D: 检查依赖存在性（工作流发布）
-
-**调用方**：`sync-to-environment.usecase.ts:149`
-
-**代码**：
-```typescript
-if (this.sendWebhookMessage) {  // 先检查依赖是否注入
-  await this.sendWebhookMessage.execute({ ... });
-}
-```
-
-**行为**：
-- 先检查 `this.sendWebhookMessage` 是否存在
-- 不存在时完全不调用，避免潜在的运行时错误
-- 不捕获异常，环境不存在时仍会中断
-
-##### 模式 E: 传入 environment 对象（批量标记）
-
-**调用方**：`mark-many-notifications-as.usecase.ts:149`
-
-**代码**：
-```typescript
+// mark-many-notifications-as.usecase.ts:142-159
 private sendWebhookEvents(...) {
   return updatedMessages.map((message) =>
     this.sendWebhookMessage.execute({
@@ -709,19 +810,194 @@ private sendWebhookEvents(...) {
 }
 ```
 
-**行为**：
-- 通过 `command.environment` 传入已查询的环境对象
-- 避免 `sendWebhookMessage` 内部再次查询数据库
-- **消除了分支 2（环境不存在）的可能性**，因为环境已在上游验证存在
+**行为说明**：
+- `sendWebhookMessage` 内部会优先使用 `command.environment`，跳过数据库查询
+- 分支 2（环境不存在）的可能性被完全消除
+- 但仍然可能遇到分支 1（无 SVIX_CLIENT）、分支 3（无 webhookAppId）、分支 4（Svix 异常）
 
-#### 4.2.4 关键风险点总结
+---
 
-| 风险 | 影响 | 涉及调用方 | 建议 |
-|-----|------|-----------|------|
-| **环境不存在异常未被捕获** | 可能导致业务流程意外中断 | 模式 A（25 个调用方） | 为关键路径添加 try-catch，或统一在调用前验证环境 |
-| **debug 级日志生产环境不可见** | 无 SVIX_CLIENT、无 webhookAppId 时调用方无法感知 | 分支 1、3 | 考虑提升为 `info` 级，或添加 metrics 指标 |
-| **Svix 失败仅记录日志不通知** | 业务方不知道 webhook 发送失败 | 分支 4 | 结合 Svix Portal 告警，或实现失败回调 |
-| **批量操作中单个失败不影响其他** | 部分消息的 webhook 可能未发送但不报错 | 模式 A 批量场景 | 记录每个事件的 eventId，支持事后审计 |
+###### 模式 C: 检查返回值（1 个）—— 入站邮件
+
+**调用点**：入站邮件 - `inbound-domain-route-delivery.usecase.ts:121`
+
+**代码证据**：
+```typescript
+// inbound-domain-route-delivery.usecase.ts:118-132
+const result = await this.sendWebhookMessage.execute({ ... });
+
+return {
+  latencyMs: Date.now() - started,
+  skipped: result === undefined,  // 明确标识是否跳过
+};
+```
+
+**行为说明**：
+- 唯一检查返回值的调用点
+- 通过 `result === undefined` 区分是否成功发送
+- 但仍然没有 try-catch，环境不存在时仍会中断
+
+---
+
+###### 模式 D: 检查依赖存在性（1 个）—— 工作流发布
+
+**调用点**：工作流发布 - `sync-to-environment.usecase.ts:149`
+
+**代码证据**：
+```typescript
+// sync-to-environment.usecase.ts:149-159
+if (this.sendWebhookMessage) {  // 先检查依赖是否注入
+  await this.sendWebhookMessage.execute({ ... });
+}
+```
+
+**行为说明**：
+- 先检查 `this.sendWebhookMessage` 是否存在
+- 不存在时完全不调用，避免潜在的运行时错误
+- 但仍然没有 try-catch，环境不存在时仍会中断
+
+---
+
+##### 各模式风险对比矩阵
+
+| 模式 | 环境不存在异常 | 无 SVIX_CLIENT | 无 webhookAppId | Svix 异常 | 对业务流程影响 |
+|-----|--------------|---------------|-----------------|-----------|--------------|
+| **A1**（外层 try-catch） | ⚠️ 被外层 catch 捕获，触发失败 webhook | ✅ 静默，无影响 | ✅ 静默，无影响 | ✅ 静默，仅日志 | 低（异常被捕获） |
+| **A1C**（catch 内调用） | ⚠️ 向外抛出，中断失败处理 | ✅ 静默，无影响 | ✅ 静默，无影响 | ✅ 静默，仅日志 | 中高（可能中断失败流程） |
+| **B**（独立 try-catch） | ✅ 捕获，仅日志 | ✅ 静默，无影响 | ✅ 静默，无影响 | ✅ 捕获，额外日志 | 最低（完全保护） |
+| **A2**（无保护） | 🔴 直接抛出，中断主流程 | ✅ 静默，无影响 | ✅ 静默，无影响 | ✅ 静默，仅日志 | **最高**（8 个调用点） |
+| **A3**（传 environment） | ✅ 不可能发生 | ✅ 静默，无影响 | ✅ 静默，无影响 | ✅ 静默，仅日志 | 低（消除了主要风险） |
+| **C**（检查返回值） | 🔴 直接抛出，中断流程 | ✅ 可识别，返回 skipped=true | ✅ 可识别，返回 skipped=true | ✅ 静默，可识别 | 中（环境不存在仍危险） |
+| **D**（检查依赖） | 🔴 直接抛出，中断流程 | ✅ 完全不调用 | ✅ 静默，无影响 | ✅ 静默，仅日志 | 中高 |
+
+#### 4.2.4 Email 与 Push 路径语义差异深度对比
+
+| 维度 | Email 路径 | Push 路径 | 代码证据 |
+|-----|-----------|----------|---------|
+| **成功路径 try-catch** | ✅ 外层 try-catch（L476） | ✅ 外层 try-catch（L599） | `send-message-email.usecase.ts:476`, `send-message-push.usecase.ts:599` |
+| **成功路径 webhook 位置** | try 块内 | try 块内 | L487, L644 |
+| **失败路径 try-catch** | ❌ 无独立保护（在 catch 内） | ✅ **独立 try-catch 包裹**（L723） | `send-message-email.usecase.ts:553`, `send-message-push.usecase.ts:723` |
+| **失败路径 webhook 位置** | 外层 catch 内，无二次保护 | 外层 catch 内 + 内层独立 catch | L553（外层 catch）, L726（内层 try） |
+| **环境不存在异常处理** | 🔴 向外抛出 | ✅ 内层 catch 捕获 |  |
+| **失败路径额外日志** | ❌ 依赖内部日志 | ✅ Logger.error 含 jobId | `send-message-push.usecase.ts:731-735` |
+| **catch 内二次调用风险** | ⚠️ 高（异常无法被外层捕获） | ✅ 低（被内层 catch 捕获） |  |
+
+**关键发现——Push 失败路径的特殊保护**：
+
+```typescript
+// send-message-push.usecase.ts:722-736
+try {  // ⚠️ 仅此一处有内层 try-catch
+  const isTokenInvalid = pushHandler?.isTokenInvalid?.(...);
+  
+  // ... token 处理逻辑 ...
+
+  await this.sendWebhookMessage.execute({ ... });  // L726
+} catch (err) {
+  Logger.error(
+    { jobId: command.jobId },  // 额外的上下文信息
+    `Error sending webhook message for jobId ${command.jobId} ${err.message}`,
+    LOG_CONTEXT
+  );
+}
+```
+
+**为什么只有 Push 有这个保护？** 代码中没有注释说明。从上下文推测，可能是因为：
+1. Push 渠道的 token 失效处理逻辑复杂，容易出错
+2. Push 发送失败的 webhook 包含敏感的 deviceToken 信息，需要更可靠的错误处理
+3. 这可能是某次特定 bugfix 的产物，没有推广到其他渠道
+
+---
+
+#### 4.2.5 修正后的关键风险点总结（每条附代码证据）
+
+| 风险 | 严重程度 | 影响描述 | 涉及调用方（精确位置） | 代码证据 |
+|-----|---------|---------|-----------------------|---------|
+| **🔴 风险 1: 8 个调用点无任何 try-catch 保护** | 最高 | 环境不存在时直接中断主业务流程 | In-App 成功/送达（L307, L319）<br>工作流 CRUD（4 个调用点）<br>偏好更新<br>Widget 按 mark 标记 | `send-message-in-app.usecase.ts:307`, `delete-workflow.usecase.ts:50` |
+| **🔴 风险 2: catch 内二次调用无保护** | 高 | 失败处理流程中 webhook 异常无法被外层捕获 | Email 失败（L553）<br>SMS 失败（L381）<br>Chat 失败（L854） | `send-message-email.usecase.ts:553` |
+| **⚠️ 风险 3: 外层 catch 可能触发重复 webhook** | 中 | A1 模式中，成功路径的 webhook 异常会被外层 catch 捕获，触发失败路径的 webhook，导致同一事件发送两次 | Email 成功（L487）<br>SMS 成功（L356）<br>Push 成功（L644）<br>Chat 成功（L805） | `send-message-email.usecase.ts:487` → catch 内 L553 |
+| **⚠️ 风险 4: debug 日志生产环境不可见** | 中 | 无 SVIX_CLIENT、无 webhookAppId 时静默跳过，无任何告警 | 所有调用点 | `send-webhook-message.usecase.ts:23, 44` |
+| **⚠️ 风险 5: 设计不一致** | 中 | 只有 Push 失败路径有独立 try-catch，其他渠道失败路径没有 | Push 失败（L726）vs Email 失败（L553） | `send-message-push.usecase.ts:723` vs `send-message-email.usecase.ts:553` |
+| **✅ 最佳实践（已实现）** | - | 传入 environment 消除环境不存在异常 | 4 个批量操作调用点 | `mark-many-notifications-as.usecase.ts:149` |
+
+##### 风险 3 详细说明——外层 catch 导致重复 webhook
+
+**场景**：Email 发送成功，但 `sendWebhookMessage.execute()` 抛出「环境不存在」异常。
+
+**执行路径**：
+```
+1. try 块内 mailHandler.send() 成功 ✅
+2. try 块内 sendWebhookMessage.execute(MESSAGE_SENT) 抛出「环境不存在」 ❌
+3. 异常被外层 catch 捕获
+4. catch 块内执行 sendWebhookMessage.execute(MESSAGE_FAILED) ❌
+5. 结果：消息实际发送成功，但用户收到 MESSAGE_FAILED 事件
+```
+
+**代码证据**：
+```typescript
+// send-message-email.usecase.ts:476-584
+try {
+  const result = await mailHandler.send({ ... });  // ✅ 发送成功
+
+  await this.sendWebhookMessage.execute({  // ❌ 这里抛出环境不存在异常
+    eventType: WebhookEventEnum.MESSAGE_SENT,
+    ...
+  });
+
+  return { status: SendMessageStatus.SUCCESS };
+} catch (error) {
+  // 异常被捕获，进入失败处理
+  await this.sendWebhookMessage.execute({  // ⚠️ 触发 MESSAGE_FAILED webhook
+    eventType: WebhookEventEnum.MESSAGE_FAILED,  // 但消息实际上已经发送成功了！
+    ...
+  });
+
+  return { status: SendMessageStatus.FAILED };
+}
+```
+
+**影响**：用户收到错误的 `MESSAGE_FAILED` 事件，而实际上消息已经发送成功。这可能导致用户重发消息，造成重复发送。
+
+---
+
+#### 4.2.6 调用方优化建议（按优先级排序）
+
+| 优先级 | 建议 | 涉及文件 | 预期收益 |
+|-------|-----|---------|---------|
+| 🔴 P0 | 为模式 A2 的 8 个高风险调用点添加外层 try-catch | `send-message-in-app.usecase.ts`, `delete-workflow.usecase.ts` 等 | 消除主流程中断风险 |
+| 🔴 P0 | 为模式 A1C 的 3 个 catch 内调用点添加独立 try-catch | `send-message-email.usecase.ts:553`, `send-message-sms.usecase.ts:381`, `send-message-chat.usecase.ts:854` | 对齐 Push 失败路径的保护级别 |
+| ⚠️ P1 | 考虑将分支 1、3 的日志级别从 debug 提升为 info | `send-webhook-message.usecase.ts:23, 44` | 生产环境可感知 webhook 被静默跳过 |
+| ⚠️ P1 | 模式 A1 的 7 个调用点检查返回值，避免外层 catch 误触发 | `send-message-email.usecase.ts:487` 等 | 解决重复 webhook 和事件类型错误问题 |
+| ✅ P2 | 推广模式 A3 的最佳实践，所有调用点优先传入 environment 对象 | 所有调用点 | 从根源消除环境不存在异常 |
+| ✅ P2 | 推广模式 C 的返回值检查，关键路径明确区分成功/跳过 | 所有调用点 | 提高可观测性 |
+
+##### P1 优化建议代码示例——检查返回值避免误触发
+
+```typescript
+// 优化前：A1 模式
+try {
+  const result = await mailHandler.send({ ... });
+  await this.sendWebhookMessage.execute({ eventType: MESSAGE_SENT, ... });
+  return { status: SUCCESS };
+} catch (error) {
+  // 如果 sendWebhookMessage 抛出异常，会错误地进入失败处理
+  await this.sendWebhookMessage.execute({ eventType: MESSAGE_FAILED, ... });
+  return { status: FAILED };
+}
+
+// 优化后：检查返回值
+try {
+  const result = await mailHandler.send({ ... });
+  const webhookResult = await this.sendWebhookMessage.execute({ eventType: MESSAGE_SENT, ... });
+  if (webhookResult === undefined) {
+    // webhook 被静默跳过，但消息发送成功，不应进入失败处理
+  }
+  return { status: SUCCESS };
+} catch (error) {
+  // 只有 mailHandler.send() 失败才进入这里
+  await this.sendWebhookMessage.execute({ eventType: MESSAGE_FAILED, ... });
+  return { status: FAILED };
+}
+```
 
 ### 4.3 Payload 结构
 
