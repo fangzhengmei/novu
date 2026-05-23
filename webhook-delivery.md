@@ -459,7 +459,271 @@ async execute(command: SendWebhookMessageCommand): Promise<{ eventId: string } |
 }
 ```
 
-### 4.2 Payload 结构
+### 4.2 可靠性语义与错误分支深度分析
+
+**文件**：`libs/application-generic/src/webhooks/usecases/send-webhook-message/send-webhook-message.usecase.ts:20-80`
+
+`sendWebhookMessage.execute()` 方法有 **5 个执行分支**，每个分支的返回值、日志行为和对调用方的影响各不相同。
+
+#### 4.2.1 完整执行流程图
+
+```
+                              ┌─────────────────────────────┐
+                              │ sendWebhookMessage.execute() │
+                              └─────────────┬───────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │ 分支 1: 检查 SVIX_CLIENT 是否存在     │
+                        └───────────────────┬───────────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │ 分支 2: 检查 Environment 是否存在     │
+                        └───────────────────┬───────────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │ 分支 3: 检查 webhookAppId 是否存在     │
+                        └───────────────────┬───────────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │ 分支 4: 调用 Svix API 创建消息        │
+                        └───────────────────┬───────────────────┘
+                                            │
+                        ┌───────────────────┴───────────────────┐
+                        │ 分支 5: 成功返回 { eventId }           │
+                        └───────────────────────────────────────┘
+```
+
+#### 4.2.2 各分支详细分析
+
+| 分支 | 触发条件 | 返回值 | 日志级别 | 日志内容 | 是否抛出 | 调用方可见性 |
+|-----|---------|--------|---------|---------|---------|-------------|
+| **分支 1** | `!this.svix`（SVIX_CLIENT 未注入） | `undefined` | `debug` | `Outbound webhook client not available – webhooks are disabled for this instance.` | ❌ 不抛出 | ✅ 静默跳过 |
+| **分支 2** | `!environment`（环境不存在） | 抛出 `Error` | - | - | ✅ **抛出异常** | ⚠️ **错误暴露，可能中断业务流程** |
+| **分支 3** | `!appId`（webhookAppId 为空） | `undefined` | `debug` | `Webhook app ID not found for environment xxx` | ❌ 不抛出 | ✅ 静默跳过 |
+| **分支 4** | `svix.message.create()` 抛出异常 | `undefined` | `error` | `Failed to send webhook xxx. Error: xxx, Event ID: xxx` | ❌ 不抛出 | ✅ 静默跳过（仅日志） |
+| **分支 5** | Svix API 调用成功 | `{ eventId: string }` | `debug` | `Attempting to send webhook...` + `Successfully sent webhook...` | ❌ 不抛出 | ✅ 可通过返回值确认 |
+
+##### 分支 1: 无 SVIX_CLIENT（L22-26）
+
+**代码**：
+```typescript
+if (!this.svix) {
+  this.logger.debug('Outbound webhook client not available – webhooks are disabled for this instance.');
+  return;
+}
+```
+
+**说明**：
+- `SVIX_CLIENT` 用 `@Optional()` 装饰器注入，未配置 `SVIX_API_KEY` 环境变量时返回 `null`
+- 仅记录 `debug` 级日志，生产环境默认日志级别（`info`）下**不可见**
+- 静默返回 `undefined`，调用方无感知
+
+**典型场景**：社区版部署、开发环境未配置 Svix
+
+##### 分支 2: 环境不存在（L37-39）
+
+**代码**：
+```typescript
+if (!environment) {
+  throw new Error(`Environment not found for id ${command.environmentId}`);
+}
+```
+
+**说明**：
+- **唯一会向外抛出异常的分支**
+- 无内部日志，异常直接向上传播
+- 调用方如果没有 `try-catch`，会**导致整个业务流程中断**
+
+**风险场景**：
+- 并发删除环境导致的竞态条件
+- 数据库不一致导致环境 ID 无效
+- 手动传入错误的 `environmentId`
+
+##### 分支 3: 缺少 webhookAppId（L43-47）
+
+**代码**：
+```typescript
+if (!appId) {
+  this.logger.debug(`Webhook app ID not found for environment ${command.environmentId}`);
+  return;
+}
+```
+
+**说明**：
+- 环境存在但未初始化 webhook 配置（未调用过 `/v2/outbound-webhooks/portal/token`）
+- 仅记录 `debug` 级日志，生产环境不可见
+- 静默返回 `undefined`，调用方无感知
+
+**典型场景**：新环境尚未配置 webhook
+
+##### 分支 4: Svix API 调用异常（L74-78）
+
+**代码**：
+```typescript
+catch (error: any) {
+  this.logger.error(
+    `Failed to send webhook ${command.eventType} for application ${appId}. Error: ${error.message}, Event ID: ${eventId}`,
+    error.stack
+  );
+}
+```
+
+**说明**：
+- Svix API 调用失败（网络问题、权限问题、配额超限等）
+- 记录 `error` 级日志，包含完整 `error.stack`，生产环境可见
+- catch 块没有 `return` 语句，函数隐式返回 `undefined`
+- 不向外抛出异常，调用方无感知
+
+**典型场景**：
+- Svix 服务不可用
+- API 配额耗尽
+- 签名密钥配置错误
+- 网络分区
+
+##### 分支 5: 成功路径（L65-73）
+
+**代码**：
+```typescript
+await this.svix.message.create(appId, {
+  eventType: command.eventType,
+  eventId,
+  payload: webhookPayload,
+});
+
+this.logger.debug(`Successfully sent webhook ${command.eventType}. Event ID: ${eventId}`);
+return { eventId };
+```
+
+**说明**：
+- 返回 `{ eventId: string }`，调用方可通过返回值确认发送成功
+- 记录两条 `debug` 级日志（尝试发送 + 发送成功）
+
+#### 4.2.3 各调用方错误处理模式分析
+
+基于 29 个真实调用点的分析，调用方分为 **4 种错误处理模式**：
+
+| 模式 | 调用方数量 | try-catch | 检查返回值 | 依赖存在性检查 | 行为特征 |
+|-----|-----------|-----------|-----------|---------------|---------|
+| **A: Fire-and-Forget** | 25/29 | ❌ 无 | ❌ 不检查 | ❌ 不检查 | 环境不存在时中断流程，其他情况静默 |
+| **B: 有 try-catch** | 1/29 | ✅ 有 | ❌ 不检查 | ❌ 不检查 | 所有异常都捕获，记录额外日志后继续 |
+| **C: 检查返回值** | 1/29 | ❌ 无 | ✅ 检查 `result === undefined` | ❌ 不检查 | 通过返回值区分是否跳过 |
+| **D: 检查依赖存在** | 1/29 | ❌ 无 | ❌ 不检查 | ✅ `if (this.sendWebhookMessage)` | 依赖不存在时完全不调用 |
+| **E: 传入 environment** | 1/29 | ❌ 无 | ❌ 不检查 | ❌ 不检查 | 避免环境不存在异常 |
+
+##### 模式 A: Fire-and-Forget（绝大多数调用方）
+
+**代表调用方**：
+- Email 发送成功/失败: `send-message-email.usecase.ts:487, 553`
+- SMS 发送成功/失败: `send-message-sms.usecase.ts:356, 381`
+- Push 发送成功: `send-message-push.usecase.ts:644`
+- In-App 发送成功/送达: `send-message-in-app.usecase.ts:307, 319`
+- Chat 发送成功/失败: `send-message-chat.usecase.ts:805, 854`
+- 工作流删除: `delete-workflow.usecase.ts:50`
+- 工作流更新/创建: `patch-workflow.usecase.ts:57`, `upsert-workflow.usecase.ts:114, 125`
+- 偏好更新: `update-preferences.usecase.ts:78`
+- Widget 各种标记: `mark-message-as.usecase.ts:184` 等
+- 消息批量状态变更: `mark-many-notifications-as.usecase.ts:149`
+
+**代码特征**：
+```typescript
+await this.sendWebhookMessage.execute({ ... });
+// 无 try-catch，不检查返回值，继续执行
+```
+
+**风险**：
+- 如果遇到「分支 2：环境不存在」，会直接抛出异常，**中断整个业务流程**
+- 其他分支（无 SVIX_CLIENT、无 webhookAppId、Svix 异常）均静默跳过，调用方无感知
+
+##### 模式 B: 有 try-catch（Push 发送失败路径）
+
+**调用方**：`send-message-push.usecase.ts:726`
+
+**代码**：
+```typescript
+try {
+  await this.sendWebhookMessage.execute({ ... });
+} catch (err) {
+  Logger.error(
+    { jobId: command.jobId },
+    `Error sending webhook message for jobId ${command.jobId} ${err.message || err.toString()}`,
+    LOG_CONTEXT
+  );
+}
+// 继续执行，返回 { success: false, error: e }
+```
+
+**行为**：
+- 捕获所有异常（包括分支 2 的环境不存在）
+- 记录额外的错误日志（包含 `jobId`）
+- 不向外抛出，继续执行
+- **Push 发送失败是唯一有 try-catch 保护的调用点**
+
+##### 模式 C: 检查返回值（入站邮件）
+
+**调用方**：`inbound-domain-route-delivery.usecase.ts:121`
+
+**代码**：
+```typescript
+const result = await this.sendWebhookMessage.execute({ ... });
+
+return {
+  latencyMs: Date.now() - started,
+  skipped: result === undefined,  // 明确标识是否跳过
+};
+```
+
+**行为**：
+- 保存返回值，通过 `result === undefined` 区分是否成功发送
+- 不捕获异常，环境不存在时仍会中断
+- **入站邮件是唯一检查返回值的调用方**
+
+##### 模式 D: 检查依赖存在性（工作流发布）
+
+**调用方**：`sync-to-environment.usecase.ts:149`
+
+**代码**：
+```typescript
+if (this.sendWebhookMessage) {  // 先检查依赖是否注入
+  await this.sendWebhookMessage.execute({ ... });
+}
+```
+
+**行为**：
+- 先检查 `this.sendWebhookMessage` 是否存在
+- 不存在时完全不调用，避免潜在的运行时错误
+- 不捕获异常，环境不存在时仍会中断
+
+##### 模式 E: 传入 environment 对象（批量标记）
+
+**调用方**：`mark-many-notifications-as.usecase.ts:149`
+
+**代码**：
+```typescript
+private sendWebhookEvents(...) {
+  return updatedMessages.map((message) =>
+    this.sendWebhookMessage.execute({
+      ...,
+      environment: environment,  // 直接传入已查询的 environment 对象
+    })
+  );
+}
+```
+
+**行为**：
+- 通过 `command.environment` 传入已查询的环境对象
+- 避免 `sendWebhookMessage` 内部再次查询数据库
+- **消除了分支 2（环境不存在）的可能性**，因为环境已在上游验证存在
+
+#### 4.2.4 关键风险点总结
+
+| 风险 | 影响 | 涉及调用方 | 建议 |
+|-----|------|-----------|------|
+| **环境不存在异常未被捕获** | 可能导致业务流程意外中断 | 模式 A（25 个调用方） | 为关键路径添加 try-catch，或统一在调用前验证环境 |
+| **debug 级日志生产环境不可见** | 无 SVIX_CLIENT、无 webhookAppId 时调用方无法感知 | 分支 1、3 | 考虑提升为 `info` 级，或添加 metrics 指标 |
+| **Svix 失败仅记录日志不通知** | 业务方不知道 webhook 发送失败 | 分支 4 | 结合 Svix Portal 告警，或实现失败回调 |
+| **批量操作中单个失败不影响其他** | 部分消息的 webhook 可能未发送但不报错 | 模式 A 批量场景 | 记录每个事件的 eventId，支持事后审计 |
+
+### 4.3 Payload 结构
 
 **文件**：`libs/application-generic/src/webhooks/dtos/webhook-payload.dto.ts:4-40`
 
