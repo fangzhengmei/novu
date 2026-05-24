@@ -86,7 +86,52 @@ export interface ITemplateVariable {
 
 ---
 
-### 2.3 关联与转化流程
+### 2.3 覆盖范围与交集全景
+
+#### 2.3.1 完整覆盖范围对比
+
+| 类别 | 命名空间 | 校验期Schema包含 | 渲染期实际注入 | 备注 |
+|------|----------|----------------|--------------|------|
+| **交集（7个）** | `payload` | ✅ | ✅ |  |
+| | `subscriber` | ✅ | ✅ |  |
+| | `context` | ✅ | ✅ |  |
+| | `workflow` | ✅ | ✅ | 仅模板 |
+| | `steps` | ✅ | ✅ | 仅模板 |
+| | `env` | ✅ | ✅ |  |
+| | `content` | ✅ | ✅ | 仅布局 |
+| **仅渲染期（5个）** | `step` | ❌ | ✅ | 仅模板，旧版兼容 |
+| | `branding` | ❌ | ✅ |  |
+| | `tenant` | ❌ | ✅ | 独立顶级变量 |
+| | `actor` | ❌ | ✅ | 独立顶级变量 |
+| | `preheader` | ❌ | ✅ | 仅模板 |
+
+#### 2.3.2 集合关系可视化
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                     渲染期注入变量（12个）                 │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │              校验期Schema包含（7个）                │  │
+│  │  payload, subscriber, context, workflow, steps,    │  │
+│  │  env, content(布局)                                │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
+│  仅渲染期（5个）：step, branding, tenant, actor, preheader│
+└──────────────────────────────────────────────────────────┘
+```
+
+#### 2.3.3 关键差异说明
+
+| 差异点 | 说明 |
+|--------|------|
+| **Schema 是子集** | 校验期 Schema 定义的变量是渲染期注入的子集（7/12） |
+| **Schema 字段不完整** | 即使在交集中，Schema 定义的字段也可能不完整。例如 `workflow` 在 Schema 中仅 5 个字段，但渲染期注入完整 DB 对象 |
+| **渲染期有额外变量** | `step`, `branding`, `tenant`, `actor`, `preheader` 这 5 个变量在渲染期注入，但在校验期 Schema 中未定义 |
+| **同名但含义不同** | `tenant` 和 `actor` 既可以通过 `context.tenant` / `context.actor` 访问（在 Schema 中），也可以作为独立顶级变量 `tenant` / `actor` 访问（不在 Schema 中） |
+
+---
+
+### 2.4 关联与转化流程
 
 ```
 用户编辑模板
@@ -141,35 +186,64 @@ Worker 执行
 
 ### 3.1.1 `layout_content` / `content` 深度解析
 
-这是最容易混淆的变量，必须严格区分**三层含义**：
+这是最容易混淆的变量，必须严格区分**代码层面的三层含义**和**用户界面的对应关系**：
+
+#### 一、代码层面的三层含义
 
 | 概念 | 具体内容 | 代码位置 |
 |------|----------|----------|
 | **常量定义** | `LAYOUT_CONTENT_VARIABLE = 'content'` | `packages/shared/src/consts/layouts.ts:1` |
-| **用户显示名** | `{{ layout_content }}` | Dashboard UI 显示给用户的友好名称 |
 | **实际变量名** | `content` | Schema 定义和渲染期注入时使用的真实 key |
 | **实际值（渲染期）** | 渲染后的邮件正文 HTML 字符串 | `email-output-renderer.usecase.ts:406` |
+
+#### 二、用户界面的显示映射
+
+代码中**不存在** `content` → `layout_content` 的动态转换逻辑。`layout_content` 仅存在于：
+1. 文档和用户教育材料中
+2. 测试用例（`packages/framework/src/utils/liquid.utils.test.ts:330`）
+
+前端代码中始终使用 `{{ content }}` 作为变量名，但在用户界面提示和文档中称为 `layout_content` 以避免歧义。
 
 **代码验证**：
 
 ```typescript
-// 常量定义
-export const LAYOUT_CONTENT_VARIABLE = 'content';  // 永远是字符串 'content'
+// 常量定义（前后端共用此常量，值永远是字符串 'content'）
+export const LAYOUT_CONTENT_VARIABLE = 'content';
 
-// Schema 定义（布局校验期）
+// 布局校验期 Schema 定义
 [LAYOUT_CONTENT_VARIABLE]: {
   type: JsonSchemaTypeEnum.STRING,  // 仅定义类型为 string
 }
 
-// 渲染期实际注入
+// 前端布局内容校验（component-utils.tsx:29-30）
+// 将预览中的占位符 HTML 替换为实际变量表达式
+const cleanedBody = previewBody.replace(
+  /<table[^>]*data-content-placeholder[^>]*>[\s\S]*?<\/table>(\s*)/gi,
+  `{{ ${LAYOUT_CONTENT_VARIABLE} }}`  // 生成 "{{ content }}"
+);
+
+// 渲染期实际注入（email-output-renderer.usecase.ts:406）
 [LAYOUT_CONTENT_VARIABLE]: removeBrandingFromHtml(cleanedStepBodyHtml.replace(/\n/g, '')),
 // ↑ 这里注入的是经过处理的 HTML 字符串，例如：
-// "<div>Hello, {{subscriber.firstName}}</div>" 渲染后变成 "<div>Hello, John</div>"
+// 模板内容 "<div>Hello, {{subscriber.firstName}}</div>"
+// 渲染后变成 "<div>Hello, John</div>"
+```
+
+#### 三、对应关系总结
+
+```
+用户界面显示：{{ layout_content }}
+           ↓（概念映射，非代码转换）
+代码常量名：content
+           ↓（代码运行）
+渲染期值：<div>Hello, John</div>（实际 HTML 字符串）
 ```
 
 > **常见误区警示**：
 > - ❌ 错误：`layout_content` 的值是 "content"
-> - ✅ 正确：`layout_content` 是用户显示名，**实际变量名是 `content`**，**实际值是渲染后的邮件正文 HTML**
+> - ✅ 正确：`layout_content` 是用户友好名称，**实际代码中的变量名是 `content`**，**渲染期实际值是邮件正文 HTML 字符串**
+> - ❌ 错误：代码中存在 `content` 到 `layout_content` 的动态转换
+> - ✅ 正确：代码中始终使用 `content` 作为变量名，`layout_content` 仅是文档和 UI 中的友好称呼
 > - ❌ 错误：`layout_content` 是系统变量，触发校验时会被豁免
 > - ✅ 正确：`content` 不在 `TemplateSystemVariables` 中，**不会被豁免**，如果在布局 variables 中声明为 `required: true` 会被校验
 
@@ -756,16 +830,78 @@ if (template.validatePayload && template.payloadSchema) {
 
 #### 阶段 4.2：执行侧必填与默认值校验
 
-**触发条件**：始终执行，不受 `validatePayload` 开关控制
+**⚠️ 触发条件修正**：**并非始终执行**，仅在**有状态工作流（Stateful Workflow）**路径下执行，且不受 `validatePayload` 开关控制。
 
 **核心代码**：
 - `libs/application-generic/src/usecases/trigger-event/trigger-event.usecase.ts:73-82`
 - `libs/application-generic/src/services/verify-payload.service.ts`
 
-**校验逻辑**：
+---
+
+##### 4.2.1 不同触发路径下的成立条件
+
+系统存在两种工作流触发路径，必填校验仅在其中一种路径下执行：
+
+| 工作流类型 | 触发路径 | verifyPayload 是否执行 | 说明 |
+|-----------|----------|----------------------|------|
+| **有状态工作流**<br>（Stateful） | 工作流存储在数据库中，通过 `triggerIdentifier` 查找 | ✅ **执行** | 常规 API 触发路径，经过 `TriggerEvent` 用例 |
+| **无状态工作流**<br>（Stateless / Bridge） | 工作流定义在外部 `bridgeUrl`，通过 DISCOVER 接口获取 | ❌ **不执行** | 直接调用 `dispatchEventToWorkflowQueue`，不经过 `TriggerEvent` 用例 |
+
+**代码验证 1 - 执行前提判断**（`trigger-event.usecase.ts:63-82`）：
 
 ```typescript
-// 在 TriggerEvent.execute() 中调用
+// 只有非 bridge workflow 才会查询并设置 storedWorkflow
+if (!command.bridgeWorkflow) {
+  storedWorkflow = await this.getAndUpdateWorkflowById({
+    environmentId: command.environmentId,
+    triggerIdentifier: command.identifier,
+    payload: command.payload,
+    organizationId: command.organizationId,
+    userId: command.userId,
+  });
+}
+
+// ⚠️ 只有 storedWorkflow 存在时才执行 verifyPayload
+if (storedWorkflow) {
+  const defaultPayload = this.verifyPayload.execute(
+    VerifyPayloadCommand.create({
+      payload: command.payload,
+      template: storedWorkflow,
+    })
+  );
+
+  command.payload = toMerged(defaultPayload, command.payload);
+}
+```
+
+**代码验证 2 - 无状态工作流跳过路径**（`parse-event-request.usecase.ts:96-117`）：
+
+```typescript
+const statelessWorkflowAllowed = this.isStatelessWorkflowAllowed(command.bridgeUrl);
+
+if (statelessWorkflowAllowed) {
+  const discoveredWorkflow = await this.queryDiscoverWorkflow(command);
+
+  if (!discoveredWorkflow) {
+    throw new UnprocessableEntityException('workflow_not_found');
+  }
+
+  // ⚠️ 直接入队，不经过 TriggerEvent，因此不执行 verifyPayload
+  return await this.dispatchEventToWorkflowQueue({
+    requestId,
+    command,
+    transactionId,
+    discoveredWorkflow,
+  });
+}
+```
+
+---
+
+##### 4.2.2 校验逻辑
+
+```typescript
+// 仅在有状态工作流路径下的 TriggerEvent.execute() 中调用
 const defaultPayload = this.verifyPayload.execute(
   VerifyPayloadCommand.create({
     payload: command.payload,
@@ -818,11 +954,18 @@ isSystemVariable(variableName: string) {
 **系统变量豁免清单**（`TemplateSystemVariables`）：
 `['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor']`
 
-**关键特性**：
-- **仅豁免 TemplateSystemVariables**：`workflow.*`、`steps.*`、`env.*`、`context.*`、`content` 不豁免
-- **嵌套支持**：通过 `reduce` 递归访问嵌套属性 `user.name`
-- **默认值合并**：使用 `toMerged(defaultPayload, command.payload)`，用户传入值优先级更高
-- **两层校验独立**：Schema 校验和变量校验是两个独立步骤，结果互不影响
+---
+
+##### 4.2.3 关键特性
+
+| 特性 | 说明 |
+|------|------|
+| **路径依赖** | 仅在有状态工作流路径下执行，无状态工作流不执行 |
+| **不受 validatePayload 控制** | 在有状态工作流路径下，无论 `validatePayload` 开关是否开启，此校验都会执行 |
+| **仅豁免 TemplateSystemVariables** | `workflow.*`、`steps.*`、`env.*`、`context.*`、`content` 不豁免 |
+| **嵌套支持** | 通过 `reduce` 递归访问嵌套属性 `user.name` |
+| **默认值合并** | 使用 `toMerged(defaultPayload, command.payload)`，用户传入值优先级更高 |
+| **两层校验独立** | Schema 校验和变量校验是两个独立步骤，结果互不影响 |
 
 ---
 
@@ -947,15 +1090,16 @@ this.liquidEngine = createLiquidEngine({
 
 | 维度 | 阶段 4.1：请求侧 Schema 校验 | 阶段 4.2：执行侧变量校验 |
 |------|----------------------------|------------------------|
-| **开关控制** | 受 `validatePayload` 控制，可选 | 始终执行，不可关闭 |
+| **开关控制** | 受 `validatePayload` 控制，可选 | 不受 `validatePayload` 控制，但**仅在有状态工作流路径下执行** |
 | **校验依据** | `payloadSchema`（JSON Schema） | `variables: ITemplateVariable[]` |
 | **校验内容** | 完整结构校验（类型、格式、枚举、默认值） | 仅必填变量存在性和类型 |
 | **默认值来源** | Schema 中 `default` 字段 | `ITemplateVariable.defaultValue` |
 | **默认值优先级** | 较低，被用户值覆盖 | 较低，被用户值覆盖 |
 | **校验工具** | AJV | 自定义 reduce 遍历 |
 | **执行位置** | `ParseEventRequest`（API 入口） | `TriggerEvent`（API 入口） |
-| **执行时机** | 入队前同步 | 入队前同步 |
+| **执行时机** | 入队前同步 | 入队前同步（仅有状态工作流） |
 | **系统变量** | 不区分，全部校验 | 仅豁免 TemplateSystemVariables（6 个） |
+| **路径依赖** | 两种工作流路径下都可能执行 | **仅在有状态工作流路径下执行**，无状态工作流不执行 |
 
 ### 8.2 关键边界澄清
 
@@ -969,7 +1113,7 @@ this.liquidEngine = createLiquidEngine({
 
 > **误解 3**：`validatePayload=false` 时完全不校验
 > 
-> **事实**：`validatePayload` 只控制 Schema 校验。即使关闭，**阶段 4.2 的必填变量校验仍然执行**。
+> **事实**：`validatePayload` 只控制 Schema 校验。即使关闭，**在有状态工作流路径下，阶段 4.2 的必填变量校验仍然执行**。但在无状态工作流（Bridge）路径下，阶段 4.2 校验根本不执行。
 
 > **误解 4**：Worker 执行期会再次校验变量
 > 
@@ -1016,6 +1160,23 @@ this.liquidEngine = createLiquidEngine({
 > 
 > **事实**：TemplateSystemVariables 的 6 个变量中，只有 `subscriber` 在校验期 Schema 中明确定义。`step`, `branding`, `tenant`, `actor`, `preheader` 都不在 Schema 中定义，但渲染期会注入。
 
+> **误解 13**：触发阶段必填校验始终执行
+> 
+> **事实**：阶段 4.2 的必填变量校验**仅在有状态工作流路径下执行**。对于无状态工作流（Bridge Workflow，通过 `bridgeUrl` 触发），系统直接调用 `dispatchEventToWorkflowQueue` 入队，不经过 `TriggerEvent` 用例，因此 `verifyPayload` 校验**完全不执行**。
+> 
+> 执行条件判断逻辑：
+> ```typescript
+> if (!command.bridgeWorkflow) {
+>   storedWorkflow = await this.getAndUpdateWorkflowById({...});
+> }
+> 
+> // 只有 storedWorkflow 存在（即非 bridge 工作流）时才执行校验
+> if (storedWorkflow) {
+>   const defaultPayload = this.verifyPayload.execute(...);
+>   command.payload = toMerged(defaultPayload, command.payload);
+> }
+> ```
+
 ---
 
 ## 九、校验阶段对比总结
@@ -1039,17 +1200,20 @@ this.liquidEngine = createLiquidEngine({
 
 ### Q2: `defaultValue` 在哪个阶段生效？
 
-有两处独立的默认值逻辑：
-1. **Schema 默认值**：在**阶段 4.1** 由 AJV 根据 `payloadSchema` 中的 `default` 字段填充
-2. **变量默认值**：在**阶段 4.2** 通过 `fillDefaults()` 根据 `ITemplateVariable.defaultValue` 填充
+有两处独立的默认值逻辑，但**都仅在有状态工作流路径下生效**：
 
-两者都在触发入口处执行，且都被用户传入的 payload 覆盖（用户值优先级更高）。注意：**系统变量（TemplateSystemVariables）的默认值会被忽略**，不会填充。
+1. **Schema 默认值**：在**阶段 4.1** 由 AJV 根据 `payloadSchema` 中的 `default` 字段填充（有状态/无状态工作流路径下都可能执行，取决于 `validatePayload` 开关）
+2. **变量默认值**：在**阶段 4.2** 通过 `fillDefaults()` 根据 `ITemplateVariable.defaultValue` 填充（**仅在有状态工作流路径下执行**）
+
+两者都在触发入口处执行，且都被用户传入的 payload 覆盖（用户值优先级更高）。注意：
+- **系统变量（TemplateSystemVariables）的默认值会被忽略**，不会填充
+- **无状态工作流（Bridge）路径下**，阶段 4.2 校验完全不执行，因此 `ITemplateVariable.defaultValue` 完全不生效
 
 ### Q3: 布局变量和模板变量有什么区别？
 
 **声明方式相同**（都用 `ITemplateVariable[]`），但**校验时机和可用范围不同**：
 - 布局变量在布局保存时校验（阶段 2）
-- 模板变量在触发时校验（阶段 4.2）
+- 模板变量在触发时校验（阶段 4.2，**仅在有状态工作流路径下执行**）
 - 布局特有 `content`（`layout_content`）变量，模板特有 `workflow`、`steps`、`step`、`preheader` 变量
 
 ### Q4: 为什么 `{{ subscriber.firstName }}` 不需要声明也能通过校验？
@@ -1081,7 +1245,10 @@ this.liquidEngine = createLiquidEngine({
 
 ### Q7: 关闭 `validatePayload` 后，还会检查必填变量吗？
 
-会。`validatePayload` 只控制阶段 4.1 的 Schema 校验，阶段 4.2 的必填变量检查（基于 `ITemplateVariable.required`）始终执行，不可关闭。
+**取决于触发路径**：
+
+- **有状态工作流路径**（工作流存储在数据库中）：**会检查**。`validatePayload` 只控制阶段 4.1 的 Schema 校验，阶段 4.2 的必填变量检查（基于 `ITemplateVariable.required`）不受此开关控制，仍然执行。
+- **无状态工作流路径**（通过 `bridgeUrl` 触发）：**不会检查**。无状态工作流直接入队，不经过 `TriggerEvent` 用例，因此阶段 4.2 校验完全不执行。
 
 ### Q8: `steps` 命名空间可以访问哪些步骤？
 
@@ -1092,12 +1259,17 @@ this.liquidEngine = createLiquidEngine({
 
 ### Q9: `layout_content` 变量有什么特殊要求？
 
-- 布局内容**必须**包含 `{{ layout_content }}` 变量
-- 该变量**不需要命名空间**，直接使用 `{{ layout_content }}`
-- 实际常量名为 `content`（`LAYOUT_CONTENT_VARIABLE`）
-- **渲染时实际值为邮件正文 HTML 字符串**，不是常量 "content"
-- 仅在布局编辑/渲染时可用，模板中不可用
-- 不在 TemplateSystemVariables 中，声明为 required 会被校验
+需要区分**用户界面显示**和**代码实际运行**的差异：
+
+- **用户界面要求**：布局内容**必须**包含 `{{ layout_content }}` 变量（这是用户友好的显示名）
+- **代码实际使用**：代码中始终使用变量名 `content`（通过 `LAYOUT_CONTENT_VARIABLE` 常量）
+- **不需要命名空间**：直接使用 `{{ content }}`（代码中）或 `{{ layout_content }}`（UI 显示）
+- **实际常量名**：`content`（`LAYOUT_CONTENT_VARIABLE = 'content'`）
+- **渲染时实际值**：**渲染后的邮件正文 HTML 字符串**，不是常量 "content"
+- **可用范围**：仅在布局编辑/渲染时可用，模板中不可用
+- **校验豁免**：不在 TemplateSystemVariables 中，如果在布局 variables 中声明为 required，**在有状态工作流路径下会被校验**（无状态工作流路径下不校验）
+
+> **代码中不存在 `content` → `layout_content` 的动态转换**，`layout_content` 仅作为文档和 UI 中的友好名称使用。
 
 ### Q10: 如何在模板中访问 Digest 聚合的事件？
 
@@ -1168,6 +1340,36 @@ this.liquidEngine = createLiquidEngine({
 | **`content`** | ✅ 定义为 string 类型 | ✅ 注入渲染后的 HTML 字符串 |
 
 > **核心结论**：Schema ≠ 实际注入。不能假设 Schema 中有的渲染期一定有值，也不能假设 Schema 中没有的渲染期一定不可用。
+
+### Q13: 不同触发路径下的校验行为有什么差异？
+
+系统支持两种工作流触发路径，校验行为差异显著：
+
+| 对比项 | 有状态工作流（Stateful） | 无状态工作流（Stateless / Bridge） |
+|--------|------------------------|----------------------------------|
+| **工作流存储位置** | 数据库中，通过 `triggerIdentifier` 查找 | 外部 `bridgeUrl`，通过 DISCOVER 接口获取 |
+| **阶段 4.1 Schema 校验** | 受 `validatePayload` 开关控制 | 受 `validatePayload` 开关控制（如果有 payloadSchema） |
+| **阶段 4.2 必填校验** | ✅ **执行**，经过 `TriggerEvent` 用例 | ❌ **不执行**，直接入队 |
+| **verifyPayload 调用** | ✅ 调用 | ❌ 不调用 |
+| **storedWorkflow 查询** | ✅ 查询数据库 | ❌ 不查询 |
+| **ITemplateVariable.defaultValue** | ✅ 生效（非系统变量） | ❌ 不生效 |
+| **必填变量检查** | ✅ 执行（非系统变量） | ❌ 不执行 |
+
+**关键代码判断逻辑**：
+```typescript
+// 只有非 bridge workflow 才会查询并设置 storedWorkflow
+if (!command.bridgeWorkflow) {
+  storedWorkflow = await this.getAndUpdateWorkflowById({...});
+}
+
+// ⚠️ 只有 storedWorkflow 存在时才执行 verifyPayload
+if (storedWorkflow) {
+  const defaultPayload = this.verifyPayload.execute(...);
+  command.payload = toMerged(defaultPayload, command.payload);
+}
+```
+
+> **重要提示**：如果使用无状态工作流（Bridge），请确保在调用方自行验证 payload 的完整性，因为系统不会执行阶段 4.2 的必填变量校验和默认值填充。
 
 ---
 
