@@ -1,6 +1,6 @@
 # 模板与布局变量校验机制详解
 
-本文档详细说明 Novu 系统中模板（Template）与布局（Layout）的变量声明、完整命名空间范围、校验时机、完整校验链路以及渲染期的兜底逻辑。
+本文档详细说明 Novu 系统中模板（Template）与布局（Layout）的变量声明、完整命名空间范围、校验期与渲染期的边界、完整校验链路以及渲染期的兜底逻辑。
 
 ---
 
@@ -42,30 +42,140 @@ export interface ITemplateVariable {
 
 ---
 
-## 二、完整命名空间范围说明
+## 二、校验期可用变量 vs 渲染期注入变量
 
-### 2.1 全部可用命名空间总览
+### 2.1 核心概念澄清
 
-系统支持以下 10 个命名空间，分为**模板通用**和**布局特有**两类：
+这是两个**本质不同**的概念，界限必须严格区分：
 
-| 命名空间 | 模板可用 | 布局可用 | 说明 |
-|----------|---------|---------|------|
-| `payload` | ✅ | ✅ | 触发时传入的自定义数据 |
-| `subscriber` | ✅ | ✅ | 订阅者信息 |
-| `context` | ✅ | ✅ | 上下文数据（tenant、actor 等） |
-| `workflow` | ✅ | ❌ | 工作流元数据 |
-| `steps` | ✅ | ❌ | 前置步骤执行结果 |
-| `env` | ✅ | ✅ | 环境变量（用户自定义 + 系统内置） |
-| `step` | ✅ | ❌ | 兼容旧版步骤变量（digest/events/total_count） |
-| `branding` | ✅ | ✅ | 品牌信息 |
-| `tenant` | ✅ | ✅ | 租户信息 |
-| `actor` | ✅ | ✅ | 执行者信息 |
-| `preheader` | ✅ | ❌ | 邮件预览文本 |
-| `layout_content` | ❌ | ✅ | 布局内容占位符（布局特有） |
+| 维度 | 校验期可用变量（Validation-time Variables） | 渲染期注入变量（Render-time Injected Variables） |
+|------|--------------------------------------------|------------------------------------------------|
+| **本质** | 通过 `variableSchema` 构建的 **JSON Schema 元数据**，描述"允许访问的变量结构" | Worker 执行时实际传递给 Liquid 引擎的 **真实数据对象**，提供"实际值是什么" |
+| **存在形式** | 内存中的 Schema 对象，仅包含字段名和类型定义 | 实际运行时数据对象，包含完整的字段值 |
+| **构建时机** | 编辑/保存/构建时动态生成 | Worker 执行消息发送时动态构建 |
+| **构建位置** | `build-available-variable-schema.usecase.ts`（模板）<br>`layout-variables-schema.usecase.ts`（布局） | `construct-framework-workflow.usecase.ts`<br>`send-message.usecase.ts`（旧版兼容） |
+| **用途** | 编辑/保存/构建/触发时校验变量使用是否合法 | 模板渲染时替换 `{{ variable }}` 占位符的实际值 |
+| **Liquid 模式** | 配合 `strictVariables: true` 严格校验 | 配合 `strictVariables: false` 宽松渲染 |
 
-### 2.2 编辑期 vs 构建期变量范围
+> **核心边界**：校验期 Schema 定义"**可以用什么**"，渲染期注入"**实际值是什么**"。两者范围高度相关但**不完全一致**——Schema 中有的，渲染期不一定注入；Schema 中没有的，渲染期可能实际注入。
 
-编辑期和构建期使用相同的 `variableSchema` 构建逻辑，但范围存在关键差异：
+---
+
+### 2.2 关键差异对比（按命名空间）
+
+两者最容易混淆的地方在于**同一命名空间下，校验期定义和渲染期实际注入的差异**：
+
+| 命名空间 | 校验期 Schema 定义 | 渲染期实际注入 | 差异说明 |
+|----------|------------------|--------------|----------|
+| **`workflow`** | 仅定义 5 个字段：<br>`workflowId`, `name`, `description`, `tags`, `severity` | 完整的数据库 `NotificationTemplateEntity` 对象，包含 `_id`, `createdAt`, `updatedAt`, `steps` 等所有字段 | ✅ Schema 是**子集**，渲染期是**超集** |
+| **`steps`** | 仅包含**当前步骤之前**的步骤 Schema 定义，按 `stepId` 组织 | 初始为空对象 `{}`，工作流执行过程中**逐步填充**已完成步骤的实际结果 | ✅ Schema 是**前置步骤定义**，渲染期是**动态执行结果** |
+| **`subscriber`** | 定义标准字段：`firstName`, `lastName`, `email`, `subscriberId`, `data` 等 | 与 Schema 基本一致，`data` 字段包含用户自定义属性 | ⚠️ 基本一致 |
+| **`payload`** | 根据 `payloadSchema` 动态定义（如用户未配置则为空） | 用户触发时传入的完整 payload 对象 | ✅ Schema 是**用户定义结构**，渲染期是**实际传入值** |
+| **`context`** | 定义为 `{ [entityType]: { id, data } }` 结构 | 实际解析后的上下文对象，包含 `tenant`, `actor` 等实体 | ⚠️ 基本一致 |
+| **`env`** | 仅定义环境变量的**键名列表**（类型均为 string） | 实际键值对，包含用户自定义变量 + 系统内置变量（`name`, `type`） | ✅ Schema 是**键名集合**，渲染期是**完整键值对** |
+| **`step`** | ❌ **不在 Schema 中** | ✅ 注入旧版兼容变量：`{ digest, events, total_count }` | ❌ Schema 缺失，渲染期存在 |
+| **`branding`** | ❌ **不在 Schema 中** | ✅ 注入品牌信息：`{ logo, color }` | ❌ Schema 缺失，渲染期存在 |
+| **`tenant`** | ❌ **不在 Schema 中**（需通过 `context.tenant` 访问） | ✅ 作为**独立顶级变量**注入：`{ name, data }` | ❌ Schema 缺失，渲染期存在 |
+| **`actor`** | ❌ **不在 Schema 中**（需通过 `context.actor` 访问） | ✅ 作为**独立顶级变量**注入：`{ firstName, lastName, email, ... }` | ❌ Schema 缺失，渲染期存在 |
+| **`preheader`** | ❌ **不在 Schema 中** | ✅ 注入邮件预览文本（string 类型） | ❌ Schema 缺失，渲染期存在 |
+| **`content`**<br>（`layout_content`） | ✅ Schema 中定义为 `string` 类型（仅布局） | ✅ 注入**渲染后的邮件正文 HTML 字符串**（仅布局） | ⚠️ 类型一致，但值是**动态渲染结果** |
+
+> **重要结论**：
+> 1. **Schema ≠ 实际注入**：不能假设 Schema 中定义的变量渲染期一定有值，也不能假设 Schema 中没有的变量渲染期一定不可用
+> 2. **"系统变量"≠"被豁免"**：`branding`, `tenant`, `actor`, `preheader`, `step` 虽然是渲染期注入的系统变量，但**不在 Schema 中定义**，且**只有部分被豁免校验**（详见第四章）
+
+---
+
+### 2.3 关联与转化流程
+
+```
+用户编辑模板
+    ↓
+[校验期] 构建 variableSchema（JSON Schema）
+    ↓
+[校验期] 使用 strictVariables: true 校验变量合法性
+    ↓ 校验通过
+工作流触发
+    ↓
+[触发期] 校验 payload 结构和必填变量
+    ↓ 校验通过
+Worker 执行
+    ↓
+[渲染期] 构建 FullPayloadForRender（实际数据对象）
+    ↓
+[渲染期] 使用 strictVariables: false 渲染模板
+```
+
+> 校验期和渲染期通过**变量命名约定**关联，但两者是完全独立的构建流程，没有直接的数据依赖。
+
+---
+
+## 三、完整命名空间范围说明
+
+### 3.1 全部可用命名空间总览
+
+系统支持以下命名空间，分为**模板特有**、**布局特有**和**通用**三类。注意**"校验期 Schema 包含"≠"渲染期一定会注入"**，反之亦然：
+
+| 命名空间 | 模板可用 | 布局可用 | 校验期Schema包含 | 渲染期实际注入 | 触发校验豁免 | 说明 |
+|----------|---------|---------|----------------|--------------|------------|------|
+| `payload` | ✅ | ✅ | ✅ | ✅ | ❌ | 触发时传入的自定义数据 |
+| `subscriber` | ✅ | ✅ | ✅ | ✅ | ✅ | 订阅者信息（属于 TemplateSystemVariables） |
+| `context` | ✅ | ✅ | ✅ | ✅ | ❌ | 上下文数据（tenant、actor 等，通过 context.tenant 访问） |
+| `workflow` | ✅ | ❌ | ✅ | ✅ | ❌ | 工作流元数据（Schema 仅5个字段，渲染期是完整DB对象） |
+| `steps` | ✅ | ❌ | ✅（仅前置步骤） | ✅（逐步填充） | ❌ | 前置步骤执行结果 |
+| `env` | ✅ | ✅ | ✅ | ✅ | ❌ | 环境变量（用户自定义 + 系统内置） |
+| `step` | ✅ | ❌ | ❌ | ✅（旧版兼容） | ✅ | 兼容旧版步骤变量（digest/events/total_count，属于 TemplateSystemVariables） |
+| `branding` | ✅ | ✅ | ❌ | ✅ | ✅ | 品牌信息（属于 TemplateSystemVariables） |
+| `tenant` | ✅ | ✅ | ❌ | ✅ | ✅ | 租户信息（独立顶级变量，属于 TemplateSystemVariables） |
+| `actor` | ✅ | ✅ | ❌ | ✅ | ✅ | 执行者信息（独立顶级变量，属于 TemplateSystemVariables） |
+| `preheader` | ✅ | ❌ | ❌ | ✅ | ✅ | 邮件预览文本（属于 TemplateSystemVariables） |
+| `content`<br>（`layout_content`） | ❌ | ✅ | ✅ | ✅ | ❌ | 布局内容占位符（布局特有，**实际值为渲染后的HTML字符串**） |
+
+> **关键澄清**：
+> 1. **模板特有**：`workflow`、`steps`、`step`、`preheader` —— 仅模板可用，布局不可用
+> 2. **布局特有**：`content`（`layout_content`）—— 仅布局可用，模板不可用
+> 3. **Schema 缺失但渲染期存在**：`branding`、`tenant`、`actor`、`step`、`preheader` —— 校验期 Schema 中未定义，但渲染期会实际注入
+> 4. **触发校验豁免**：仅 `subscriber`、`step`、`branding`、`tenant`、`actor`、`preheader` 这 6 个 `TemplateSystemVariables` 被豁免，其余均不豁免
+
+---
+
+### 3.1.1 `layout_content` / `content` 深度解析
+
+这是最容易混淆的变量，必须严格区分**三层含义**：
+
+| 概念 | 具体内容 | 代码位置 |
+|------|----------|----------|
+| **常量定义** | `LAYOUT_CONTENT_VARIABLE = 'content'` | `packages/shared/src/consts/layouts.ts:1` |
+| **用户显示名** | `{{ layout_content }}` | Dashboard UI 显示给用户的友好名称 |
+| **实际变量名** | `content` | Schema 定义和渲染期注入时使用的真实 key |
+| **实际值（渲染期）** | 渲染后的邮件正文 HTML 字符串 | `email-output-renderer.usecase.ts:406` |
+
+**代码验证**：
+
+```typescript
+// 常量定义
+export const LAYOUT_CONTENT_VARIABLE = 'content';  // 永远是字符串 'content'
+
+// Schema 定义（布局校验期）
+[LAYOUT_CONTENT_VARIABLE]: {
+  type: JsonSchemaTypeEnum.STRING,  // 仅定义类型为 string
+}
+
+// 渲染期实际注入
+[LAYOUT_CONTENT_VARIABLE]: removeBrandingFromHtml(cleanedStepBodyHtml.replace(/\n/g, '')),
+// ↑ 这里注入的是经过处理的 HTML 字符串，例如：
+// "<div>Hello, {{subscriber.firstName}}</div>" 渲染后变成 "<div>Hello, John</div>"
+```
+
+> **常见误区警示**：
+> - ❌ 错误：`layout_content` 的值是 "content"
+> - ✅ 正确：`layout_content` 是用户显示名，**实际变量名是 `content`**，**实际值是渲染后的邮件正文 HTML**
+> - ❌ 错误：`layout_content` 是系统变量，触发校验时会被豁免
+> - ✅ 正确：`content` 不在 `TemplateSystemVariables` 中，**不会被豁免**，如果在布局 variables 中声明为 `required: true` 会被校验
+
+---
+
+### 3.2 校验期 Schema 构建逻辑
 
 #### 模板编辑/构建期 Schema 构建
 
@@ -75,12 +185,12 @@ export interface ITemplateVariable {
 return {
   type: JsonSchemaTypeEnum.OBJECT,
   properties: {
-    workflow: buildWorkflowSchema(),              // 工作流元数据
-    subscriber: buildSubscriberSchema(finalSubscriber), // 订阅者
-    steps: buildPreviousStepsSchema({...}),       // 仅前置步骤结果
+    workflow: buildWorkflowSchema(),              // { workflowId, name, description, tags, severity }
+    subscriber: buildSubscriberSchema(finalSubscriber), // { firstName, lastName, email, ..., data }
+    steps: buildPreviousStepsSchema({...}),       // 仅当前步骤之前的步骤结果
     payload: await this.resolvePayloadSchema(...),// payload 结构
-    context: buildContextSchema(finalContext),    // 上下文
-    env: buildEnvSchema(envVars),                 // 环境变量
+    context: buildContextSchema(finalContext),    // { id, data }
+    env: buildEnvSchema(envVars),                 // 环境变量键列表
   },
   additionalProperties: false,
 };
@@ -95,7 +205,7 @@ return {
   type: JsonSchemaTypeEnum.OBJECT,
   properties: {
     subscriber: buildSubscriberSchema(subscriber),
-    [LAYOUT_CONTENT_VARIABLE]: {                  // 布局特有 content 变量
+    [LAYOUT_CONTENT_VARIABLE]: {                  // 实际变量名为 'content'
       type: JsonSchemaTypeEnum.STRING,
     },
     context: buildContextSchema(context),
@@ -105,20 +215,98 @@ return {
 };
 ```
 
-#### 关键范围差异
+#### 关键范围限制
 
-| 差异点 | 说明 |
+| 限制项 | 说明 |
 |--------|------|
-| **steps 范围** | 仅包含**当前步骤之前**执行的步骤，不包含后续步骤。例如步骤 3 只能访问 steps.step1 和 steps.step2，不能访问 steps.step3 或 steps.step4 |
-| **workflow** | 仅模板可用，布局不可用 |
-| **layout_content** | 仅布局可用，模板不可用 |
+| **steps 范围** | 仅包含**当前步骤之前**执行的步骤结果。例如步骤 3 只能访问 `steps.step1` 和 `steps.step2`，不能访问 `steps.step3` 或 `steps.step4` |
+| **workflow 范围** | 仅模板可用，布局不可用 |
+| **content 范围** | 仅布局可用，模板不可用。实际变量名为 `content`，模板中显示为 `layout_content` |
 | **steps.digest** | Digest 步骤的 `events` 字段有特殊处理，支持 `steps.digest-step.events[0].payload` 格式 |
 
 ---
 
-## 三、系统内置变量完整清单
+### 3.3 渲染期实际注入变量
 
-### 3.1 `TemplateSystemVariables` 列表
+#### FullPayloadForRender 接口定义
+
+**核心代码**：`apps/api/src/app/environments-v1/usecases/output-renderers/render-command.ts:11-24`
+
+```typescript
+export class FullPayloadForRender {
+  workflow?: Record<string, unknown>;  // 完整 DB workflow 对象，不止 Schema 字段
+  subscriber: Record<string, unknown>;
+  payload: Record<string, unknown>;
+  context?: ContextResolved;
+  steps: Record<string, unknown>;      // stepId -> 步骤结果，初始为空 {}，逐步填充
+  env?: Record<string, unknown>;       // 用户自定义 env + 系统变量（name, type）
+  [LAYOUT_CONTENT_VARIABLE]?: string;  // 仅布局渲染时注入：'content' = 渲染后的 HTML
+}
+```
+
+#### 布局渲染时的特殊注入
+
+**核心代码**：`email-output-renderer.usecase.ts:402-413`
+
+```typescript
+return this.processBodyContent({
+  body: layoutBody,
+  payload: {
+    ...payload,
+    [LAYOUT_CONTENT_VARIABLE]: removeBrandingFromHtml(cleanedStepBodyHtml.replace(/\n/g, '')),
+  },
+  // ...
+});
+```
+
+> **`layout_content` 真相**：
+> - 常量定义：`LAYOUT_CONTENT_VARIABLE = 'content'`（`packages/shared/src/consts/layouts.ts:1`）
+> - 模板中显示：`{{ layout_content }}`（用户友好名）
+> - 实际变量名：`content`（注入时使用的 key）
+> - 实际值：**渲染后的邮件正文 HTML 字符串**，不是常量 "content"
+
+#### Worker 中额外注入的旧版兼容变量
+
+**核心代码**：`apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts:453-465`
+
+```typescript
+return {
+  subscriber,
+  payload: command.payload,
+  step: {                                         // 旧版兼容变量
+    digest: !!command.events?.length,
+    events: command.events,
+    total_count: command.events?.length,
+  },
+  ...(tenant && { tenant }),                      // 租户信息
+  ...(actor && { actor }),                        // 执行者信息
+  ...(context && { context }),                    // 上下文
+  env,                                            // 环境变量
+};
+```
+
+---
+
+## 四、系统内置变量完整清单
+
+### 4.1 "系统变量"的三层含义澄清
+
+"系统变量"是一个容易混淆的术语，必须严格区分以下三层含义：
+
+| 概念 | 说明 | 范围 |
+|------|------|------|
+| **渲染期系统注入变量** | Worker 渲染时自动注入的变量，无需用户传入 | `subscriber`, `step`, `branding`, `tenant`, `actor`, `preheader`, `workflow`, `steps`, `env`, `context`, `content` |
+| **`TemplateSystemVariables` 列表** | 代码中明确定义的常量列表，共 6 个 | `['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor']` |
+| **触发校验豁免变量** | 在阶段 4.2 中不进行必填校验和默认值填充的变量 | **等同于 `TemplateSystemVariables` 列表**，仅 6 个 |
+
+> **关键结论**：
+> - ❌ 不是所有"系统注入变量"都在 `TemplateSystemVariables` 中
+> - ❌ 不是所有"系统注入变量"都能获得触发校验豁免
+> - ✅ **只有 `TemplateSystemVariables` 列表中的 6 个变量能获得豁免**
+
+---
+
+### 4.2 `TemplateSystemVariables` 列表（仅 6 个）
 
 **定义位置**：`packages/shared/src/entities/message-template/message-template.interface.ts:54`
 
@@ -126,7 +314,88 @@ return {
 export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor'];
 ```
 
-### 3.2 完整内置变量详细说明
+> **⚠️ 绝对注意**：此列表**仅包含 6 个变量**。以下变量虽然也是系统注入的，但**不在此列表中**，也**不会获得校验豁免**：
+> - ❌ `workflow` - 工作流元数据
+> - ❌ `steps` - 前置步骤结果
+> - ❌ `env` - 环境变量
+> - ❌ `context` - 上下文数据
+> - ❌ `content` - 布局内容占位符
+
+---
+
+### 4.3 系统变量豁免规则（核心）
+
+#### 4.3.1 适用范围
+
+**仅适用于阶段 4.2：触发时必填变量校验和默认值填充**
+
+- **checkRequired()** 方法：过滤掉 `isSystemVariable()` 返回 true 的变量，不进行必填校验
+- **fillDefaults()** 方法：过滤掉 `isSystemVariable()` 返回 true 的变量，不填充默认值
+
+#### 4.3.2 核心代码
+
+**定义位置**：`libs/application-generic/src/services/verify-payload.service.ts:71-73`
+
+```typescript
+isSystemVariable(variableName: string): boolean {
+  // 只取第一段命名空间前缀进行匹配
+  const prefix = variableName.includes('.') ? variableName.split('.')[0] : variableName;
+  return TemplateSystemVariables.includes(prefix);
+}
+```
+
+**调用位置 1 - 必填校验过滤**（第 8 行）：
+```typescript
+for (const variable of variables.filter((vari) => vari.required && !this.isSystemVariable(vari.name))) {
+  // 仅对非系统变量进行必填校验
+}
+```
+
+**调用位置 2 - 默认值填充过滤**（第 46-48 行）：
+```typescript
+for (const variable of variables.filter(
+  (elem) => elem.defaultValue !== undefined && elem.defaultValue !== null && !this.isSystemVariable(elem.name)
+)) {
+  // 仅对非系统变量填充默认值
+}
+```
+
+#### 4.3.3 豁免影响全景
+
+| 变量 | 属于 TemplateSystemVariables | 触发校验豁免 | 备注 |
+|------|----------------------------|------------|------|
+| `subscriber.firstName` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `step.digest` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `branding.logo` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `tenant.name` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `actor.email` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `preheader` | ✅ | ✅ 豁免 | 不校验 required，不填充 defaultValue |
+| `workflow.name` | ❌ | ❌ **不豁免** | 声明为 required 会被校验 |
+| `steps.step1.result` | ❌ | ❌ **不豁免** | 声明为 required 会被校验 |
+| `env.API_KEY` | ❌ | ❌ **不豁免** | 声明为 required 会被校验 |
+| `context.tenant.id` | ❌ | ❌ **不豁免** | 声明为 required 会被校验 |
+| `content`（layout_content） | ❌ | ❌ **不豁免** | 声明为 required 会被校验 |
+
+#### 4.3.4 重要风险提示
+
+如果用户在 `variables` 数组中声明以下变量为 `required: true`，**触发时一定会报错**，因为这些变量不在 payload 中：
+
+```typescript
+// ⚠️ 错误示例：这些变量声明为 required 会导致触发失败
+const variables: ITemplateVariable[] = [
+  { name: 'workflow.name', type: TemplateVariableTypeEnum.STRING, required: true },      // ❌ 不豁免
+  { name: 'steps.step1.result', type: TemplateVariableTypeEnum.STRING, required: true }, // ❌ 不豁免
+  { name: 'env.API_KEY', type: TemplateVariableTypeEnum.STRING, required: true },        // ❌ 不豁免
+  { name: 'context.tenant.id', type: TemplateVariableTypeEnum.STRING, required: true },  // ❌ 不豁免
+  { name: 'content', type: TemplateVariableTypeEnum.STRING, required: true },            // ❌ 不豁免
+];
+```
+
+> **最佳实践**：**永远不要**将系统注入变量声明为 `required: true` 或设置 `defaultValue`。这些变量的值由系统在渲染期动态注入，不受触发时校验控制。
+
+---
+
+### 4.4 完整内置变量详细说明
 
 #### 1. `workflow` - 工作流元数据
 
@@ -143,6 +412,7 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 ```
 
 **必填字段**：`workflowId`, `name`
+**系统变量豁免**：❌ 不在 TemplateSystemVariables 中
 
 #### 2. `subscriber` - 订阅者信息
 
@@ -165,6 +435,7 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 ```
 
 **必填字段**：`subscriberId`
+**系统变量豁免**：✅ 在 TemplateSystemVariables 中
 
 #### 3. `steps` - 前置步骤结果
 
@@ -191,8 +462,7 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 - `steps.digest-step.events[0].payload` - 第一个事件的 payload
 - `steps.digest-step.eventCount` - 事件总数
 
-**HTTP 请求步骤**：
-- 根据 `responseBodySchema` 动态生成可访问字段
+**系统变量豁免**：❌ 不在 TemplateSystemVariables 中
 
 #### 4. `env` - 环境变量
 
@@ -203,6 +473,8 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 2. **系统内置环境变量**：
    - `env.name` - 环境名称（如 "Production", "Development"）
    - `env.type` - 环境类型
+
+**系统变量豁免**：❌ 不在 TemplateSystemVariables 中
 
 #### 5. `context` - 上下文数据
 
@@ -221,6 +493,8 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 - `context.tenant` - 租户上下文
 - `context.actor` - 执行者上下文
 
+**系统变量豁免**：❌ 不在 TemplateSystemVariables 中
+
 #### 6. `step` - 兼容旧版步骤变量
 
 **SystemVariablesWithTypes 定义**：`message-template.interface.ts:75-79`
@@ -234,6 +508,7 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 ```
 
 > **注意**：这是旧版兼容变量，推荐使用 `steps.{stepId}` 格式访问特定步骤结果。
+> **系统变量豁免**：✅ 在 TemplateSystemVariables 中
 
 #### 7. `branding` - 品牌信息
 
@@ -246,6 +521,8 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 }
 ```
 
+**系统变量豁免**：✅ 在 TemplateSystemVariables 中
+
 #### 8. `tenant` - 租户信息
 
 **SystemVariablesWithTypes 定义**：`message-template.interface.ts:84-87`
@@ -256,6 +533,8 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
   data: object;            // 租户自定义数据
 }
 ```
+
+**系统变量豁免**：✅ 在 TemplateSystemVariables 中
 
 #### 9. `actor` - 执行者信息
 
@@ -273,13 +552,16 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 }
 ```
 
+**系统变量豁免**：✅ 在 TemplateSystemVariables 中
+
 #### 10. `preheader` - 邮件预览文本
 
 **类型**：`string`
 
 邮件收件人列表中显示的预览文本。
+**系统变量豁免**：✅ 在 TemplateSystemVariables 中
 
-#### 11. `layout_content` - 布局内容占位符（布局特有）
+#### 11. `content` / `layout_content` - 布局内容占位符（布局特有）
 
 **常量定义**：`packages/shared/src/consts/layouts.ts:1`
 
@@ -287,14 +569,17 @@ export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenan
 export const LAYOUT_CONTENT_VARIABLE = 'content';
 ```
 
+- **模板中使用**：`{{ layout_content }}`（用户友好显示名）
+- **实际变量名**：`content`（注入时使用的 key）
 - **类型**：`string`
+- **实际值**：渲染后的邮件正文 HTML 字符串
 - **用途**：标记邮件正文在布局中的插入位置
 - **校验要求**：布局内容必须包含此变量（HTML 或 Maily JSON 格式）
-- **渲染时**：被替换为实际邮件模板内容
+- **系统变量豁免**：❌ 不在 TemplateSystemVariables 中
 
 ---
 
-## 四、完整校验链路总览
+## 五、完整校验链路总览
 
 变量校验分布在**编辑 → 保存 → 构建 → 触发 → 渲染**五个阶段，形成层层递进的防护链。其中**触发阶段又分为两层独立校验**。
 
@@ -324,7 +609,7 @@ API 触发 /events/trigger
 
 ---
 
-## 五、各阶段校验详细说明
+## 六、各阶段校验详细说明
 
 ### 阶段 1：前端编辑实时校验
 
@@ -337,7 +622,7 @@ API 触发 /events/trigger
 **校验内容**：
 1. **命名空间校验**：变量必须以 `payload.` / `subscriber.` / `context.` / `workflow.` / `steps.` / `env.` 开头
    - 无命名空间的单段变量会提示 `invalid or missing namespace`
-   - 例外：`layout_content`（布局特有，无需命名空间）
+   - 例外：`content`（布局特有，无需命名空间，模板中显示为 `layout_content`）
    - 建议补全：`Did you mean {{payload.xxx}}?`
 
 2. **Schema 存在性校验**：`payload.` 开头的变量必须在 Payload Schema 中声明
@@ -498,7 +783,7 @@ command.payload = toMerged(defaultPayload, command.payload);
 verifyPayload(variables: ITemplateVariable[], payload: Record<string, unknown>) {
   const invalidKeys: string[] = [];
   
-  // 1. 检查必填变量（排除系统变量）
+  // 1. 检查必填变量（排除 TemplateSystemVariables）
   for (const variable of variables.filter(v => v.required && !isSystemVariable(v.name))) {
     const value = variable.name.split('.').reduce((a, b) => a[b], payload);
     
@@ -517,7 +802,7 @@ verifyPayload(variables: ITemplateVariable[], payload: Record<string, unknown>) 
     );
   }
   
-  // 2. 填充默认值（排除系统变量）
+  // 2. 填充默认值（排除 TemplateSystemVariables）
   return this.fillDefaults(variables.filter(
     v => v.defaultValue != null && !isSystemVariable(v.name)
   ));
@@ -534,7 +819,7 @@ isSystemVariable(variableName: string) {
 `['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor']`
 
 **关键特性**：
-- **系统变量豁免**：`subscriber.*`、`step.*` 等内置变量跳过校验
+- **仅豁免 TemplateSystemVariables**：`workflow.*`、`steps.*`、`env.*`、`context.*`、`content` 不豁免
 - **嵌套支持**：通过 `reduce` 递归访问嵌套属性 `user.name`
 - **默认值合并**：使用 `toMerged(defaultPayload, command.payload)`，用户传入值优先级更高
 - **两层校验独立**：Schema 校验和变量校验是两个独立步骤，结果互不影响
@@ -567,11 +852,11 @@ isSystemVariable(variableName: string) {
 
 ---
 
-## 六、渲染期兜底策略详解
+## 七、渲染期兜底策略详解
 
 渲染阶段是最后一道防线，采用"容错优先"策略，确保消息尽可能发送成功。
 
-### 6.1 Liquid 引擎配置差异
+### 7.1 Liquid 引擎配置差异
 
 系统中有两种不同配置的 Liquid 引擎实例：
 
@@ -598,7 +883,7 @@ createLiquidEngine({
 });
 ```
 
-### 6.2 `undefined` / `null` 变量处理
+### 7.2 `undefined` / `null` 变量处理
 
 **核心兜底逻辑**在 `defaultOutputEscape` 函数中：
 
@@ -625,7 +910,7 @@ export function defaultOutputEscape(output: unknown): string {
 - `{{ payload.objVar }}` → 渲染为 `{'key':'value'}`（单引号 JSON）
 - `{{ payload.arrVar }}` → 渲染为 `[1,2,3]`（单引号 JSON）
 
-### 6.3 邮件渲染的特殊处理
+### 7.3 邮件渲染的特殊处理
 
 邮件渲染使用自定义 `outputEscape`，避免破坏 HTML 结构：
 
@@ -643,7 +928,7 @@ this.liquidEngine = createLiquidEngine({
 });
 ```
 
-### 6.4 异常兜底
+### 7.4 异常兜底
 
 渲染过程中的异常处理策略：
 
@@ -656,9 +941,9 @@ this.liquidEngine = createLiquidEngine({
 
 ---
 
-## 七、触发入口校验与执行期校验的边界澄清
+## 八、触发入口校验与执行期校验的边界澄清
 
-### 7.1 两层校验的对比
+### 8.1 两层校验的对比
 
 | 维度 | 阶段 4.1：请求侧 Schema 校验 | 阶段 4.2：执行侧变量校验 |
 |------|----------------------------|------------------------|
@@ -670,9 +955,9 @@ this.liquidEngine = createLiquidEngine({
 | **校验工具** | AJV | 自定义 reduce 遍历 |
 | **执行位置** | `ParseEventRequest`（API 入口） | `TriggerEvent`（API 入口） |
 | **执行时机** | 入队前同步 | 入队前同步 |
-| **系统变量** | 不区分，全部校验 | 跳过系统变量 |
+| **系统变量** | 不区分，全部校验 | 仅豁免 TemplateSystemVariables（6 个） |
 
-### 7.2 关键边界澄清
+### 8.2 关键边界澄清
 
 > **误解 1**：Schema 校验在 Worker 执行期执行
 > 
@@ -694,13 +979,46 @@ this.liquidEngine = createLiquidEngine({
 > 
 > **事实**：`steps` 仅包含**当前步骤之前**执行的步骤结果，不能访问当前步骤和后续步骤。
 
-> **误解 6**：`layout_content` 是一个普通变量
+> **误解 6**：`layout_content` 是一个普通变量，值为 "content"
 > 
-> **事实**：`layout_content` 是布局特有的必需变量，实际值为 `LAYOUT_CONTENT_VARIABLE = 'content'`，无需命名空间，且仅在布局编辑/渲染时可用。
+> **事实**：`layout_content` 是布局特有的必需变量，常量名为 `content`，**渲染时实际值为邮件正文 HTML 字符串**，不是常量 "content"。
+
+> **误解 7**：所有系统内置变量在触发校验时都会被豁免
+> 
+> **事实**：只有 `TemplateSystemVariables` 列表中的 6 个变量（`subscriber`, `step`, `branding`, `tenant`, `preheader`, `actor`）会被豁免。`workflow`, `steps`, `env`, `context`, `content` **不被豁免**，如果声明为 required 会触发校验错误。
+
+> **误解 8**：校验期 Schema 中定义的变量，渲染期一定会注入
+> 
+> **事实**：`branding`, `tenant`, `actor` 在校验期 Schema 中未定义，但渲染期会实际注入。反之，校验期 Schema 中定义的 `workflow` 等字段是子集，渲染期注入的是完整 DB 对象。
+
+> **误解 9**："系统变量"就是 `TemplateSystemVariables` 列表
+> 
+> **事实**："系统变量"有三层含义：
+> 1. 渲染期系统注入变量（11 个）
+> 2. `TemplateSystemVariables` 列表（仅 6 个）
+> 3. 触发校验豁免变量（等同于列表，仅 6 个）
+> 
+> 不要混淆这三层含义。`workflow`, `steps`, `env`, `context`, `content` 是系统注入变量，但不在列表中，也不被豁免。
+
+> **误解 10**：`branding`, `tenant`, `actor` 在 Schema 中定义了，所以可以直接用
+> 
+> **事实**：`branding`, `tenant`, `actor` **不在校验期 Schema 中定义**。它们能正常使用是因为：
+> 1. 渲染期会实际注入这些变量
+> 2. Liquid 校验时的宽松匹配或特殊处理
+> 
+> 但从严格的 Schema 定义角度，它们是缺失的。
+
+> **误解 11**：`layout_content` 是系统变量，会被豁免校验
+> 
+> **事实**：`layout_content`（实际变量名 `content`）**不在 `TemplateSystemVariables` 列表中**，不会被豁免。如果在布局 variables 中声明为 `required: true`，触发时会校验失败。
+
+> **误解 12**：所有 TemplateSystemVariables 都在 Schema 中定义了
+> 
+> **事实**：TemplateSystemVariables 的 6 个变量中，只有 `subscriber` 在校验期 Schema 中明确定义。`step`, `branding`, `tenant`, `actor`, `preheader` 都不在 Schema 中定义，但渲染期会注入。
 
 ---
 
-## 八、校验阶段对比总结
+## 九、校验阶段对比总结
 
 | 阶段 | 触发时机 | 严格程度 | 失败后果 | 主要校验内容 |
 |------|----------|----------|----------|--------------|
@@ -708,12 +1026,12 @@ this.liquidEngine = createLiquidEngine({
 | 2. 保存时 | 点击保存时 | ⭐⭐⭐⭐ | 阻止保存 | 格式、必需变量、合法性 |
 | 3. 构建时 | 编辑工作流时 | ⭐⭐⭐ | 显示警告，前端状态变 ERROR | Schema、Liquid、自定义规则 |
 | **4.1 触发时-Schema** | 调用 Trigger API，`validatePayload=true` | ⭐⭐⭐⭐⭐ | 返回 400 错误 | 完整 JSON Schema 校验 |
-| **4.2 触发时-必填** | 调用 Trigger API，始终执行 | ⭐⭐⭐⭐ | 返回 400 错误 | 必填变量存在性、类型匹配 |
+| **4.2 触发时-必填** | 调用 Trigger API，始终执行 | ⭐⭐⭐⭐ | 返回 400 错误 | 必填变量存在性、类型匹配（仅豁免 6 个系统变量） |
 | 5. 渲染时 | Worker 实际发送前 | ⭐ | 尽可能渲染 | undefined/null 兜底为空 |
 
 ---
 
-## 九、常见疑惑解答
+## 十、常见疑惑解答
 
 ### Q1: 为什么编辑时提示变量不存在，但触发时还能正常发送？
 
@@ -725,21 +1043,33 @@ this.liquidEngine = createLiquidEngine({
 1. **Schema 默认值**：在**阶段 4.1** 由 AJV 根据 `payloadSchema` 中的 `default` 字段填充
 2. **变量默认值**：在**阶段 4.2** 通过 `fillDefaults()` 根据 `ITemplateVariable.defaultValue` 填充
 
-两者都在触发入口处执行，且都被用户传入的 payload 覆盖（用户值优先级更高）。
+两者都在触发入口处执行，且都被用户传入的 payload 覆盖（用户值优先级更高）。注意：**系统变量（TemplateSystemVariables）的默认值会被忽略**，不会填充。
 
 ### Q3: 布局变量和模板变量有什么区别？
 
 **声明方式相同**（都用 `ITemplateVariable[]`），但**校验时机和可用范围不同**：
 - 布局变量在布局保存时校验（阶段 2）
 - 模板变量在触发时校验（阶段 4.2）
-- 布局特有 `layout_content` 变量，模板特有 `workflow`、`steps` 变量
+- 布局特有 `content`（`layout_content`）变量，模板特有 `workflow`、`steps`、`step`、`preheader` 变量
 
 ### Q4: 为什么 `{{ subscriber.firstName }}` 不需要声明也能通过校验？
 
-因为 `subscriber`、`step`、`branding`、`tenant`、`actor`、`preheader`、`workflow`、`steps`、`env`、`context` 是**系统内置变量**：
-- 在 `variableSchema` 中自动包含，阶段 1/3 校验通过
-- 在阶段 4.2 中通过 `isSystemVariable()` 跳过必填检查
-- 实际值在渲染时由 Worker 动态注入
+因为 `subscriber`、`step`、`branding`、`tenant`、`actor`、`preheader` 是 **TemplateSystemVariables**，但它们的处理方式分为两类：
+
+#### 第一类：在校验期 Schema 中定义
+- `subscriber`：在 `variableSchema` 中明确定义，阶段 1/3 校验通过
+
+#### 第二类：在校验期 Schema 中**未定义**，但渲染期会注入
+- `step`、`branding`、`tenant`、`actor`、`preheader`：**不在校验期 Schema 中**，但由于 Liquid 校验时的特殊处理（或 Schema 的宽松匹配），编辑时不会报错
+
+#### 共性：触发校验豁免
+- 所有 6 个变量在阶段 4.2 中都通过 `isSystemVariable()` 跳过必填检查
+- 实际值都在渲染时由 Worker 动态注入
+
+> **⚠️ 重要澄清**：
+> - 不要误以为所有 TemplateSystemVariables 都在 Schema 中定义
+> - `step`、`branding`、`tenant`、`actor`、`preheader` 在校验期 Schema 中是缺失的
+> - `workflow`、`steps`、`env`、`context` 不在 TemplateSystemVariables 中，虽然校验期 Schema 包含它们，但**不会**豁免必填校验
 
 ### Q5: 渲染时变量是 `undefined`，为什么没有报错？
 
@@ -764,9 +1094,10 @@ this.liquidEngine = createLiquidEngine({
 
 - 布局内容**必须**包含 `{{ layout_content }}` 变量
 - 该变量**不需要命名空间**，直接使用 `{{ layout_content }}`
-- 实际常量值为 `content`（`LAYOUT_CONTENT_VARIABLE`）
-- 渲染时会被替换为实际邮件模板内容
+- 实际常量名为 `content`（`LAYOUT_CONTENT_VARIABLE`）
+- **渲染时实际值为邮件正文 HTML 字符串**，不是常量 "content"
 - 仅在布局编辑/渲染时可用，模板中不可用
+- 不在 TemplateSystemVariables 中，声明为 required 会被校验
 
 ### Q10: 如何在模板中访问 Digest 聚合的事件？
 
@@ -784,19 +1115,77 @@ this.liquidEngine = createLiquidEngine({
 - `steps.digest-step.events[0].payload` - 第一个事件的 payload
 - `steps.digest-step.eventCount` - 事件总数
 
+### Q11: 哪些系统变量在触发校验时会被豁免？
+
+首先必须澄清：**"系统变量"≠"会被豁免"**。"系统变量"有三层含义，只有中间那层才与豁免相关：
+
+| 概念 | 范围 | 是否被豁免 |
+|------|------|----------|
+| 渲染期系统注入变量 | 11 个：`subscriber`, `step`, `branding`, `tenant`, `actor`, `preheader`, `workflow`, `steps`, `env`, `context`, `content` | 仅 6 个被豁免 |
+| **`TemplateSystemVariables` 列表** | **仅 6 个**：`['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor']` | ✅ 全部被豁免 |
+| 触发校验豁免变量 | 等同于 `TemplateSystemVariables` 列表 | ✅ |
+
+#### ✅ 会被豁免的变量（仅 6 个）：
+- `subscriber.*`
+- `step.*`（旧版兼容变量）
+- `branding.*`
+- `tenant.*`
+- `preheader`
+- `actor.*`
+
+#### ❌ 不会被豁免的变量（即使是系统注入的）：
+- `workflow.*` —— 系统注入，但不在 TemplateSystemVariables 中
+- `steps.*` —— 系统注入，但不在 TemplateSystemVariables 中
+- `env.*` —— 系统注入，但不在 TemplateSystemVariables 中
+- `context.*` —— 系统注入，但不在 TemplateSystemVariables 中
+- `content`（`layout_content`）—— 系统注入，但不在 TemplateSystemVariables 中
+
+> **💡 记忆技巧**：豁免清单 = `TemplateSystemVariables` = 6 个变量，一个不多一个不少。
+
+### Q12: 校验期可用变量和渲染期注入变量有什么区别？
+
+这是两个**本质不同**的概念，界限必须严格区分：
+
+| 维度 | 校验期可用变量 | 渲染期注入变量 |
+|------|--------------|--------------|
+| **本质** | JSON Schema 元数据，定义"**可以用什么**" | 真实数据对象，提供"**实际值是什么**" |
+| **存在形式** | 内存中的 Schema 对象，仅含字段名和类型 | 运行时数据对象，包含完整字段值 |
+| **构建时机** | 编辑/保存/构建时动态生成 | Worker 发送消息时动态构建 |
+| **Liquid 模式** | 配合 `strictVariables: true` 严格校验 | 配合 `strictVariables: false` 宽松渲染 |
+
+#### 按命名空间的关键差异：
+
+| 命名空间 | 校验期 Schema 定义 | 渲染期实际注入 |
+|----------|------------------|--------------|
+| **`workflow`** | 仅 5 个字段：`workflowId`, `name`, `description`, `tags`, `severity` | 完整数据库对象，含 `_id`, `createdAt`, `steps` 等 |
+| **`steps`** | 仅前置步骤的 Schema 定义 | 初始 `{}`，执行后逐步填充实际结果 |
+| **`env`** | 仅键名列表（类型均为 string） | 完整键值对，含用户自定义 + 系统内置变量 |
+| **`step`** | ❌ 不在 Schema 中 | ✅ 注入 `{ digest, events, total_count }` |
+| **`branding`** | ❌ 不在 Schema 中 | ✅ 注入 `{ logo, color }` |
+| **`tenant`** | ❌ 不在 Schema 中 | ✅ 作为独立顶级变量注入 |
+| **`actor`** | ❌ 不在 Schema 中 | ✅ 作为独立顶级变量注入 |
+| **`preheader`** | ❌ 不在 Schema 中 | ✅ 注入邮件预览文本 |
+| **`content`** | ✅ 定义为 string 类型 | ✅ 注入渲染后的 HTML 字符串 |
+
+> **核心结论**：Schema ≠ 实际注入。不能假设 Schema 中有的渲染期一定有值，也不能假设 Schema 中没有的渲染期一定不可用。
+
 ---
 
-## 十、关键代码索引
+## 十一、关键代码索引
 
 | 功能模块 | 文件路径 |
 |----------|----------|
 | 变量接口定义 | `packages/shared/src/types/message-templates.ts:23-28` |
-| 系统变量列表 | `packages/shared/src/entities/message-template/message-template.interface.ts:54-90` |
+| TemplateSystemVariables 列表 | `packages/shared/src/entities/message-template/message-template.interface.ts:54` |
 | LAYOUT_CONTENT_VARIABLE 常量 | `packages/shared/src/consts/layouts.ts:1` |
 | 工作流 `validatePayload` 字段 | `libs/dal/src/repositories/notification-template/notification-template.entity.ts:92` |
 | **命名空间 Schema 构建** | `libs/application-generic/src/utils/create-schema.ts` |
 | **模板变量 Schema 构建** | `libs/application-generic/src/usecases/build-variable-schema/build-available-variable-schema.usecase.ts` |
 | **布局变量 Schema 构建** | `libs/application-generic/src/usecases/layout-variables-schema/layout-variables-schema.usecase.ts` |
+| **FullPayloadForRender 接口** | `apps/api/src/app/environments-v1/usecases/output-renderers/render-command.ts:11-24` |
+| **渲染期变量注入** | `apps/api/src/app/environments-v1/usecases/construct-framework-workflow/construct-framework-workflow.usecase.ts:144-163` |
+| **layout_content 实际值注入** | `apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts:402-413` |
+| **Worker 旧版变量构建** | `apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts:453-465` |
 | 前端校验 Hook | `apps/dashboard/src/components/variable/hooks/use-variable-validation.ts` |
 | Liquid 变量解析 | `libs/application-generic/src/utils/template-parser/new-liquid-parser.ts` |
 | Schema + Liquid 校验 | `libs/application-generic/src/utils/issues.ts` |
@@ -805,6 +1194,7 @@ this.liquidEngine = createLiquidEngine({
 | 工作流状态计算 | `libs/application-generic/src/utils/compute-workflow-status.ts` |
 | **触发时 Schema 校验** | `apps/api/src/app/events/usecases/parse-event-request/parse-event-request.usecase.ts:138-157` |
 | **触发时必填变量校验** | `libs/application-generic/src/services/verify-payload.service.ts` |
+| **系统变量豁免逻辑** | `libs/application-generic/src/services/verify-payload.service.ts:71-73` |
 | Payload 校验异常 | `apps/api/src/app/events/exceptions/payload-validation-exception.ts` |
 | 触发事件入口 | `libs/application-generic/src/usecases/trigger-event/trigger-event.usecase.ts` |
 | Liquid 引擎工厂 | `packages/framework/src/utils/liquid.utils.ts` |
