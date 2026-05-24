@@ -1,6 +1,6 @@
 # 模板与布局变量校验机制详解
 
-本文档详细说明 Novu 系统中模板（Template）与布局（Layout）的变量声明、校验时机、完整校验链路以及渲染期的兜底逻辑。
+本文档详细说明 Novu 系统中模板（Template）与布局（Layout）的变量声明、完整命名空间范围、校验时机、完整校验链路以及渲染期的兜底逻辑。
 
 ---
 
@@ -28,14 +28,6 @@ export interface ITemplateVariable {
 | 消息模板 | `IMessageTemplate` | `variables?: ITemplateVariable[]` |
 | 布局 | `ILayoutEntity` / `LayoutDto` | `variables?: ITemplateVariable[]` |
 
-**系统内置变量**（无需声明）：
-`packages/shared/src/entities/message-template/message-template.interface.ts:54-90`
-- `subscriber` - 订阅者信息（firstName, lastName, email, phone 等）
-- `actor` - 执行者信息
-- `step` - 步骤信息（digest, events, total_count）
-- `branding` - 品牌信息（logo, color）
-- `tenant` - 租户信息（name, data）
-
 ### 1.3 Payload Schema 与 `validatePayload` 开关
 
 工作流级别的 Payload Schema 校验是可选的，由两个字段共同控制：
@@ -50,7 +42,259 @@ export interface ITemplateVariable {
 
 ---
 
-## 二、完整校验链路总览
+## 二、完整命名空间范围说明
+
+### 2.1 全部可用命名空间总览
+
+系统支持以下 10 个命名空间，分为**模板通用**和**布局特有**两类：
+
+| 命名空间 | 模板可用 | 布局可用 | 说明 |
+|----------|---------|---------|------|
+| `payload` | ✅ | ✅ | 触发时传入的自定义数据 |
+| `subscriber` | ✅ | ✅ | 订阅者信息 |
+| `context` | ✅ | ✅ | 上下文数据（tenant、actor 等） |
+| `workflow` | ✅ | ❌ | 工作流元数据 |
+| `steps` | ✅ | ❌ | 前置步骤执行结果 |
+| `env` | ✅ | ✅ | 环境变量（用户自定义 + 系统内置） |
+| `step` | ✅ | ❌ | 兼容旧版步骤变量（digest/events/total_count） |
+| `branding` | ✅ | ✅ | 品牌信息 |
+| `tenant` | ✅ | ✅ | 租户信息 |
+| `actor` | ✅ | ✅ | 执行者信息 |
+| `preheader` | ✅ | ❌ | 邮件预览文本 |
+| `layout_content` | ❌ | ✅ | 布局内容占位符（布局特有） |
+
+### 2.2 编辑期 vs 构建期变量范围
+
+编辑期和构建期使用相同的 `variableSchema` 构建逻辑，但范围存在关键差异：
+
+#### 模板编辑/构建期 Schema 构建
+
+**核心代码**：`libs/application-generic/src/usecases/build-variable-schema/build-available-variable-schema.usecase.ts:113-128`
+
+```typescript
+return {
+  type: JsonSchemaTypeEnum.OBJECT,
+  properties: {
+    workflow: buildWorkflowSchema(),              // 工作流元数据
+    subscriber: buildSubscriberSchema(finalSubscriber), // 订阅者
+    steps: buildPreviousStepsSchema({...}),       // 仅前置步骤结果
+    payload: await this.resolvePayloadSchema(...),// payload 结构
+    context: buildContextSchema(finalContext),    // 上下文
+    env: buildEnvSchema(envVars),                 // 环境变量
+  },
+  additionalProperties: false,
+};
+```
+
+#### 布局编辑/构建期 Schema 构建
+
+**核心代码**：`libs/application-generic/src/usecases/layout-variables-schema/layout-variables-schema.usecase.ts:41-52`
+
+```typescript
+return {
+  type: JsonSchemaTypeEnum.OBJECT,
+  properties: {
+    subscriber: buildSubscriberSchema(subscriber),
+    [LAYOUT_CONTENT_VARIABLE]: {                  // 布局特有 content 变量
+      type: JsonSchemaTypeEnum.STRING,
+    },
+    context: buildContextSchema(context),
+    env: buildEnvSchema(envVars),
+  },
+  additionalProperties: false,
+};
+```
+
+#### 关键范围差异
+
+| 差异点 | 说明 |
+|--------|------|
+| **steps 范围** | 仅包含**当前步骤之前**执行的步骤，不包含后续步骤。例如步骤 3 只能访问 steps.step1 和 steps.step2，不能访问 steps.step3 或 steps.step4 |
+| **workflow** | 仅模板可用，布局不可用 |
+| **layout_content** | 仅布局可用，模板不可用 |
+| **steps.digest** | Digest 步骤的 `events` 字段有特殊处理，支持 `steps.digest-step.events[0].payload` 格式 |
+
+---
+
+## 三、系统内置变量完整清单
+
+### 3.1 `TemplateSystemVariables` 列表
+
+**定义位置**：`packages/shared/src/entities/message-template/message-template.interface.ts:54`
+
+```typescript
+export const TemplateSystemVariables = ['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor'];
+```
+
+### 3.2 完整内置变量详细说明
+
+#### 1. `workflow` - 工作流元数据
+
+**Schema 定义**：`libs/application-generic/src/utils/create-schema.ts:94-112`
+
+```typescript
+{
+  workflowId: string;      // 工作流标识符
+  name: string;            // 工作流名称
+  description: string;     // 工作流描述
+  tags: string[];          // 标签数组
+  severity: SeverityLevelEnum; // 严重级别 (critical/warning/info)
+}
+```
+
+**必填字段**：`workflowId`, `name`
+
+#### 2. `subscriber` - 订阅者信息
+
+**Schema 定义**：`libs/application-generic/src/utils/create-schema.ts:63-92`
+
+```typescript
+{
+  firstName: string;       // 名
+  lastName: string;        // 姓
+  email: string;           // 邮箱
+  phone: string;           // 电话（可选）
+  avatar: string;          // 头像 URL（可选）
+  locale: string;          // 语言区域（可选）
+  timezone: string;        // 时区（可选）
+  subscriberId: string;    // 订阅者唯一标识
+  isOnline: boolean;       // 是否在线（可选）
+  lastOnlineAt: string;    // 最后在线时间（可选）
+  data: Record<string, any>; // 自定义数据
+}
+```
+
+**必填字段**：`subscriberId`
+
+#### 3. `steps` - 前置步骤结果
+
+**Schema 定义**：`build-available-variable-schema.usecase.ts:217-281`
+
+```typescript
+// 格式：steps.{stepId}.{property}
+{
+  [stepId]: {
+    // 根据 stepType 动态生成
+    // Digest 步骤特殊结构：
+    events: Array<{
+      id: string;
+      time: string;         // ISO 时间
+      payload: any;         // 事件 payload
+    }>;
+    eventCount: number;     // 事件数量
+  }
+}
+```
+
+**Digest 步骤特殊变量**：
+- `steps.digest-step.events` - 聚合的事件数组
+- `steps.digest-step.events[0].payload` - 第一个事件的 payload
+- `steps.digest-step.eventCount` - 事件总数
+
+**HTTP 请求步骤**：
+- 根据 `responseBodySchema` 动态生成可访问字段
+
+#### 4. `env` - 环境变量
+
+**Schema 定义**：`libs/application-generic/src/utils/create-schema.ts:114-128`
+
+包含两类变量：
+1. **用户自定义环境变量** - 在环境设置中配置的键值对
+2. **系统内置环境变量**：
+   - `env.name` - 环境名称（如 "Production", "Development"）
+   - `env.type` - 环境类型
+
+#### 5. `context` - 上下文数据
+
+**Schema 定义**：`libs/application-generic/src/utils/create-schema.ts:130-198`
+
+```typescript
+{
+  [entityType]: {
+    id: string;            // 上下文实体标识
+    data: Record<string, any>; // 实体数据
+  }
+}
+```
+
+常见实体类型：
+- `context.tenant` - 租户上下文
+- `context.actor` - 执行者上下文
+
+#### 6. `step` - 兼容旧版步骤变量
+
+**SystemVariablesWithTypes 定义**：`message-template.interface.ts:75-79`
+
+```typescript
+{
+  digest: boolean;         // 是否为 digest 聚合
+  events: array;           // 事件数组
+  total_count: number;     // 事件总数
+}
+```
+
+> **注意**：这是旧版兼容变量，推荐使用 `steps.{stepId}` 格式访问特定步骤结果。
+
+#### 7. `branding` - 品牌信息
+
+**SystemVariablesWithTypes 定义**：`message-template.interface.ts:80-83`
+
+```typescript
+{
+  logo: string;            // Logo URL
+  color: string;           // 品牌主色
+}
+```
+
+#### 8. `tenant` - 租户信息
+
+**SystemVariablesWithTypes 定义**：`message-template.interface.ts:84-87`
+
+```typescript
+{
+  name: string;            // 租户名称
+  data: object;            // 租户自定义数据
+}
+```
+
+#### 9. `actor` - 执行者信息
+
+**SystemVariablesWithTypes 定义**：`message-template.interface.ts:66-74`
+
+```typescript
+{
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  avatar: string;
+  locale: string;
+  subscriberId: string;
+}
+```
+
+#### 10. `preheader` - 邮件预览文本
+
+**类型**：`string`
+
+邮件收件人列表中显示的预览文本。
+
+#### 11. `layout_content` - 布局内容占位符（布局特有）
+
+**常量定义**：`packages/shared/src/consts/layouts.ts:1`
+
+```typescript
+export const LAYOUT_CONTENT_VARIABLE = 'content';
+```
+
+- **类型**：`string`
+- **用途**：标记邮件正文在布局中的插入位置
+- **校验要求**：布局内容必须包含此变量（HTML 或 Maily JSON 格式）
+- **渲染时**：被替换为实际邮件模板内容
+
+---
+
+## 四、完整校验链路总览
 
 变量校验分布在**编辑 → 保存 → 构建 → 触发 → 渲染**五个阶段，形成层层递进的防护链。其中**触发阶段又分为两层独立校验**。
 
@@ -80,7 +324,7 @@ API 触发 /events/trigger
 
 ---
 
-## 三、各阶段校验详细说明
+## 五、各阶段校验详细说明
 
 ### 阶段 1：前端编辑实时校验
 
@@ -91,13 +335,15 @@ API 触发 /events/trigger
 - `libs/application-generic/src/utils/issues.ts:195-258` (`processControlValuesByLiquid`)
 
 **校验内容**：
-1. **命名空间校验**：变量必须以 `payload.` / `subscriber.` / `context.` 开头
+1. **命名空间校验**：变量必须以 `payload.` / `subscriber.` / `context.` / `workflow.` / `steps.` / `env.` 开头
    - 无命名空间的单段变量会提示 `invalid or missing namespace`
+   - 例外：`layout_content`（布局特有，无需命名空间）
    - 建议补全：`Did you mean {{payload.xxx}}?`
 
 2. **Schema 存在性校验**：`payload.` 开头的变量必须在 Payload Schema 中声明
    - 通过 `isPropertyAllowed()` 递归校验属性路径 `new-liquid-parser.ts:174-232`
    - 支持数组索引 `payload.items[0].name`
+   - 支持 digest 事件特殊格式 `steps.digest-step.events[0].payload`
 
 3. **过滤器有效性校验**：校验 Liquid 过滤器参数合法性
    - 如 `toSentence`、`digest`、`pluralize` 等过滤器的参数
@@ -105,8 +351,7 @@ API 触发 /events/trigger
 4. **语法正确性校验**：
    - 变量不能包含空格（`contains whitespaces` 错误）
    - Liquid 语法正确性（通过 `parserEngine.parse()` 校验）
-
----
+   - 布局特有：`{{ layout_content }}` 变量存在性
 
 ### 阶段 2：保存/更新时校验
 
@@ -129,8 +374,6 @@ API 触发 /events/trigger
 4. **Liquid 变量校验**：同阶段 1 的变量合法性校验
 
 **校验失败处理**：抛出 `BadRequestException`，阻止保存。
-
----
 
 ### 阶段 3：工作流构建时校验
 
@@ -181,8 +424,6 @@ export function computeWorkflowStatus(workflowActive: boolean, steps: Notificati
 ```
 
 > **重要**：`issues` 仅影响前端显示状态（ERROR），**不阻止 API 触发**。只有 `active=false` 会真正阻止触发。
-
----
 
 ### 阶段 4：触发时校验（核心重点 - 两层校验）
 
@@ -281,7 +522,16 @@ verifyPayload(variables: ITemplateVariable[], payload: Record<string, unknown>) 
     v => v.defaultValue != null && !isSystemVariable(v.name)
   ));
 }
+
+// 系统变量判断逻辑
+isSystemVariable(variableName: string) {
+  const prefix = variableName.includes('.') ? variableName.split('.')[0] : variableName;
+  return TemplateSystemVariables.includes(prefix);
+}
 ```
+
+**系统变量豁免清单**（`TemplateSystemVariables`）：
+`['subscriber', 'step', 'branding', 'tenant', 'preheader', 'actor']`
 
 **关键特性**：
 - **系统变量豁免**：`subscriber.*`、`step.*` 等内置变量跳过校验
@@ -307,8 +557,6 @@ verifyPayload(variables: ITemplateVariable[], payload: Record<string, unknown>) 
 - `TENANT_MISSING` - 租户不存在
 - `INVALID_RECIPIENTS` - 接收者全部无效
 
----
-
 ### 阶段 5：渲染时校验与兜底
 
 **触发时机**：实际渲染消息内容时（Worker 进程中）
@@ -319,11 +567,11 @@ verifyPayload(variables: ITemplateVariable[], payload: Record<string, unknown>) 
 
 ---
 
-## 四、渲染期兜底策略详解
+## 六、渲染期兜底策略详解
 
 渲染阶段是最后一道防线，采用"容错优先"策略，确保消息尽可能发送成功。
 
-### 4.1 Liquid 引擎配置差异
+### 6.1 Liquid 引擎配置差异
 
 系统中有两种不同配置的 Liquid 引擎实例：
 
@@ -350,7 +598,7 @@ createLiquidEngine({
 });
 ```
 
-### 4.2 `undefined` / `null` 变量处理
+### 6.2 `undefined` / `null` 变量处理
 
 **核心兜底逻辑**在 `defaultOutputEscape` 函数中：
 
@@ -377,7 +625,7 @@ export function defaultOutputEscape(output: unknown): string {
 - `{{ payload.objVar }}` → 渲染为 `{'key':'value'}`（单引号 JSON）
 - `{{ payload.arrVar }}` → 渲染为 `[1,2,3]`（单引号 JSON）
 
-### 4.3 邮件渲染的特殊处理
+### 6.3 邮件渲染的特殊处理
 
 邮件渲染使用自定义 `outputEscape`，避免破坏 HTML 结构：
 
@@ -395,7 +643,7 @@ this.liquidEngine = createLiquidEngine({
 });
 ```
 
-### 4.4 异常兜底
+### 6.4 异常兜底
 
 渲染过程中的异常处理策略：
 
@@ -408,9 +656,9 @@ this.liquidEngine = createLiquidEngine({
 
 ---
 
-## 五、触发入口校验与执行期校验的边界澄清
+## 七、触发入口校验与执行期校验的边界澄清
 
-### 5.1 两层校验的对比
+### 7.1 两层校验的对比
 
 | 维度 | 阶段 4.1：请求侧 Schema 校验 | 阶段 4.2：执行侧变量校验 |
 |------|----------------------------|------------------------|
@@ -424,7 +672,7 @@ this.liquidEngine = createLiquidEngine({
 | **执行时机** | 入队前同步 | 入队前同步 |
 | **系统变量** | 不区分，全部校验 | 跳过系统变量 |
 
-### 5.2 关键边界澄清
+### 7.2 关键边界澄清
 
 > **误解 1**：Schema 校验在 Worker 执行期执行
 > 
@@ -442,9 +690,17 @@ this.liquidEngine = createLiquidEngine({
 > 
 > **事实**：Worker 中没有变量校验逻辑，直接进入渲染。变量缺失会被渲染阶段的宽松模式兜底为空字符串。
 
+> **误解 5**：`steps` 命名空间可以访问所有步骤
+> 
+> **事实**：`steps` 仅包含**当前步骤之前**执行的步骤结果，不能访问当前步骤和后续步骤。
+
+> **误解 6**：`layout_content` 是一个普通变量
+> 
+> **事实**：`layout_content` 是布局特有的必需变量，实际值为 `LAYOUT_CONTENT_VARIABLE = 'content'`，无需命名空间，且仅在布局编辑/渲染时可用。
+
 ---
 
-## 六、校验阶段对比总结
+## 八、校验阶段对比总结
 
 | 阶段 | 触发时机 | 严格程度 | 失败后果 | 主要校验内容 |
 |------|----------|----------|----------|--------------|
@@ -457,7 +713,7 @@ this.liquidEngine = createLiquidEngine({
 
 ---
 
-## 七、常见疑惑解答
+## 九、常见疑惑解答
 
 ### Q1: 为什么编辑时提示变量不存在，但触发时还能正常发送？
 
@@ -473,13 +729,14 @@ this.liquidEngine = createLiquidEngine({
 
 ### Q3: 布局变量和模板变量有什么区别？
 
-**声明方式相同**（都用 `ITemplateVariable[]`），但**校验时机不同**：
+**声明方式相同**（都用 `ITemplateVariable[]`），但**校验时机和可用范围不同**：
 - 布局变量在布局保存时校验（阶段 2）
 - 模板变量在触发时校验（阶段 4.2）
+- 布局特有 `layout_content` 变量，模板特有 `workflow`、`steps` 变量
 
 ### Q4: 为什么 `{{ subscriber.firstName }}` 不需要声明也能通过校验？
 
-因为 `subscriber`、`step`、`branding`、`tenant`、`actor` 是**系统内置变量**：
+因为 `subscriber`、`step`、`branding`、`tenant`、`actor`、`preheader`、`workflow`、`steps`、`env`、`context` 是**系统内置变量**：
 - 在 `variableSchema` 中自动包含，阶段 1/3 校验通过
 - 在阶段 4.2 中通过 `isSystemVariable()` 跳过必填检查
 - 实际值在渲染时由 Worker 动态注入
@@ -496,14 +753,50 @@ this.liquidEngine = createLiquidEngine({
 
 会。`validatePayload` 只控制阶段 4.1 的 Schema 校验，阶段 4.2 的必填变量检查（基于 `ITemplateVariable.required`）始终执行，不可关闭。
 
+### Q8: `steps` 命名空间可以访问哪些步骤？
+
+`steps` 仅包含**当前步骤之前**执行的步骤。例如：
+- 工作流顺序：step1 → step2 → step3 → step4
+- 在 step3 中，`steps` 包含 step1 和 step2 的结果
+- 在 step3 中，**不能**访问 steps.step3（当前步骤）或 steps.step4（后续步骤）
+
+### Q9: `layout_content` 变量有什么特殊要求？
+
+- 布局内容**必须**包含 `{{ layout_content }}` 变量
+- 该变量**不需要命名空间**，直接使用 `{{ layout_content }}`
+- 实际常量值为 `content`（`LAYOUT_CONTENT_VARIABLE`）
+- 渲染时会被替换为实际邮件模板内容
+- 仅在布局编辑/渲染时可用，模板中不可用
+
+### Q10: 如何在模板中访问 Digest 聚合的事件？
+
+使用 `steps.{digestStepId}.events` 变量：
+```liquid
+{% for event in steps.digest-step.events %}
+  #{{ forloop.index }}: {{ event.payload.title }}
+{% endfor %}
+
+共 {{ steps.digest-step.eventCount }} 条更新
+```
+
+支持的格式：
+- `steps.digest-step.events` - 完整事件数组
+- `steps.digest-step.events[0].payload` - 第一个事件的 payload
+- `steps.digest-step.eventCount` - 事件总数
+
 ---
 
-## 八、关键代码索引
+## 十、关键代码索引
 
 | 功能模块 | 文件路径 |
 |----------|----------|
 | 变量接口定义 | `packages/shared/src/types/message-templates.ts:23-28` |
+| 系统变量列表 | `packages/shared/src/entities/message-template/message-template.interface.ts:54-90` |
+| LAYOUT_CONTENT_VARIABLE 常量 | `packages/shared/src/consts/layouts.ts:1` |
 | 工作流 `validatePayload` 字段 | `libs/dal/src/repositories/notification-template/notification-template.entity.ts:92` |
+| **命名空间 Schema 构建** | `libs/application-generic/src/utils/create-schema.ts` |
+| **模板变量 Schema 构建** | `libs/application-generic/src/usecases/build-variable-schema/build-available-variable-schema.usecase.ts` |
+| **布局变量 Schema 构建** | `libs/application-generic/src/usecases/layout-variables-schema/layout-variables-schema.usecase.ts` |
 | 前端校验 Hook | `apps/dashboard/src/components/variable/hooks/use-variable-validation.ts` |
 | Liquid 变量解析 | `libs/application-generic/src/utils/template-parser/new-liquid-parser.ts` |
 | Schema + Liquid 校验 | `libs/application-generic/src/utils/issues.ts` |
@@ -516,5 +809,4 @@ this.liquidEngine = createLiquidEngine({
 | 触发事件入口 | `libs/application-generic/src/usecases/trigger-event/trigger-event.usecase.ts` |
 | Liquid 引擎工厂 | `packages/framework/src/utils/liquid.utils.ts` |
 | 邮件渲染器 | `apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts` |
-| 系统变量列表 | `packages/shared/src/entities/message-template/message-template.interface.ts:54-90` |
 | 触发状态枚举 | `packages/shared/src/types/trigger-event-status.enum.ts` |
