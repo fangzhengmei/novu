@@ -577,76 +577,111 @@ function getControllers() {
 
 ## 八、Roles 在 JWT 和权限守卫中的实际生效路径
 
-### 8.1 社区版路径（实际不生效）
+### 8.1 社区版：roles 在 JWT 中存活但无消费者
 
-```
-邀请发起时 roles 写入 Member 记录
-        ↓
-getSignedToken() 将 member.roles 写入 JWT payload
-        ↓
-JwtStrategy.validate() 直接返回 session（包含 roles）
-        ↓
-CommunityUserAuthGuard 仅校验认证，不读取 roles 或 permissions
-        ↓
-@RequirePermissions() 装饰器设置元数据，但无守卫读取
-        ↓
-结果：所有认证用户都可以访问所有端点
+**JWT 构建阶段：** `apps/api/src/app/auth/services/community.auth.service.ts:236`
+
+```typescript
+public async getSignedToken(user, organizationId?, member?, environmentId?) {
+  const roles: MemberRoleEnum[] = [];
+  if (member && member.roles) {
+    roles.push(...member.roles);  // 从成员记录中取出角色
+  }
+
+  return this.jwtService.sign({
+    _id: user._id,
+    organizationId: organizationId || null,
+    environmentId: environmentId || null,
+    roles,                        // 写入 JWT payload
+  }, { expiresIn: '30 days' });
+}
 ```
 
-**社区版 JWT Strategy：** `apps/api/src/app/auth/services/passport/jwt.strategy.ts`
+**JWT 解码阶段：** passport-jwt 自动将 JWT payload 映射为 `UserSessionData` 对象。由于 payload 中的 key 与类型字段名匹配，`session.roles` 自动获得值，`session.permissions` 为 `undefined`（JWT 中不存在此字段）。
+
+**JwtStrategy.validate()：** `apps/api/src/app/auth/services/passport/jwt.strategy.ts:24`
 
 ```typescript
 async validate(req: http.IncomingMessage, session: UserSessionData) {
   session.scheme = ApiAuthSchemeEnum.BEARER;
-  // 只验证用户存在和组织成员身份，不校验权限
+  // 只验证用户存在 + 是否属于组织，不处理 roles 或 permissions
   const user = await this.authService.validateUser(session);
   session.environmentId = this.resolveEnvironmentId(req, session);
-  return session;  // 直接返回，不处理 roles/permissions
+  return session;  // session.roles 有值，session.permissions 为 undefined
 }
 ```
 
-### 8.2 EE 版路径（完整生效）
+**认证守卫：** `CommunityUserAuthGuard` 仅调用 passport 验证身份，不读取 `session.roles` 或 `session.permissions`。
+
+**权限装饰器：** `@RequirePermissions()` 仅通过 `SetMetadata` 设置元数据，社区版没有对应的 Guard 来读取并校验这些元数据。
+
+**实际生效链路：**
 
 ```
-Clerk/Better-Auth 签发 JWT，包含 org_permissions claim
+Member.roles → getSignedToken() → JWT payload.roles
+    ↓
+passport-jwt 自动映射 → UserSessionData.roles（有值）
+    ↓
+JwtStrategy.validate() → 透传 session，不做权限处理
+    ↓
+CommunityUserAuthGuard → 仅认证，不校验权限
+    ↓
+@RequirePermissions() → 设置元数据，无守卫读取
+    ↓
+唯一使用 roles 的地方：get-members.usecase.ts 中
+    command.user.roles.includes(MemberRoleEnum.OSS_ADMIN)
+```
+
+**结论：** 社区版中，`session.roles` 从 JWT 到会话数据的链路是完整的（roles 确实能到达 UserSessionData），但缺少将 roles 映射为 permissions 并执行校验的守卫。唯一消费 roles 的代码是 `get-members.usecase.ts:15`，用于过滤非管理员可见的数据。
+
+### 8.2 EE 版：完整的 roles → permissions → 校验链路
+
+```
+Clerk/Better-Auth 签发 JWT
+    包含 claims: org_role, org_permissions, org_id
         ↓
-EE JWT Strategy 解析 org_permissions 到 UserSessionData.permissions
+EE JWT Strategy 解析 claims
+    session.roles = org_role
+    session.permissions = org_permissions
         ↓
-EE 权限守卫（@novu/ee-auth）读取 @RequirePermissions() 元数据
+EE 权限守卫（@novu/ee-auth）
+    读取 @RequirePermissions() 元数据
+    校验 session.permissions 是否包含所需权限
         ↓
-校验 session.permissions 是否包含所需权限
-        ↓
-同时检查订阅等级：
-  - Business tier: 完整权限校验
-  - Free/Pro tier: 绕过权限校验（向后兼容）
-  - API Key: 绕过权限校验
+按订阅等级分级：
+  - Business tier: 严格校验，不足返回 403
+  - Free/Pro tier: 跳过校验，返回 200（向后兼容）
+  - API Key: 跳过校验，返回 200
 ```
 
 **EE 权限守卫测试验证：** `apps/api/src/app/auth/e2e/permissions.guard.e2e.ts`
 
 ```typescript
-// Business tier: 权限不足返回 403
+// Business tier + 权限不足 → 403
 expect(response.statusCode).to.equal(403);
 expect(response.body.message).to.include('Insufficient permissions');
 
-// Free/Pro tier: 即使权限不足也返回 200
+// Free/Pro tier + 权限不足 → 200（跳过校验）
 expect(response.statusCode).to.equal(200);
 
-// API Key: 始终返回 200
+// API Key + 任何权限 → 200（跳过校验）
 expect(response.statusCode).to.equal(200);
 ```
 
-### 8.3 UserSessionData 结构对比
+### 8.3 UserSessionData 中 roles/permissions 的来源差异
 
 ```typescript
 export type UserSessionData = {
   _id: string;
   organizationId: string;
-  roles: MemberRoleEnum[];        // 社区版有值但未使用
-  permissions: PermissionsEnum[]; // 仅 EE 版 JWT 会填充
+  roles: MemberRoleEnum[];        // 来源：
+                                  //   社区版: JWT payload.roles（getSignedToken 写入）
+                                  //   EE 版:   JWT claim org_role
+  permissions: PermissionsEnum[]; // 来源：
+                                  //   社区版: undefined（JWT 中无此字段）
+                                  //   EE 版:   JWT claim org_permissions
   scheme: ApiAuthSchemeEnum;
   environmentId: string;
-  // ...
 };
 ```
 
@@ -784,7 +819,7 @@ await this.memberRepository.addMember(organization._id, {
 
 2. **社区版角色硬编码为 OSS_ADMIN**：在 `invites.controller.ts` 中，邀请和批量邀请的角色都硬编码为 `OSS_ADMIN`，前端无法选择角色。EE 版的角色选择逻辑在 `@novu/ee-auth` 模块中。
 
-3. **权限守卫存在于 EE 模块**：社区版的 `CommunityUserAuthGuard` 仅做认证，不做权限校验。`RequirePermissions` 装饰器在社区版中实际不生效（没有守卫读取元数据）。
+3. **权限守卫存在于 EE 模块**：社区版的 `CommunityUserAuthGuard` 仅做认证（JWT/API Key 身份验证），不做权限校验。`@RequirePermissions()` 装饰器在社区版中实际不生效（没有 Guard 读取元数据）。EE 版的 `@novu/ee-auth` 模块提供了完整的权限守卫，会读取 `@RequirePermissions()` 元数据并校验 `session.permissions`。社区版中唯一一处基于角色的逻辑是 `get-members.usecase.ts:15` 中对 `command.user.roles.includes(MemberRoleEnum.OSS_ADMIN)` 的检查，用于非管理员的数据可见性过滤。
 
 4. **API Key 认证绕过角色限制**：通过 API Key 认证的用户自动获得 `ALL_PERMISSIONS`，不受 `ROLE_PERMISSIONS` 映射限制。
 
@@ -792,7 +827,7 @@ await this.memberRepository.addMember(organization._id, {
 
 6. **成员列表数据过滤**：非 OSS_ADMIN 看不到已邀请成员和邮箱，这是服务端的数据过滤，不是权限守卫。
 
-7. **Token 中包含角色数组**：`getSignedToken` 将 member.roles 写入 JWT payload，但社区版 JWT strategy 不解析 roles 到 UserSessionData（仅 EE 版完整解析）。
+7. **社区版 JWT 中 roles 确实能到达 UserSessionData**：`getSignedToken()` 将 `member.roles` 写入 JWT payload，passport-jwt 自动将 payload 映射为 `UserSessionData`，因此 `session.roles` 有值。但社区版缺少将 roles 转换为 permissions 并执行校验的守卫，`session.permissions` 始终为 `undefined`。唯一消费 `session.roles` 的代码是 `get-members.usecase.ts:15`。
 
 8. **接受邀请不校验邮箱**：`AcceptInvite` usecase 不验证当前登录用户邮箱是否等于 `member.invite.email`，存在 token 泄露风险。
 
