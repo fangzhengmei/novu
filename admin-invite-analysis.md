@@ -490,6 +490,7 @@ export function useHasPermission(): CheckAuthorizationWithCustomPermissions {
 | 邀请控制器 | `apps/api/src/app/invites/invites.controller.ts` | L42-L130 |
 | 转换为成员(DAL) | `libs/dal/src/repositories/member/community.member.repository.ts` | L115-L130 |
 | Token 生成(含角色) | `apps/api/src/app/auth/services/community.auth.service.ts` | L236-L267 |
+| 生成用户 Token | `apps/api/src/app/auth/services/community.auth.service.ts` | L219-L234 |
 | 切换组织 | `apps/api/src/app/auth/usecases/switch-organization/switch-organization.usecase.ts` | L14-L32 |
 | 权限装饰器 | `libs/application-generic/src/decorators/permissions.decorator.ts` | L1-L12 |
 | 社区认证守卫 | `apps/api/src/app/auth/framework/community.user.auth.guard.ts` | L1-L48 |
@@ -505,6 +506,10 @@ export function useHasPermission(): CheckAuthorizationWithCustomPermissions {
 | 社区版 JWT Strategy | `apps/api/src/app/auth/services/passport/jwt.strategy.ts` | L24-L54 |
 | 权限守卫测试 | `apps/api/src/app/auth/e2e/permissions.guard.e2e.ts` | L1-L142 |
 | 组织控制器动态加载 | `apps/api/src/app/organization/organization.module.ts` | L34-L40 |
+| Token 生成函数 | `libs/application-generic/src/services/helper-service/helper.service.ts` | L3-L5 |
+| 邮箱规范化函数 | `packages/shared/src/utils/normalizeEmail.ts` | L28-L45 |
+| DAL 按邮箱查找被邀请人 | `libs/dal/src/repositories/member/community.member.repository.ts` | L145-L154 |
+| DAL 按 Token 查找被邀请人 | `libs/dal/src/repositories/member/community.member.repository.ts` | L137-L143 |
 
 ---
 
@@ -813,7 +818,178 @@ await this.memberRepository.addMember(organization._id, {
 
 ---
 
-## 十一、设计要点与注意事项
+## 十一、接受邀请后 Token 的组织选择逻辑不稳定
+
+### 11.1 问题分析
+
+**文件：** `apps/api/src/app/invites/usecases/accept-invite/accept-invite.usecase.ts:51`
+
+```typescript
+return this.authService.generateUserToken(user);  // ⚠️  没有指定组织 ID！
+```
+
+**文件：** `apps/api/src/app/auth/services/community.auth.service.ts:219`
+
+```typescript
+public async generateUserToken(user: UserEntity) {
+  // 查询用户所有活跃组织（按 MongoDB 默认排序，通常是创建时间升序）
+  const userActiveOrganizations = await this.organizationRepository.findUserActiveOrganizations(user._id);
+
+  if (userActiveOrganizations?.length > 0) {
+    const organizationToSwitch = userActiveOrganizations[0];  // ⚠️  总是取第一个组织！
+
+    return this.switchOrganizationUsecase.execute(
+      SwitchOrganizationCommand.create({
+        newOrganizationId: organizationToSwitch._id,
+        userId: user._id,
+      })
+    );
+  }
+
+  return this.getSignedToken(user);  // 没有组织时返回无组织的 token
+}
+```
+
+### 11.2 不稳定的表现
+
+| 场景 | 邀请的组织 | 结果 Token 中的 organizationId | 是否一致 |
+|------|-----------|-------------------------------|---------|
+| 新用户（无组织）接受邀请 | Org-B | null | ❌ 空值 |
+| 已有 1 个组织（Org-A）的用户接受邀请到 Org-B | Org-B | Org-A 的 _id | ❌ 不一致 |
+| 已有 2 个组织（Org-A, Org-B）的用户接受邀请到 Org-C | Org-C | Org-A 的 _id（第一个） | ❌ 不一致 |
+
+**关键问题：** 接受邀请后返回的 Token 中的 `organizationId` **不保证**是被邀请加入的组织。用户可能被"无声"地切换到了另一个组织。
+
+### 11.3 根因
+
+`generateUserToken()` 的设计目标是"生成一个带默认组织的 token"，而不是"生成指定组织的 token"。接受邀请的场景需要后者，但错误地调用了前者。
+
+**正确的调用应该是：**
+
+```typescript
+// 直接为被邀请的组织生成 token，而不是取第一个组织
+return this.authService.getSignedToken(user, this.organizationId, member);
+```
+
+---
+
+## 十二、Invite Token 的唯一性与更新语义风险
+
+### 12.1 Token 生成方式
+
+**文件：** `libs/application-generic/src/services/helper-service/helper.service.ts:3`
+
+```typescript
+export function createGuid(): string {
+  return uuidv1();  // 基于时间戳 + MAC 地址的 UUID v1
+}
+```
+
+### 12.2 数据库层面的唯一性保障
+
+**文件：** `libs/dal/src/repositories/member/community.member.repository.ts:137`
+
+```typescript
+async findByInviteToken(token: string) {
+  return await this.findOne({ 'invite.token': token });  // 仅查询，无唯一索引约束
+}
+```
+
+**风险点：**
+1. **无数据库唯一索引**：`invite.token` 字段没有唯一索引，理论上可能存在重复 token（虽然 UUID v1 冲突概率极低）
+2. **全局搜索而非组织内**：`findByInviteToken` 搜索整个 members 集合，而非限定在某个组织内。如果跨组织出现 token 冲突，可能返回错误的成员记录
+
+### 12.3 更新语义：重发邀请 = 旧 Token 立即失效
+
+**文件：** `apps/api/src/app/invites/usecases/resend-invite/resend-invite.usecase.ts:71`
+
+```typescript
+await this.memberRepository.update(foundInvitee, {
+  memberStatus: MemberStatusEnum.INVITED,
+  invite: {
+    token,              // 新 token 覆盖旧 token
+    _inviterId: command.userId,
+    invitationDate: new Date(),
+  },
+});
+```
+
+**后果：**
+- 旧邮件中的链接立即失效（即使邮件还没被看到）
+- 用户点击旧链接会得到 "No invite found" 错误
+- 没有给旧 token 设置宽限期或多 token 并存机制
+
+### 12.4 并发风险
+
+接受邀请的流程：
+1. `findByInviteToken(token)` 查找成员
+2. 检查 `memberStatus === MemberStatusEnum.INVITED`
+3. 更新为 ACTIVE 并绑定 userId
+
+**问题：** 这三步操作不是原子的。如果同一个 token 被并发请求，可能出现竞态条件（虽然实际影响有限，因为 `_userId` 会被最后一个请求覆盖）。
+
+---
+
+## 十三、邀请邮箱查重与查询的规范化口径差异
+
+### 13.1 normalizeEmail 函数定义
+
+**文件：** `packages/shared/src/utils/normalizeEmail.ts:28`
+
+```typescript
+export function normalizeEmail(email: string): string {
+  if (typeof email !== 'string') throw new TypeError('normalize-email expects a string');
+
+  const lowerCasedEmail = email.toLowerCase();
+  const emailParts = lowerCasedEmail.split(/@/);
+
+  if (emailParts.length !== 2) return email;
+
+  // 规范化逻辑：转小写 + 去除 Gmail 点号 + 去除 + 后缀
+  // ...
+}
+```
+
+### 13.2 三处邮箱操作的规范化差异
+
+| 操作 | 代码位置 | 是否 normalize | 说明 |
+|------|---------|---------------|------|
+| **查重（邀请前）** | `invite-member.usecase.ts:23` → `findInviteeByEmail` | ❌ 否 | 直接用原始 email 查询 `'invite.email': email` |
+| **存储（写入 DB）** | `invite-member.usecase.ts:52` | ❌ 否 | 存储用户输入的原始 email |
+| **查询（查用户）** | `get-invite.usecase.ts:33` → `findByEmail` | ✅ 是 | `normalizeEmail(invitedMember.invite.email)` |
+
+### 13.3 问题表现：重复邀请漏洞
+
+```
+步骤 1: 邀请 Alice@Example.com  →  存储原始邮箱: "Alice@Example.com"
+步骤 2: 邀请 alice@example.com  →  查重用原始邮箱查询，找不到记录
+                             →  ✅ 成功！同一邮箱被重复邀请两次
+```
+
+因为查重时不做 normalize，`Alice@Example.com` 和 `alice@example.com` 被认为是不同的邮箱，可以被重复邀请到同一个组织。
+
+### 13.4 存储与查询不匹配的副作用
+
+`get-invite.usecase.ts:33` 中：
+
+```typescript
+// DB 中存储的是 "Alice@Example.com"（原始）
+// 但查询用户时用 normalize 后的 "alice@example.com"
+const invitedUser = await this.userRepository.findByEmail(normalizeEmail(invitedMember.invite.email));
+```
+
+这意味着：
+- 如果用户注册时邮箱是 `alice@example.com`（规范化存储）
+- 但邀请邮箱是 `Alice@Example.com`（原始存储）
+- 查询时会 normalize 后查询，能正确匹配（这是正确的）
+
+但反过来：
+- 如果用户表没有做邮箱规范化存储
+- 则可能出现匹配失败
+
+---
+
+## 十四、设计要点与注意事项
 
 1. **角色在邀请发起时即已确定**：`InviteMember` usecase 中 `roles` 字段直接写入 Member 记录，接受邀请时不修改角色。这意味着角色选择必须在邀请发起时完成。
 
@@ -834,3 +1010,9 @@ await this.memberRepository.addMember(organization._id, {
 9. **重发邀请丢失 invite.email**：`ResendInvite` usecase 更新 invite 对象时未保留 email 字段，导致数据不一致。
 
 10. **EE 权限校验分级**：Business tier 完整校验权限，Free/Pro tier 绕过权限校验，API Key 始终绕过。
+
+11. **接受邀请后 Token 组织 ID 不稳定**：`generateUserToken()` 总是取用户的第一个组织（按创建时间排序），而非被邀请的组织。新用户甚至会得到无组织的 token（`organizationId: null`）。
+
+12. **Invite Token 无数据库唯一约束**：`invite.token` 字段仅用 UUID v1 保证唯一性，但无数据库唯一索引。跨组织查询时理论上可能返回错误记录。重发邀请会使旧 Token 立即失效，无宽限期。
+
+13. **邮箱规范化口径不一致**：邀请查重和存储时不做 normalize，查询用户时做 normalize。大小写不同的同一邮箱可被重复邀请到同一组织。
