@@ -820,7 +820,24 @@ await this.memberRepository.addMember(organization._id, {
 
 ## 十一、接受邀请后 Token 的组织选择逻辑不稳定
 
-### 11.1 问题分析
+### 11.1 时序分析
+
+**执行顺序：** `apps/api/src/app/invites/usecases/accept-invite/accept-invite.usecase.ts`
+
+```
+1. L43: convertInvitedUserToMember()
+        → 将成员状态从 INVITED → ACTIVE
+        → 绑定 _userId = command.userId
+        → 数据库更新已完成
+
+2. L51: generateUserToken(user)
+        → 内部调用 findUserActiveOrganizations()
+        → findUserActiveMembers() 查询 _userId + memberStatus=ACTIVE
+```
+
+由于 MongoDB 在同一连接上顺序执行读写，步骤 1 的更新在步骤 2 查询时**可见**。
+
+### 11.2 问题分析
 
 **文件：** `apps/api/src/app/invites/usecases/accept-invite/accept-invite.usecase.ts:51`
 
@@ -850,17 +867,19 @@ public async generateUserToken(user: UserEntity) {
 }
 ```
 
-### 11.2 不稳定的表现
+### 11.3 不稳定的表现（修正后）
 
 | 场景 | 邀请的组织 | 结果 Token 中的 organizationId | 是否一致 |
 |------|-----------|-------------------------------|---------|
-| 新用户（无组织）接受邀请 | Org-B | null | ❌ 空值 |
+| 新用户（无组织）接受邀请 | Org-B | Org-B 的 _id | ✅ 一致 |
 | 已有 1 个组织（Org-A）的用户接受邀请到 Org-B | Org-B | Org-A 的 _id | ❌ 不一致 |
 | 已有 2 个组织（Org-A, Org-B）的用户接受邀请到 Org-C | Org-C | Org-A 的 _id（第一个） | ❌ 不一致 |
 
-**关键问题：** 接受邀请后返回的 Token 中的 `organizationId` **不保证**是被邀请加入的组织。用户可能被"无声"地切换到了另一个组织。
+> **修正说明：** 新用户（无任何组织）接受邀请后，`findUserActiveMembers` 能看到刚更新的 ACTIVE 成员记录，因此 `userActiveOrganizations` 包含 1 个组织（被邀请的组织），`organizationId` 不会为 null。之前的"null"结论错误。
 
-### 11.3 根因
+**关键问题：** 接受邀请后返回的 Token 中的 `organizationId` **不保证**是被邀请加入的组织。已有其他组织的用户可能被"无声"地切换到了最早加入的组织。
+
+### 11.4 根因
 
 `generateUserToken()` 的设计目标是"生成一个带默认组织的 token"，而不是"生成指定组织的 token"。接受邀请的场景需要后者，但错误地调用了前者。
 
@@ -870,6 +889,22 @@ public async generateUserToken(user: UserEntity) {
 // 直接为被邀请的组织生成 token，而不是取第一个组织
 return this.authService.getSignedToken(user, this.organizationId, member);
 ```
+
+### 11.5 SwitchOrganizationUsecase 的隐式角色刷新
+
+**文件：** `apps/api/src/app/auth/usecases/switch-organization/switch-organization.usecase.ts:23`
+
+```typescript
+async execute(command: SwitchOrganizationCommand) {
+  const member = await this.memberRepository.findMemberByUserId(
+    command.newOrganizationId, command.userId
+  );
+  // 重新生成带该组织角色的 token
+  return this.authService.getSignedToken(user, command.newOrganizationId, member);
+}
+```
+
+即使 `generateUserToken` 取错了组织，`switchOrganizationUsecase` 也会重新查询该组织的成员记录，确保 token 中的 `roles` 是正确的。但 `organizationId` 仍然是错误的。
 
 ---
 
@@ -1011,7 +1046,7 @@ const invitedUser = await this.userRepository.findByEmail(normalizeEmail(invited
 
 10. **EE 权限校验分级**：Business tier 完整校验权限，Free/Pro tier 绕过权限校验，API Key 始终绕过。
 
-11. **接受邀请后 Token 组织 ID 不稳定**：`generateUserToken()` 总是取用户的第一个组织（按创建时间排序），而非被邀请的组织。新用户甚至会得到无组织的 token（`organizationId: null`）。
+11. **接受邀请后 Token 组织 ID 不稳定**：`generateUserToken()` 总是取用户的第一个组织（按创建时间排序），而非被邀请的组织。已有其他组织的用户可能被无声切换到最早加入的组织。新用户接受邀请后组织 ID 正确（因刚加入的组织是其唯一组织）。
 
 12. **Invite Token 无数据库唯一约束**：`invite.token` 字段仅用 UUID v1 保证唯一性，但无数据库唯一索引。跨组织查询时理论上可能返回错误记录。重发邀请会使旧 Token 立即失效，无宽限期。
 
