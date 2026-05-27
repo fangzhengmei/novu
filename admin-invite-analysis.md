@@ -500,10 +500,285 @@ export function useHasPermission(): CheckAuthorizationWithCustomPermissions {
 | 组织控制器(成员端点) | `apps/api/src/app/organization/organization.controller.ts` | L114-L155 |
 | 前端权限 Hook | `apps/dashboard/src/hooks/use-has-permission.tsx` | L24-L45 |
 | API Key 全权限 | `apps/api/src/app/auth/services/community.auth.service.ts` | L176-L197 |
+| EE 认证开关 | `packages/shared/src/utils/env.ts` | L58-L69 |
+| Auth 装饰器动态路由 | `apps/api/src/app/auth/framework/auth.decorator.ts` | L1-L15 |
+| 社区版 JWT Strategy | `apps/api/src/app/auth/services/passport/jwt.strategy.ts` | L24-L54 |
+| 权限守卫测试 | `apps/api/src/app/auth/e2e/permissions.guard.e2e.ts` | L1-L142 |
+| 组织控制器动态加载 | `apps/api/src/app/organization/organization.module.ts` | L34-L40 |
 
 ---
 
-## 七、设计要点与注意事项
+## 七、社区版与 EE/Better-Auth 实现差异
+
+### 7.1 认证与权限架构差异
+
+| 维度 | 社区版 (Community) | EE 版 (Clerk/Better-Auth) |
+|------|-------------------|------------------------|
+| **身份提供商** | 本地 JWT + GitHub OAuth | Clerk / Better-Auth |
+| **JWT 签发方** | 本地 `JwtService` | Clerk / Better-Auth 服务 |
+| **JWT claims** | `_id`, `organizationId`, `roles` | `_id`, `org_id`, `org_role`, `org_permissions` |
+| **权限来源** | 无（社区版不校验） | `org_permissions` claim |
+| **权限守卫** | 无（仅认证） | EE 权限守卫（按订阅等级启用） |
+| **角色映射** | `ROLE_PERMISSIONS`（定义但未使用） | 由 Clerk/Better-Auth 外部映射 |
+| **组织控制器** | `OrganizationController` | `EEOrganizationController` |
+
+### 7.2 切换开关逻辑
+
+**文件：** `packages/shared/src/utils/env.ts`
+
+```typescript
+// EE 启用条件
+export const isEEAuthEnabled = () =>
+  process.env.NOVU_ENTERPRISE === 'true' || process.env.CI_EE_TEST === 'true';
+
+// Auth Provider 选择
+export const getEEAuthProvider = (): EEAuthProvider => {
+  const provider = process.env.EE_AUTH_PROVIDER as EEAuthProvider | undefined;
+  return provider || 'clerk';
+};
+
+export const isClerkEnabled = () => isEEAuthEnabled() && getEEAuthProvider() === 'clerk';
+export const isBetterAuthEnabled = () => isEEAuthEnabled() && getEEAuthProvider() === 'better-auth';
+```
+
+**文件：** `apps/api/src/app/auth/framework/auth.decorator.ts`
+
+```typescript
+export function RequireAuthentication() {
+  if (isEEAuthEnabled()) {
+    // 加载 EE 版认证守卫（含权限校验）
+    const { RequireAuthentication: EERequireAuthentication } = require('@novu/ee-auth');
+    return EERequireAuthentication();
+  }
+  // 社区版仅认证
+  return applyDecorators(UseGuards(CommunityUserAuthGuard), ApiBearerAuth(...));
+}
+```
+
+### 7.3 控制器差异
+
+**文件：** `apps/api/src/app/organization/organization.module.ts`
+
+```typescript
+function getControllers() {
+  if (isClerkEnabled() || isBetterAuthEnabled()) {
+    return [EEOrganizationController];  // EE 版控制器
+  }
+  return [OrganizationController];       // 社区版控制器
+}
+```
+
+**关键差异：**
+- `EEOrganizationController` 大量使用 `@RequirePermissions()` 装饰器
+- `OrganizationController` 不使用 `@RequirePermissions()`，仅依赖 `@RequireAuthentication()`
+- EE 版支持更多角色（OWNER/ADMIN/AUTHOR/VIEWER），社区版仅 OSS_ADMIN
+
+---
+
+## 八、Roles 在 JWT 和权限守卫中的实际生效路径
+
+### 8.1 社区版路径（实际不生效）
+
+```
+邀请发起时 roles 写入 Member 记录
+        ↓
+getSignedToken() 将 member.roles 写入 JWT payload
+        ↓
+JwtStrategy.validate() 直接返回 session（包含 roles）
+        ↓
+CommunityUserAuthGuard 仅校验认证，不读取 roles 或 permissions
+        ↓
+@RequirePermissions() 装饰器设置元数据，但无守卫读取
+        ↓
+结果：所有认证用户都可以访问所有端点
+```
+
+**社区版 JWT Strategy：** `apps/api/src/app/auth/services/passport/jwt.strategy.ts`
+
+```typescript
+async validate(req: http.IncomingMessage, session: UserSessionData) {
+  session.scheme = ApiAuthSchemeEnum.BEARER;
+  // 只验证用户存在和组织成员身份，不校验权限
+  const user = await this.authService.validateUser(session);
+  session.environmentId = this.resolveEnvironmentId(req, session);
+  return session;  // 直接返回，不处理 roles/permissions
+}
+```
+
+### 8.2 EE 版路径（完整生效）
+
+```
+Clerk/Better-Auth 签发 JWT，包含 org_permissions claim
+        ↓
+EE JWT Strategy 解析 org_permissions 到 UserSessionData.permissions
+        ↓
+EE 权限守卫（@novu/ee-auth）读取 @RequirePermissions() 元数据
+        ↓
+校验 session.permissions 是否包含所需权限
+        ↓
+同时检查订阅等级：
+  - Business tier: 完整权限校验
+  - Free/Pro tier: 绕过权限校验（向后兼容）
+  - API Key: 绕过权限校验
+```
+
+**EE 权限守卫测试验证：** `apps/api/src/app/auth/e2e/permissions.guard.e2e.ts`
+
+```typescript
+// Business tier: 权限不足返回 403
+expect(response.statusCode).to.equal(403);
+expect(response.body.message).to.include('Insufficient permissions');
+
+// Free/Pro tier: 即使权限不足也返回 200
+expect(response.statusCode).to.equal(200);
+
+// API Key: 始终返回 200
+expect(response.statusCode).to.equal(200);
+```
+
+### 8.3 UserSessionData 结构对比
+
+```typescript
+export type UserSessionData = {
+  _id: string;
+  organizationId: string;
+  roles: MemberRoleEnum[];        // 社区版有值但未使用
+  permissions: PermissionsEnum[]; // 仅 EE 版 JWT 会填充
+  scheme: ApiAuthSchemeEnum;
+  environmentId: string;
+  // ...
+};
+```
+
+---
+
+## 九、邀请接受时的邮箱校验缺失
+
+### 9.1 问题分析
+
+**文件：** `apps/api/src/app/invites/usecases/accept-invite/accept-invite.usecase.ts`
+
+```typescript
+async execute(command: AcceptInviteCommand): Promise<string> {
+  const member = await this.memberRepository.findByInviteToken(command.token);
+  if (!member) throw new BadRequestException('No organization found');
+  if (!member.invite) throw new BadRequestException('No active invite found for user');
+
+  const organization = await this.organizationRepository.findById(member._organizationId);
+  const user = await this.userRepository.findById(command.userId);  // 只通过 userId 查找用户
+
+  if (member.memberStatus !== MemberStatusEnum.INVITED)
+    throw new BadRequestException('Token expired');
+
+  // ⚠️  缺失：没有校验 user.email === member.invite.email
+
+  await this.memberRepository.convertInvitedUserToMember(
+    this.organizationId,
+    command.token,
+    {
+      memberStatus: MemberStatusEnum.ACTIVE,
+      _userId: command.userId,  // 直接绑定当前登录用户
+      answerDate: new Date(),
+    }
+  );
+
+  return this.authService.generateUserToken(user);
+}
+```
+
+### 9.2 安全隐患
+
+**任何登录用户只要获取到邀请 token，就可以接受该邀请并加入组织。** 不需要其邮箱与邀请邮箱匹配。
+
+**示例攻击场景：**
+1. 管理员邀请 `alice@example.com`
+2. 邀请邮件被拦截，token 泄露
+3. 攻击者 `bob@evil.com` 登录系统
+4. 攻击者调用 `POST /invites/:stolenToken/accept`
+5. 攻击者成功加入组织，获得 `OSS_ADMIN` 权限
+
+### 9.3 测试中的隐式假设
+
+**文件：** `apps/api/src/app/invites/e2e/accept-invite.e2e.ts`
+
+```typescript
+// 测试中使用邀请邮箱对应的用户登录来接受邀请
+// 但这是测试用例的约定，不是代码强制的校验
+expect(member.invite && member.invite.email === invitedUserSession.user.email);
+```
+
+---
+
+## 十、重发邀请对 invite.email 一致性的影响
+
+### 10.1 Bug 分析
+
+**文件：** `apps/api/src/app/invites/usecases/resend-invite/resend-invite.usecase.ts`
+
+```typescript
+async execute(command: ResendInviteCommand) {
+  const organization = await this.organizationRepository.findById(command.organizationId);
+  const foundInvitee = await this.memberRepository.findOne({
+    _id: command.memberId,
+    _organizationId: command.organizationId,
+  });
+
+  // foundInvitee.invite.email 此时是有值的（首次邀请时写入）
+
+  const token = createGuid();
+
+  // 发送新邀请邮件到原邮箱（使用 foundInvitee.invite.email）
+  await novu.trigger({
+    to: [{ subscriberId: foundInvitee.invite.email, email: foundInvitee.invite.email }],
+    payload: { acceptInviteUrl: `.../${token}` },
+  });
+
+  // ⚠️  更新 invite 时丢失了 email 字段！
+  await this.memberRepository.update(foundInvitee, {
+    memberStatus: MemberStatusEnum.INVITED,
+    invite: {
+      token,
+      _inviterId: command.userId,
+      invitationDate: new Date(),
+      // ❌ 没有包含 email: foundInvitee.invite.email
+    },
+  });
+}
+```
+
+### 10.2 后果
+
+| 阶段 | member.invite.email 的值 |
+|------|------------------------|
+| 首次邀请后 | `alice@example.com` |
+| 重发邀请后 | `undefined`（被覆盖） |
+
+后续操作会受到影响：
+1. **获取邀请信息**：`GET /invites/:token` 无法返回邮箱
+2. **接受邀请**：虽然当前代码不校验邮箱，但如果未来添加校验会失败
+3. **数据一致性**：数据库记录不完整
+
+### 10.3 对比：首次邀请的正确写法
+
+**文件：** `apps/api/src/app/invites/usecases/invite-member/invite-member.usecase.ts`
+
+```typescript
+// 首次邀请时完整写入 invite 对象
+await this.memberRepository.addMember(organization._id, {
+  roles: [command.role as MemberRoleEnum],
+  memberStatus: MemberStatusEnum.INVITED,
+  invite: {
+    token,
+    _inviterId: command.userId,
+    email: command.email,  // ✅ 包含 email
+    invitationDate: new Date(),
+  },
+});
+```
+
+---
+
+## 十一、设计要点与注意事项
 
 1. **角色在邀请发起时即已确定**：`InviteMember` usecase 中 `roles` 字段直接写入 Member 记录，接受邀请时不修改角色。这意味着角色选择必须在邀请发起时完成。
 
@@ -518,3 +793,9 @@ export function useHasPermission(): CheckAuthorizationWithCustomPermissions {
 6. **成员列表数据过滤**：非 OSS_ADMIN 看不到已邀请成员和邮箱，这是服务端的数据过滤，不是权限守卫。
 
 7. **Token 中包含角色数组**：`getSignedToken` 将 member.roles 写入 JWT payload，但社区版 JWT strategy 不解析 roles 到 UserSessionData（仅 EE 版完整解析）。
+
+8. **接受邀请不校验邮箱**：`AcceptInvite` usecase 不验证当前登录用户邮箱是否等于 `member.invite.email`，存在 token 泄露风险。
+
+9. **重发邀请丢失 invite.email**：`ResendInvite` usecase 更新 invite 对象时未保留 email 字段，导致数据不一致。
+
+10. **EE 权限校验分级**：Business tier 完整校验权限，Free/Pro tier 绕过权限校验，API Key 始终绕过。
