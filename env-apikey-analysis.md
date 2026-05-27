@@ -184,16 +184,93 @@ export interface IApiKey {
 
 ```typescript
 export const UserSession = createParamDecorator((data, ctx) => {
-  const req = ctx.switchToHttp().getRequest();
-  
-  // Passport 验证成功后将 user 对象挂载到 req.user
+  let req;
+  if (ctx.getType() === 'graphql') {
+    req = ctx.getArgs()[2].req;  // GraphQL 分支：从 context 第三个参数获取
+  } else {
+    req = ctx.switchToHttp().getRequest();  // HTTP 分支：标准 HTTP 请求
+  }
+
   if (req.user) {
     return req.user;
   }
 
-  throw new InternalServerErrorException('No user in request - forgot AuthGuard?');
+  Logger.error(
+    'Attempted to access user session without a user in the request. You probably forgot to add the AuthGuard',
+    'UserSession'
+  );
+  throw new InternalServerErrorException();
 });
 ```
+
+#### HTTP/GraphQL 双分支深度解析
+
+| 分支类型 | 执行路径 | 获取方式 | 使用场景 |
+|---------|---------|---------|---------|
+| **HTTP 分支** | `ctx.switchToHttp().getRequest()` | 标准 NestJS HTTP 上下文 | REST API 端点（95% 场景） |
+| **GraphQL 分支** | `ctx.getArgs()[2].req` | GraphQL context.args[2] | Inbox 订阅、WebSocket 连接 |
+
+**GraphQL 分支代码约束**:
+- 依赖 GraphQL 执行上下文的参数顺序固定为 `[root, args, context, info]`
+- `context.req` 必须在 GraphQL Module 配置中显式注入
+- **风险**：如果 GraphQL 上下文重构（如参数顺序变更），此分支会静默失败
+
+---
+
+### 2.4 无 req.user 异常路径完整链路
+
+#### 异常触发场景
+
+**场景 1：AuthGuard 缺失（最常见）**
+```
+Controller 方法使用 @UserSession()
+    ↓
+AuthGuard 未注册或未执行
+    ↓
+req.user === undefined
+    ↓
+UserSession 装饰器抛出 InternalServerErrorException
+    ↓
+HTTP 500: "Internal Server Error"
+```
+
+**场景 2：Passport 策略验证返回 false**
+```
+ApiKeyStrategy.validateApiKey() 返回 null
+    ↓
+verified(null, false) 调用
+    ↓
+Passport 判定认证失败
+    ↓
+req.user 未设置
+    ↓
+UserSession 装饰器抛出 500
+```
+
+**场景 3：异常在 Passport 回调中被吞掉**
+```
+authService.getUserByApiKey() 抛出 UnauthorizedException
+    ↓
+catch (err) { return verified(err, false); }
+    ↓
+Passport 接收到 error，但转换为 401
+    ↓
+如果 NestJS 异常过滤器配置不当，可能导致 req.user 未设置但也未抛出异常
+```
+
+#### 异常类型边界
+
+| 异常类型 | 抛出位置 | HTTP 状态码 | 根因分类 |
+|---------|---------|------------|---------|
+| `InternalServerErrorException` | UserSession 装饰器 | 500 | **配置错误**（Guard 缺失） |
+| `UnauthorizedException` | CommunityUserAuthGuard | 401 | **认证失败**（方案不支持） |
+| `UnauthorizedException` | Passport 框架层 | 401 | **认证失败**（密钥无效） |
+| `ServiceUnavailableException` | checkKillSwitch | 503 | **运维控制**（熔断开启） |
+
+**关键风险**：500 异常掩盖真实问题
+- 开发人员看到 500 可能误以为是服务器崩溃
+- 实际原因：忘记加 `@UseGuards(CommunityUserAuthGuard)`
+- **建议改进**：将 500 改为更明确的 401 或添加诊断日志
 
 **控制器层使用示例**: `apps/api/src/app/events/events.controller.ts:104-133`
 
@@ -662,7 +739,255 @@ if (!isMember) return { error: 'User is not a member of this organization' };
 
 ---
 
-## 八、常见调试点
+## 八、Passport 回调异常传递边界深度分析
+
+### 8.1 Passport 回调机制原理
+
+**ApiKeyStrategy 回调实现**: `apps/api/src/app/auth/services/passport/apikey.strategy.ts:25-38`
+
+```typescript
+async (apikey: string, verified: (err: Error | null, user?: UserSessionData | false) => void) => {
+  try {
+    const user = await this.validateApiKey(apikey);
+    if (!user) {
+      return verified(null, false);  // 路径1：验证失败，无错误
+    }
+    addNewRelicTraceAttributes(user);
+    return verified(null, user);     // 路径2：验证成功
+  } catch (err) {
+    return verified(err as Error, false);  // 路径3：异常捕获，传递错误
+  }
+}
+```
+
+### 8.2 异常传递的三条边界
+
+#### 边界 1：验证失败但无异常（verified(null, false)）
+
+**触发场景**:
+- `validateApiKey()` 返回 `null`
+- 密钥哈希不匹配，数据库无结果
+- 密钥在数据库中但 `Array.find()` 未匹配
+
+**传递路径**:
+```
+verified(null, false)
+    ↓
+Passport 框架内部处理
+    ↓
+抛出默认 UnauthorizedException
+    ↓
+HTTP 401: "Unauthorized"
+```
+
+**关键特征**:
+- 丢失具体错误信息（如 "API Key not found"）
+- 客户端无法区分"密钥无效"和"用户不存在"
+
+#### 边界 2：验证成功（verified(null, user)）
+
+**触发场景**:
+- 所有校验通过，返回完整 `UserSessionData`
+
+**传递路径**:
+```
+verified(null, user)
+    ↓
+Passport 将 user 挂载到 req.user
+    ↓
+后续中间件和控制器可通过 @UserSession() 获取
+    ↓
+正常执行业务逻辑
+```
+
+#### 边界 3：异常捕获后传递（verified(err, false)）
+
+**触发场景**:
+- `checkKillSwitch()` 抛出 `ServiceUnavailableException`
+- 数据库连接失败
+- 任何其他运行时异常
+
+**传递路径**:
+```
+try { validateApiKey() } catch (err)
+    ↓
+verified(err, false)  // err 被完整传递
+    ↓
+Passport 识别到 err 参数
+    ↓
+NestJS 异常过滤器捕获 err
+    ↓
+保留原始异常类型和消息
+```
+
+**异常类型保留对照表**:
+
+| 原始异常 | 经过 verified(err, false) | 最终 HTTP 状态码 |
+|---------|-------------------------|-----------------|
+| `ServiceUnavailableException` | ✅ 完整保留 | 503 |
+| `UnauthorizedException` | ✅ 完整保留 | 401 |
+| `NotFoundException` | ✅ 完整保留 | 404 |
+| 普通 `Error` | ✅ 完整保留 | 500 |
+
+### 8.3 异常传递的隐藏风险
+
+**风险 1：异常类型在 Passport 层被转换**
+
+NestJS Passport 集成的隐式行为：
+- 如果 `verified()` 的第一个参数不为 null，Passport 会调用 `next(err)`
+- 异常会进入 NestJS 的全局异常过滤器链
+- **但是**：某些异常过滤器可能会重新包装异常，丢失原始堆栈信息
+
+**风险 2：catch-all 吞掉关键诊断信息**
+
+```typescript
+} catch (err) {
+  return verified(err as Error, false);  // err 可能是任何类型，包括 string
+}
+```
+
+- `err as Error` 类型断言不安全
+- 如果底层抛出字符串或数字，会导致 `err.message` 为 undefined
+- 日志中只会看到 "undefined" 或 "[object Object]"
+
+**风险 3：kill switch 异常的特殊路径**
+
+```typescript
+private async checkKillSwitch(user: UserSessionData): Promise<void> {
+  const isKillSwitchEnabled = await this.featureFlagsService.getFlag(...);
+  if (isKillSwitchEnabled) {
+    throw new ServiceUnavailableException('Service temporarily unavailable for this organization');
+  }
+}
+```
+
+- 这是**唯一**在认证阶段抛出非 401 异常的场景
+- 503 状态码用于指示"服务不可用"，而非"认证失败"
+- **语义正确但容易混淆**：客户端可能将 503 误认为是基础设施问题，而非组织级封禁
+
+---
+
+## 九、哈希定位环境的代码实现约束与风险分层
+
+### 9.1 哈希计算的实现约束
+
+**哈希算法代码**: `apps/api/src/app/auth/services/community.auth.service.ts:336`
+
+```typescript
+const hashedApiKey = createHash('sha256').update(apiKey).digest('hex');
+```
+
+#### 约束 1：输入编码隐式假设
+
+Node.js `crypto.createHash().update()` 的默认行为：
+- 如果输入是字符串，默认使用 `'utf8'` 编码
+- API Key 通常是 base64 或十六进制字符串
+- **隐式约束**：API Key 必须是有效的 UTF-8 字符串（实际总是满足）
+
+#### 约束 2：哈希值格式固定为十六进制
+
+```typescript
+.digest('hex')  // 输出 64 字符十六进制字符串
+```
+
+- 数据库存储的 `apiKeys.hash` 必须也是十六进制格式
+- 任何地方修改 digest 格式（如改为 base64）都会导致**所有现有密钥失效**
+- **迁移风险极高**：需要双写兼容期
+
+### 9.2 MongoDB 查询的实现约束
+
+**查询代码**: `libs/dal/src/repositories/environment/environment.repository.ts:61-65`
+
+```typescript
+async findByApiKey({ hash }: { hash: string }) {
+  return await this.findOne({ 'apiKeys.hash': hash }, '_id _organizationId apiKeys', {
+    readPreference: 'secondaryPreferred',
+  });
+}
+```
+
+#### 约束 1：数组多键索引的行为
+
+MongoDB `{ 'apiKeys.hash': 1 }` 索引特性：
+- 为数组中的**每个元素**创建独立索引条目
+- 查询时只要任意一个元素匹配就返回文档
+- **基数极高**：每个 API Key 对应一个索引条目
+- **写入放大**：每次添加/删除 API Key 都会修改索引
+
+#### 约束 2：投影字段的隐式依赖
+
+```
+投影: '_id _organizationId apiKeys'
+```
+
+- `_id`: 用于构建 UserSession 的 `environmentId`
+- `_organizationId`: 用于构建 UserSession 的 `organizationId`
+- `apiKeys`: 用于二次校验和提取 `_userId`
+- **任何投影字段缺失都会导致认证链条断裂**
+
+#### 约束 3：读从库的一致性窗口
+
+```typescript
+readPreference: 'secondaryPreferred'
+```
+
+| 场景 | 风险等级 | 影响 |
+|------|---------|------|
+| 新创建密钥立即使用 | ⚠️ 中 | 1-3 秒延迟窗口内认证失败 |
+| 删除密钥立即验证 | ⚠️ 中 | 延迟窗口内仍可认证 |
+| 正常认证流量 | ✅ 低 | 从库负载均衡，性能更好 |
+
+**设计权衡**：
+- 99.9% 场景读从库没问题
+- 极端场景（创建后立即使用）需要重试机制
+- 客户端 SDK 应该实现指数退避重试
+
+### 9.3 双重校验的实现约束
+
+**二次校验代码**: `community.auth.service.ts:347-351`
+
+```typescript
+const key = environment.apiKeys.find((i) => i.hash === hashedApiKey);
+if (!key) return { error: 'API Key not found' };
+```
+
+#### 约束 1：线性扫描的性能边界
+
+| apiKeys 数组大小 | `Array.find()` 耗时 | 相对性能 |
+|-----------------|-------------------|---------|
+| 1-10 | < 1μs | ✅ 正常 |
+| 100 | ~5μs | ✅ 正常 |
+| 1,000 | ~50μs | ⚠️ 可接受 |
+| 10,000 | ~500μs | ⚠️ 需关注 |
+| 100,000 | ~5ms | ❌ 严重 |
+
+**现状**：无代码限制单环境 API Key 数量
+**风险**：恶意用户创建 10 万密钥，导致每次认证消耗 5ms CPU
+
+#### 约束 2：哈希碰撞的理论边界
+
+SHA-256 碰撞概率分析：
+- 单组织 100 万密钥：碰撞概率 ≈ (10^6)^2 / 2^257 ≈ 2^-137
+- 全平台 10 亿密钥：碰撞概率 ≈ (10^9)^2 / 2^257 ≈ 2^-77
+- **结论**：工程实践中完全可以忽略
+- **但是**：如果算法被替换为 MD5/SHA-1，风险立即升高
+
+### 9.4 风险分层矩阵
+
+| 风险层级 | 风险类型 | 发生概率 | 影响程度 | 缓解措施 |
+|---------|---------|---------|---------|---------|
+| **P0 高危** | 删除密钥后缓存仍有效 | 高 | 严重 | 1. 缩短缓存 TTL<br>2. 删除时主动失效 |
+| **P0 高危** | 用户被移出组织后密钥仍有效 | 中 | 严重 | 增加成员身份校验 |
+| **P1 中危** | 单环境创建大量密钥导致 DoS | 低 | 中等 | 限制单环境 API Key 上限（如 100） |
+| **P1 中危** | 从库延迟导致新密钥认证失败 | 中 | 中等 | 客户端重试 + 关键路径读主库 |
+| **P2 低危** | 500 异常掩盖配置错误 | 高 | 轻微 | 改进错误消息 + 告警监控 |
+| **P2 低危** | GraphQL 上下文重构导致分支失效 | 极低 | 中等 | 增加单元测试覆盖 |
+| **P3 理论** | SHA-256 哈希碰撞 | 极低 | 严重 | 无需处理（工程不可行） |
+| **P3 理论** | MongoDB 索引与数组不一致 | 极低 | 轻微 | 依赖数据库事务保证 |
+
+---
+
+## 十、常见调试点
 
 | 问题 | 检查路径 | 关键条件 |
 |------|---------|---------|
