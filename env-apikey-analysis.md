@@ -351,28 +351,318 @@ Repository 查询层强制过滤
 
 ### 5.3 环境类型保护
 
-**文件位置**: `apps/api/src/app/auth/framework/root-environment-guard.service.ts`
+**文件位置**: `apps/api/src/app/auth/framework/root-environment-guard.service.ts:1-20`
 
 ```typescript
 @Injectable()
 export class RootEnvironmentGuard implements CanActivate {
+  constructor(private authService: AuthService) {}
+
   async canActivate(context: ExecutionContext) {
-    const { user } = context.switchToHttp().getRequest();
-    const isRootEnv = await this.authService.isRootEnvironment(user);
-    
-    if (isRootEnv) {
+    const request = context.switchToHttp().getRequest();
+    const { user } = request;
+
+    const environment = await this.authService.isRootEnvironment(user);
+
+    if (environment) {
       throw new UnauthorizedException('This action is only allowed in Development environment');
     }
+
     return true;
   }
 }
 ```
 
-**用途**: 防止在生产环境执行开发操作（如工作流编辑、测试发送等）
+#### 守卫语义深度解析
+
+**核心实现逻辑**: `apps/api/src/app/auth/services/community.auth.service.ts:294-301`
+
+```typescript
+public async isRootEnvironment(payload: UserSessionData): Promise<boolean> {
+  const environment = await this.environmentRepository.findOne({
+    _id: payload.environmentId,
+  });
+  if (!environment) throw new NotFoundException('Environment not found');
+
+  return !!environment._parentId;  // 关键：通过 _parentId 判断环境类型
+}
+```
+
+**语义对照表（易混淆点）**:
+
+| 环境 | `_parentId` 值 | `isRootEnvironment()` 返回值 | 守卫放行状态 | 可执行操作 |
+|------|---------------|-----------------------------|-------------|-----------|
+| Development（开发环境） | `null` / `undefined` | `false` | ✅ 放行 | 工作流编辑、删除、状态切换 |
+| Production（生产环境） | Development 的 `_id` | `true` | ❌ 拦截 | 仅读操作、触发事件 |
+
+**关键命名澄清**:
+- ❌ 方法名 `isRootEnvironment` **具有误导性**
+- ✅ 实际语义：**"是否为非根环境"** 或 **"是否为 Production 环境"**
+- ✅ 守卫逻辑：`if (isRootEnvironment)` → **当环境有父节点时抛出异常**
+- ⚠️ **双重否定容易出错**：返回 `true` 表示"非根"，但守卫却用它来判断"是否拦截"
+
+**受保护的端点示例**（`apps/api/src/app/workflows-v1/workflow-v1.controller.ts`）:
+- `DELETE /workflows/:workflowId` - 删除工作流
+- `POST /workflows` - 创建工作流
+- `PUT /workflows/:workflowId/status` - 切换工作流状态
 
 ---
 
-## 六、常见调试点
+## 六、UserSession 异常分支逐条分析
+
+### 6.1 异常分支总览
+
+API Key 认证链路中共有 **8 个异常分支**，分布在 4 个层级：
+
+| 层级 | 异常点数量 | 主要异常类型 |
+|------|-----------|-------------|
+| AuthGuard 层 | 1 | UnauthorizedException |
+| Strategy 层 | 2 | ServiceUnavailableException |
+| AuthService 层 | 5 | UnauthorizedException, NotFoundException |
+
+---
+
+### 6.2 AuthGuard 层异常
+
+**分支 1：端点不允许外部 API 访问**
+- **位置**: `community.user.auth.guard.ts:27-28`
+- **触发条件**: `!this.reflector.get<boolean>('external_api_accessible', context.getHandler())`
+- **异常**: `UnauthorizedException('API endpoint not accessible')`
+- **根因**: 控制器方法缺少 `@ExternalApiAccessible()` 装饰器
+- **HTTP 状态码**: 401
+
+---
+
+### 6.3 ApiKeyStrategy 层异常
+
+**分支 2：组织级熔断开关开启**
+- **位置**: `apikey.strategy.ts:71-73`
+- **触发条件**: `isKillSwitchEnabled === true`
+- **异常**: `ServiceUnavailableException('Service temporarily unavailable for this organization')`
+- **根因**: 组织级 kill switch 被触发（Feature Flag 控制）
+- **HTTP 状态码**: 503
+- **备注**: 这是唯一非 401 的认证异常
+
+**分支 3：Passport verify 回调异常包裹**
+- **位置**: `apikey.strategy.ts:36-38`
+- **触发条件**: `validateApiKey()` 抛出任何异常
+- **处理**: `verified(err as Error, false)`
+- **注意**: 所有异常都会被 Passport 框架捕获并转换为 401
+
+---
+
+### 6.4 AuthService 层异常（getUserByApiKey）
+
+**分支 4：getApiKeyUser 返回 error**
+- **位置**: `community.auth.service.ts:181`
+- **触发条件**: `error` 字段有值（三种子情况）
+- **异常**: `UnauthorizedException(error)`
+- **错误消息**: 
+  - `'API Key not found'`（哈希不匹配）
+  - `'API Key not found'`（数组遍历不匹配）
+  - `'User not found'`（密钥关联用户不存在）
+
+**分支 5：user 对象为空**
+- **位置**: `community.auth.service.ts:183`
+- **触发条件**: `!user`
+- **异常**: `UnauthorizedException('User not found')`
+- **备注**: 理论上与分支 4 的第三种情况重复，属于防御性编程
+
+---
+
+### 6.5 isRootEnvironment 守卫异常
+
+**分支 6：环境不存在**
+- **位置**: `community.auth.service.ts:298`
+- **触发条件**: `!environment`
+- **异常**: `NotFoundException('Environment not found')`
+- **根因**: UserSession 中的 `environmentId` 无效或环境已被删除
+- **HTTP 状态码**: 404
+
+**分支 7：在 Production 环境执行开发操作**
+- **位置**: `root-environment-guard.service.ts:14-16`
+- **触发条件**: `environment._parentId` 存在（即 Production 环境）
+- **异常**: `UnauthorizedException('This action is only allowed in Development environment')`
+- **HTTP 状态码**: 401
+
+---
+
+### 6.6 JwtStrategy 层异常（对比参考）
+
+虽然 API Key 认证不经过此层，但 UserSession 在其他场景可能遇到：
+
+**分支 8：环境-组织不匹配**
+- **位置**: `jwt.strategy.ts:46-48`
+- **触发条件**: 查询 `{ _id, _organizationId }` 无结果
+- **异常**: `UnauthorizedException('Cannot find environment')`
+- **根因**: 环境 ID 与组织 ID 不匹配，可能是越权尝试
+
+---
+
+## 七、密钥哈希定位环境的约束条件与风险
+
+### 7.1 数据库查询约束
+
+**查询实现**: `libs/dal/src/repositories/environment/environment.repository.ts:61-65`
+
+```typescript
+async findByApiKey({ hash }: { hash: string }) {
+  return await this.findOne({ 'apiKeys.hash': hash }, '_id _organizationId apiKeys', {
+    readPreference: 'secondaryPreferred',  // 读从库
+  });
+}
+```
+
+#### 约束条件 1：MongoDB 数组索引约束
+
+```
+查询条件: { 'apiKeys.hash': hash }
+```
+
+- **必须创建索引**: `db.environments.createIndex({ 'apiKeys.hash': 1 })`
+- **无索引后果**: COLLSCAN 全表扫描，高并发下数据库雪崩
+- **数组多键索引**: MongoDB 自动为数组中的每个元素创建索引条目
+- **索引基数**: 极高（每个 API Key 都是唯一的）
+
+#### 约束条件 2：读从库最终一致性
+
+```typescript
+readPreference: 'secondaryPreferred'
+```
+
+- **风险窗口**: 主从复制延迟期间（通常 < 1s）
+- **场景**: 刚创建的 API Key 立即使用可能认证失败
+- **影响**: 新密钥创建后可能需要等待几秒才能生效
+- **缓解**: 关键路径可考虑降级读主库
+
+---
+
+### 7.2 哈希碰撞风险
+
+#### 哈希算法选择
+
+```typescript
+const hashedApiKey = createHash('sha256').update(apiKey).digest('hex');
+```
+
+| 算法 | 输出长度 | 碰撞概率（2^32 密钥） | 评估 |
+|------|---------|---------------------|------|
+| SHA-256 | 256-bit | ~2^-192 | ✅ 安全 |
+| MD5 | 128-bit | ~2^-64 | ❌ 已破解 |
+| SHA-1 | 160-bit | ~2^-96 | ❌ 不推荐 |
+
+**理论风险**:
+- 生日悖论：n 个密钥的碰撞概率 ≈ n² / 2^257
+- 10 亿密钥: 碰撞概率 ≈ 10^18 / 2^257 ≈ 2^-197
+- **结论**: 工程实践中可忽略
+
+---
+
+### 7.3 双重校验机制与风险
+
+**代码路径**: `community.auth.service.ts:338-351`
+
+```typescript
+// 第一次查询：数据库索引匹配
+const environment = await this.environmentRepository.findByApiKey({ hash: hashedApiKey });
+if (!environment) return { error: 'API Key not found' };
+
+// 第二次校验：在 apiKeys 数组中遍历匹配
+const key = environment.apiKeys.find((i) => i.hash === hashedApiKey);
+if (!key) return { error: 'API Key not found' };
+```
+
+#### 为什么需要双重校验？
+
+**MongoDB 数组查询的微妙语义**:
+- 查询 `{ 'apiKeys.hash': hash }` 只要数组中**任意一个元素**匹配就返回文档
+- 但投影 `apiKeys` 返回的是**整个数组**，而非匹配的子文档
+- 如果没有第二次校验：无法从数组中提取 `_userId`
+
+#### 隐含风险
+
+**风险 1：数组膨胀攻击**
+- `environment.apiKeys` 数组理论上可以无限增长
+- 极端情况：一个环境创建 10 万个 API Key
+- 影响：内存占用增大，`Array.find()` 线性扫描变慢
+- **约束缺失**: 代码中未限制单环境 API Key 数量上限
+
+**风险 2：哈希索引与数组内容不一致**
+- 理论场景：数据库索引条目与实际数组数据不一致
+- 例如：索引包含某个哈希，但 `apiKeys` 数组中已被删除
+- 后果：第一次查询命中，但第二次校验失败 → 认证失败
+- 概率：极低（MongoDB 崩溃 + 索引损坏）
+
+---
+
+### 7.4 缓存一致性风险
+
+**缓存架构**: `apikey.strategy.ts:46-53`
+
+```typescript
+const user = await this.inMemoryLRUCacheService.get(
+  InMemoryLRUCacheStore.API_KEY_USER,
+  hashedApiKey,
+  () => this.authService.getUserByApiKey(apiKey),  // 缓存未命中时调用
+  { environmentId: 'system' }
+);
+```
+
+#### 缓存失效问题
+
+| 操作 | 缓存是否失效 | 影响 |
+|------|-------------|------|
+| 创建新 API Key | ❌ 不失效 | 新密钥立即可用（因为未缓存） |
+| 删除 API Key | ❌ 不失效 | 已删除密钥在缓存 TTL 内仍有效 ⚠️ |
+| 变更密钥权限 | ❌ 不失效 | 权限变更不立即生效 |
+| 用户被删除 | ❌ 不失效 | 缓存仍返回有效 UserSession |
+
+**高危风险**: 删除 API Key 后，攻击者如果持有缓存的 UserSession，在 TTL 窗口内仍可访问系统。
+
+**缓解措施**:
+1. 删除 API Key 时主动失效对应缓存条目
+2. 缩短缓存 TTL（如 5 分钟）
+3. 关键操作绕过缓存直接查库
+
+---
+
+### 7.5 用户关联的安全边界
+
+```typescript
+const user = await this.userRepository.findById(key._userId);
+if (!user) return { error: 'User not found' };
+```
+
+#### 约束分析
+
+**正向约束**:
+- API Key 必须关联一个有效用户
+- 用户不存在 → 认证失败
+
+**缺失约束**:
+- ❌ 未校验用户是否属于同一组织
+- ❌ 未校验用户状态（active/suspended）
+- ❌ 未校验用户在该组织中的成员身份
+
+**风险场景**:
+1. 用户 A 创建 API Key
+2. 用户 A 被移出组织（但未删除用户账户）
+3. API Key 继续有效，因为只检查 `key._userId` 对应用户存在
+4. UserSession 仍携带 `organizationId` 并通过后续鉴权
+
+**建议修复**:
+```typescript
+// 在 getApiKeyUser 中增加成员校验
+const isMember = await this.memberRepository.isMemberOfOrganization(
+  key._userId, 
+  environment._organizationId
+);
+if (!isMember) return { error: 'User is not a member of this organization' };
+```
+
+---
+
+## 八、常见调试点
 
 | 问题 | 检查路径 | 关键条件 |
 |------|---------|---------|
