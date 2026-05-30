@@ -155,11 +155,11 @@ computeDigestLogicBasedOnExistingDigestState()
 ```
 PENDING → [Redis 限频判定]
               │
-              ├─ granted=true  → DELAYED → RUNNING → COMPLETED
-              └─ granted=false → SKIPPED（含所有子 Job）
+              ├─ granted=true  → DELAYED(delay=0) → RUNNING → COMPLETED
+              └─ granted=false → SKIPPED（含所有子 Job）→ 流程终止
 ```
 
-**注意**：Throttle 虽然是 Deferred 类型，但其核心决策在 `AddJob.executeDeferredJob()` 阶段通过 Redis 完成，**不经过 BullMQ 延迟**——通过限频的 Job 直接以 `delay=0` 入队立即执行；未通过的 Job 直接 SKIPPED，不会延迟重试。
+**注意**：Throttle 虽然是 Deferred 类型，但其核心决策在 `AddJob.executeDeferredJob()` 阶段通过 Redis 完成，**不经过 BullMQ 业务延迟**——通过限频的 Job 以 `delay=0` 入队立即执行；未通过的 Job 直接 SKIPPED，**不会延迟重试，也不会在窗口恢复后自动重新触发**。
 
 ### 4.2 限频判定逻辑（AddJob.handleThrottle）
 
@@ -228,6 +228,234 @@ throttle:{environmentId}:{subscriberId}:{workflowId}:{stepId}[:{throttleKey}:{th
 | Dynamic Key | `dynamicKey` | dynamic 模式从 payload 解析 windowMs |
 | Threshold | `threshold` | Redis 限频 limit |
 | Throttle Key | `throttleKey` | 分组限频的 Key 路径 |
+
+### 4.7 Redis 窗口 TTL 到期后的配额恢复机制
+
+Redis Throttle 的配额恢复完全依赖 **Redis Key 的 TTL 自动过期机制**，而非业务层的延迟重试。以下是完整的代码级分析：
+
+#### 4.7.1 Lua 脚本中的 TTL 检查与清理
+
+`redis-throttle.service.ts:25-33` 的 Lua 脚本在每次 `reserveThrottleSlot` 调用时都会执行前置 TTL 检查：
+
+```lua
+-- Manual TTL check: if key exists but has expired, clean it up
+local currentTtl = redis.call('TTL', setKey)
+if currentTtl == 0 then
+  -- Key exists but has no TTL (should not happen) or has expired
+  redis.call('DEL', setKey)
+elseif currentTtl == -1 then
+  -- Key exists but has no expiry set (should not happen with our logic)
+  redis.call('DEL', setKey)
+end
+```
+
+**触发清理的两种异常场景**：
+- `currentTtl == 0`：Key 已过期但 Redis 尚未惰性删除（Redis 的 TTL 过期删除是惰性 + 定期采样）
+- `currentTtl == -1`：Key 存在但未设置过期时间（防御性检查，正常逻辑不会出现）
+
+#### 4.7.2 TTL 设置时机与窗口起点
+
+`redis-throttle.service.ts:49-51` 中，TTL 仅在 **第一个成员加入时设置**：
+
+```lua
+count = count + 1
+if count == 1 then
+  redis.call('EXPIRE', setKey, ttlSec)
+end
+```
+
+这意味着：
+- **窗口起点 = 第一个成功获取配额的事件的时间戳**
+- TTL 计算公式（`redis-throttle.service.ts:112-114`）：
+  ```typescript
+  private computeTtlSeconds(windowMs: number): number {
+    return Math.ceil((windowMs + this.ttlBufferMs) / 1000);
+  }
+  ```
+  其中 `ttlBufferMs` 默认 30s（环境变量 `THROTTLE_REDIS_TTL_BUFFER_MS`），确保窗口时间内的所有事件都被正确计数，避免边界 race condition。
+
+#### 4.7.3 TTL 到期后的新事件处理流程
+
+```
+新事件到达 → AddJob.executeDeferredJob() → handleThrottle() → reserveThrottleSlot()
+     │
+     ├─ Lua 脚本执行：
+     │   1. TTL 检查：若 Key 已过期（TTL=0 或 -1），DEL 清理
+     │   2. SCARD 计数：Key 不存在或已删除 → 返回 0
+     │   3. 0 < threshold → 允许通过
+     │   4. SADD 添加 jobId
+     │   5. count == 1 → 设置新的 EXPIRE（窗口重置）
+     │   6. 返回 granted=1
+     │
+     ├─ shouldSkip=false → 继续 executeDeferredJob 流程
+     │   ├─ delay = getExecutionDelayAmount() → Throttle 非 Digest/Delay，所以 delay=0
+     │   ├─ stepRun 标记 DELAYED
+     │   └─ queueJob({ delay: 0 }) → BullMQ 立即投递
+     │
+     └─ 后续：StandardWorker 消费 → RunJob → SendMessage.Throttle → SUCCESS → tryQueueNextJobs()
+```
+
+**关键点**：
+- TTL 到期后，**新窗口的起点是新事件到达的时间**，而非上一个窗口的结束时间
+- 配额恢复对**新到达的事件**有效，已被 SKIPPED 的旧事件不会被回溯
+
+### 4.8 为何被限频跳过的父子 Job 不会自动恢复
+
+#### 4.8.1 handleThrottleSkip 的代码逻辑
+
+`add-job.usecase.ts:1004-1051` 中 `handleThrottleSkip` 的完整执行流程：
+
+```typescript
+private async handleThrottleSkip(
+  command: AddJobCommand,
+  job: JobEntity,
+  throttleResult: { ... }
+) {
+  // 1. 当前 Throttle Job 标记为 SKIPPED（终态）
+  await this.jobRepository.updateOne(
+    { _id: job._id, _environmentId: command.environmentId },
+    {
+      $set: {
+        status: JobStatusEnum.SKIPPED,
+        stepOutput: {
+          throttled: true,
+          executionCount: throttleResult.executionCount,
+          threshold: throttleResult.threshold,
+          throttledUntil: throttleResult.throttledUntil,
+        },
+      },
+    }
+  );
+
+  // 2. 创建 stepRun 记录（SKIPPED）
+  await this.stepRunRepository.create(job, { status: JobStatusEnum.SKIPPED });
+
+  // 3. 级联标记所有子 Job 为 SKIPPED
+  const childJobsUpdated = await this.jobRepository.updateAllChildJobStatus(
+    job,
+    JobStatusEnum.SKIPPED,
+    job._id
+  );
+
+  // 4. 批量创建子 Job 的 stepRun
+  if (childJobsUpdated.length > 0) {
+    await this.stepRunRepository.createMany(childJobsUpdated, { status: JobStatusEnum.SKIPPED });
+
+    // 5. 写入执行详情（记录限频事件，便于排查）
+    await this.createExecutionDetails.execute(
+      CreateExecutionDetailsCommand.create({
+        ...CreateExecutionDetailsCommand.getDetailsFromJob(job),
+        detail: DetailEnum.THROTTLE_LIMIT_EXCEEDED,
+        source: ExecutionDetailsSourceEnum.INTERNAL,
+        status: ExecutionDetailsStatusEnum.SUCCESS,
+        isTest: false,
+        isRetry: false,
+        raw: JSON.stringify({ ...throttleResult }),
+      })
+    );
+  }
+}
+```
+
+#### 4.8.2 不自动恢复的三个代码层面原因
+
+**原因 1：SKIPPED 是终态（Terminal State），非中间态**
+
+在 `executeDeferredJob` 中（`add-job.usecase.ts:293-298`），`handleThrottleSkip` 后直接返回，**不会调用 `queueJob()` 投递到队列**：
+
+```typescript
+if (throttleResult.shouldSkip) {
+  await this.handleThrottleSkip(...);
+
+  return {
+    workflowStatus: WorkflowRunStatusEnum.COMPLETED,
+    deliveryLifecycleStatus: DeliveryLifecycleStatusEnum.SKIPPED,
+  };
+}
+```
+
+对比 Digest/Delay 的 DELAYED 路径（`add-job.usecase.ts:361-365`）：
+```typescript
+await this.stepRunRepository.create(updatedJob, { status: JobStatusEnum.DELAYED });
+await this.queueJob({ job, delay, untilDate: bridgeDelayAmountDate, timezone: subscriber?.timezone });
+```
+
+**原因 2：没有"重试/恢复 Job"的调度机制**
+
+系统中**没有任何组件**会：
+- 监听 Redis Key 过期事件
+- 扫描 SKIPPED 状态的 Throttle Job
+- 在窗口恢复后重新触发被跳过的 Job
+
+BullMQ 的延迟调度（`delay` 选项）只用于 Digest/Delay，Throttle 未通过时不会设置任何延迟。
+
+**原因 3：父子链已被中断**
+
+`updateAllChildJobStatus(job, JobStatusEnum.SKIPPED, job._id)` 将所有下游子 Job 也标记为 SKIPPED。即使后续想恢复，也无法通过 `tryQueueNextJobs()` 找到下一个可执行的 Job（因为子 Job 已处于终态）。
+
+#### 4.8.3 设计意图
+
+Throttle 的设计目标是**保护下游系统不被过载**，而非**保证每个事件都必须送达**。如果在窗口恢复后自动重试被跳过的事件，可能导致：
+1. 流量突增（所有被跳过的事件同时重试）
+2. 再次触发限频
+3. 违反"保护下游"的初衷
+
+如果业务需要保证送达，应使用 Digest（聚合）而非 Throttle（限流）。
+
+### 4.9 与 Digest/Delay 到期调度的本质差异
+
+#### 4.9.1 三节点 AddJob 阶段决策对比
+
+| 决策维度 | Digest | Delay | Throttle |
+|---------|--------|-------|----------|
+| 决策阶段 | AddJob.executeDeferredJob | AddJob.executeDeferredJob | AddJob.executeDeferredJob |
+| 决策依据 | MongoDB 查询同 Key 的 DELAYED Job | metadata 配置计算 delayMs | Redis Set 计数 + TTL |
+| 决策结果 | DELAYED / MERGED / SKIPPED | DELAYED | 通过: 继续<br>不通过: SKIPPED |
+| 是否调用 queueJob() | ✅ DELAYED 分支调用 | ✅ 调用 | ✅ 通过时调用（delay=0）<br>❌ 不通过时不调用 |
+| BullMQ delay 值 | digestAmount（>0） | delayAmount（>0） | 0（立即执行） |
+| Job 终态设置 | DELAYED（中间态） | DELAYED（中间态） | SKIPPED（终态） |
+
+#### 4.9.2 到期/恢复时的调度链路对比
+
+**Digest/Delay 到期调度链路（自动恢复）**：
+```
+BullMQ 内部调度（delay 到期）
+    ↓
+StandardWorker.getWorkerProcessor() 消费
+    ↓
+RunJob.execute()
+    ├─ delayedEventIsCanceled() 检查
+    ├─ Subscriber Schedule 检查（可重新入队）
+    ├─ SendMessage 执行（Digest 收集 events / Delay 仅记录）
+    ├─ 标记 COMPLETED
+    └─ tryQueueNextJobs() → 查找 _parentId = 当前 JobId 的下一个 Job → AddJob.execute()
+```
+
+**Throttle 不通过链路（无自动恢复）**：
+```
+AddJob.executeDeferredJob()
+    ↓
+handleThrottle() → Redis 判定 granted=false
+    ↓
+handleThrottleSkip()
+    ├─ 更新当前 Job.status = SKIPPED
+    ├─ updateAllChildJobStatus() → 所有子 Job.status = SKIPPED
+    └─ return { workflowStatus: COMPLETED, deliveryLifecycleStatus: SKIPPED }
+    ↓
+流程终止。不会投递到 BullMQ，没有后续调度。
+新事件到达时重新走完整链路，与已 SKIPPED 的旧 Job 无关。
+```
+
+#### 4.9.3 状态机性质差异
+
+| 节点 | 状态 | 性质 | 后续动作 |
+|------|------|------|---------|
+| Digest | DELAYED | 中间态 | BullMQ 到期自动调度 |
+| Delay | DELAYED | 中间态 | BullMQ 到期自动调度 |
+| Throttle（通过） | DELAYED（delay=0） | 伪中间态 | BullMQ 立即调度 |
+| Throttle（不通过） | SKIPPED | 终态 | 无任何后续动作 |
+
+**核心区别**：DELAYED 状态意味着"等待条件满足后继续执行"，而 SKIPPED 意味着"放弃执行，流程到此为止"。BullMQ 只会为 DELAYED 状态的 Job 提供自动调度能力。
 
 ---
 
@@ -381,6 +609,7 @@ Delay 和 Digest 节点支持 **extendToSchedule** 选项，允许将延迟到�
 | Digest Regular 事件 | `apps/worker/src/app/workflow/usecases/send-message/digest/get-digest-events-regular.usecase.ts` |
 | Digest Backoff 事件 | `apps/worker/src/app/workflow/usecases/send-message/digest/get-digest-events-backoff.usecase.ts` |
 | Throttle 限频判定 | `apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts` (handleThrottle) |
+| Throttle 限频跳过 | `apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts` (handleThrottleSkip) |
 | Redis 限频服务 | `libs/application-generic/src/services/throttle/redis-throttle.service.ts` |
 | Throttle 运行时 | `apps/worker/src/app/workflow/usecases/send-message/throttle/throttle.usecase.ts` |
 | Delay 运行时 | `apps/worker/src/app/workflow/usecases/send-message/send-message-delay.usecase.ts` |
@@ -388,6 +617,9 @@ Delay 和 Digest 节点支持 **extendToSchedule** 选项，允许将延迟到�
 | Timed 延迟计算 | `libs/application-generic/src/services/calculate-delay/timed-digest-delay.service.ts` |
 | Job 执行与恢复 | `apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts` |
 | 消息分发 | `apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts` |
+| BullMQ 队列服务 | `libs/application-generic/src/services/bull-mq/bull-mq.service.ts` |
+| 队列基础服务（含 SQS/BullMQ 路由） | `libs/application-generic/src/services/queues/queue-base.service.ts` |
+| 标准 Worker（消费入口） | `apps/worker/src/app/workflow/services/standard.worker.ts` |
 | Job Schema | `libs/dal/src/repositories/job/job.schema.ts` |
 | Digest 校验 | `apps/worker/src/app/workflow/usecases/add-job/validation.ts` |
 | Delay 控制 Schema | `libs/application-generic/src/schemas/control/delay-control.schema.ts` |
@@ -396,3 +628,32 @@ Delay 和 Digest 节点支持 **extendToSchedule** 选项，允许将延迟到�
 | Throttle 控制 DTO | `libs/application-generic/src/dtos/workflow/controls/throttle-control.dto.ts` |
 | Throttle 类型定义 | `libs/application-generic/src/services/throttle/throttle.types.ts` |
 | Job 创建入口 | `libs/application-generic/src/usecases/create-notification-jobs/create-notification-jobs.usecase.ts` |
+
+---
+
+## 十一、核心差异总览
+
+### 11.1 三节点调度全景对比
+
+| 维度 | Digest（聚合） | Delay（延迟） | Throttle（限频） |
+|-----|-------------|------------|-----------------|
+| **核心目的** | 聚合同窗口事件，减少下游通知次数 | 推迟下游执行到指定时间 | 保护下游不被过载，牺牲送达 |
+| **决策存储** | MongoDB（Job 状态 + 合并关系 | MongoDB + BullMQ delay | Redis（Set + TTL） |
+| **AddJob 决策** | 合并/创建/跳过 | 计算延迟时长 | 过/不通过 |
+| **未通过结果** | MERGED / SKIPPED | 无（必然 DELAYED） | SKIPPED（级联子 Job） |
+| **BullMQ delay | 入队时 delay>0 | 入队时 delay>0 | 通过时 delay=0<br>不通过不入队 |
+| **状态性质** | DELAYED（中间态，自动恢复 | DELAYED（中间态，自动恢复 | SKIPPED（终态，无恢复） |
+| **到期恢复** | BullMQ 到期自动调度 + 收集聚合 events | BullMQ 到期自动调度 + 放行 | 无恢复，新事件重新走完整链路 |
+| **父子链** | 合并到主 Job，子 Job MERGED | 单 Job 延迟 | 级联 SKIPPED，链中断 |
+| **送达保证** | ✅ 保证送达（聚合后） | ✅ 保证送达（延迟后） | ❌ 超限即丢弃 |
+| **适用场景** | 批量通知、降噪 | 定时发送、错峰 | 保护下游 API/第三方服务 |
+
+### 11.2 自动恢复能力矩阵
+
+| 触发场景 | Digest | Delay | Throttle |
+|---------|--------|-------|----------|
+| 延迟/窗口到期 | ✅ 自动恢复 | ✅ 自动恢复 | ❌ 无自动恢复 |
+| 主 Job 被取消 | ✅ 提升 Follower 继续 | ❌ 直接取消 | ❌ 无此概念 |
+| 订阅者日程扩展 | ✅ 重新入队（最多 3 次） | ✅ 重新入队（最多 3 次） | ❌ 不涉及 |
+| 新事件到达 | ✅ 合并到现有窗口 | ❌ 无窗口概念 | ✅ 新窗口重新计数 |
+| 已跳过的旧事件 | ❌ 不会追溯 | ❌ 不会追溯 | ❌ 不会追溯 |
