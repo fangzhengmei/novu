@@ -457,6 +457,141 @@ handleThrottleSkip()
 
 **核心区别**：DELAYED 状态意味着"等待条件满足后继续执行"，而 SKIPPED 意味着"放弃执行，流程到此为止"。BullMQ 只会为 DELAYED 状态的 Job 提供自动调度能力。
 
+### 4.10 限频执行语义的代码级深入分析
+
+#### 4.10.1 配置异常时为何直接放行而非限流失败
+
+在 `handleThrottle()`（`add-job.usecase.ts:815-857`）中，**所有配置解析异常分支都返回 `shouldSkip: false`**，即直接放行而非限频失败。代码中共有 5 处异常退出点：
+
+| 异常场景 | 代码位置 | 处理方式 |
+|---------|---------|---------|
+| Fixed 类型缺少 amount/unit | `add-job.usecase.ts:828-831` | `logger.warn()` + `return { shouldSkip: false }` |
+| Fixed 类型 unit 非法（DurationUtils 抛错） | `add-job.usecase.ts:835-838` | `logger.warn()` + `return { shouldSkip: false }` |
+| Dynamic 类型缺少 dynamicKey | `add-job.usecase.ts:841-844` | `logger.warn()` + `return { shouldSkip: false }` |
+| Dynamic 类型解析失败（parseDynamicDurationValue 返回 null） | `add-job.usecase.ts:847-851` | `logger.warn()` + `return { shouldSkip: false }` |
+| 未知 type（非 fixed/dynamic） | `add-job.usecase.ts:854-857` | `logger.warn()` + `return { shouldSkip: false }` |
+
+**代码示例**：
+```typescript
+if (type === 'fixed') {
+  const { amount, unit } = throttleConfig;
+  if (!amount || !unit) {
+    this.logger.warn(`Fixed throttle configuration missing amount or unit for job ${job._id}`);
+    return { shouldSkip: false };  // 直接放行
+  }
+}
+```
+
+**设计意图分析**：
+1. **Fail-open 而非 Fail-close**：Throttle 的设计哲学是"最好的情况是限频，最坏的情况是不限频"，而非因为配置错误导致业务完全不可用。
+2. **区别于 Delay 的异常处理**：Delay 类型在动态延迟解析失败时会 `throw error`（`compute-job-wait-duration.service.ts`）并走 `handleStepValidationError` 标记 FAILED，因为 Delay 是"保证送达"型节点，错误配置导致延迟不成立时应失败而非跳过。
+3. **监控兜底**：仅打 `logger.warn()`，依赖日志监控发现配置问题，而不是阻塞业务流程。
+
+#### 4.10.2 throttledUntil 与 Redis TTL 缓冲不一致的原因
+
+**现象**：
+- `throttledUntil` 计算：`new Date(reservationResult.windowStartMs + windowMs).toISOString()`（`add-job.usecase.ts:901, 910`）
+- Redis 实际 TTL：`Math.ceil((windowMs + ttlBufferMs) / 1000)` 秒（`redis-throttle.service.ts:112-114`），其中 `ttlBufferMs` 默认 30s
+
+即：`Redis TTL = windowMs + 30s`，而 `throttledUntil = windowStartMs + windowMs`，两者相差约 30 秒。
+
+**代码层面的不一致原因**：
+
+1. **用途不同**：
+   - `throttledUntil` 是**用户可见的提示信息**，写入 `Job.stepOutput.throttledUntil`，在 Activity Feed 中展示给用户，告知"限频到 X 时间为止"
+   - Redis TTL 是**内部一致性保障**，确保窗口内的所有事件都被正确计数，防止边界 race condition
+
+2. **窗口起点的注释说明**：
+   ```typescript
+   // redis-throttle.service.ts:201
+   windowStartMs: params.nowMs, // For sliding windows, window starts when first request arrives
+   ```
+   代码注释表明 `windowStartMs` 是"窗口起点"，但实际上**固定窗口的起点是第一个成功获取配额的事件的时间**，而非每个事件的 `nowMs`。这导致：
+   - 当窗口已有配额被占用时，`windowStartMs = 当前事件的 nowMs`（并非真实窗口起点）
+   - `throttledUntil = windowStartMs + windowMs` 会比真实的窗口结束时间晚
+
+3. **Buffer 存在的原因**：
+   - 防止 Redis TTL 过期与新事件到达之间的边界 race condition
+   - 防止时钟漂移导致窗口提前结束
+   - Lua 脚本中已有前置 TTL 检查（`TTL == 0 或 -1 时 DEL`），所以 buffer 不会导致窗口延长
+
+**潜在的用户体验问题**：
+- 用户看到的 `throttledUntil` 可能与实际可重新获取配额的时间不一致
+- 如果配置了 1 分钟窗口，用户看到 `throttledUntil` 是 1 分钟后，但 Redis 实际要 1 分 30 秒后才会重置
+
+#### 4.10.3 SKIPPED 子链写入 _mergedDigestId 对 delivery lifecycle 判定优先级的影响
+
+`updateAllChildJobStatus()`（`job.repository.ts:262-301`）在更新子 Job 状态时，会**同时写入 `_mergedDigestId: activeDigestId`**：
+
+```typescript
+async updateAllChildJobStatus(job: JobEntity, status: JobStatusEnum, activeDigestId: string): Promise<JobEntity[]> {
+  // ...
+  {
+    $set: {
+      status,
+      _mergedDigestId: activeDigestId,  // 无论 status 是 MERGED 还是 SKIPPED，都会写入
+    },
+  }
+  // ... 循环遍历整条子链
+}
+```
+
+这个方法被**三处调用**，传入的 `activeDigestId` 含义不同：
+
+| 调用方 | 传入的 status | 传入的 activeDigestId | 含义 |
+|--------|-------------|----------------------|------|
+| `processMergedDigest`（merge-or-create-digest.usecase.ts:87） | `MERGED` | Master Digest Job 的 _id | 子 Job 被合并到主 Digest Job |
+| `handleThrottleSkip`（add-job.usecase.ts:1032） | `SKIPPED` | 当前 Throttle Job 的 _id | 子 Job 因限频被跳过 |
+| `handleDigestSkip` 无直接调用，但 Digest Backoff 跳过也会走级联 | 各种 | 不同 |
+
+**对 Delivery Lifecycle 判定的影响**：
+
+在 `WorkflowRunService.buildDeliveryLifecycle()`（`workflow-run.service.ts:841-1017`）中，SKIPPED 和 MERGED 的判定优先级如下（从高到低）：
+
+```
+Priority 4: SKIPPED
+  ↓ 条件：
+  - allStepsFinished（所有 channel job 都是终态）
+  - skippedJobs = channelJobs 中 deliveryLifecycleState.status='skipped' 且 !_mergedDigestId
+  - skippedJobs.length > 0
+
+Priority 7: MERGED
+  ↓ 条件：
+  - allStepsMerged = 所有 channel job 都是 MERGED 或 (SKIPPED 且 !!_mergedDigestId)
+```
+
+**关键优先级逻辑**（`workflow-run.service.ts:914-917`）：
+```typescript
+const skippedJobs = channelJobs.filter(
+  (job) =>
+    job.deliveryLifecycleState?.status && job.deliveryLifecycleState.status === 'skipped' && !job._mergedDigestId
+);
+```
+
+**判定优先级的代码路径**：
+1. **Priority 4（SKIPPED）先于 Priority 7（MERGED）执行**
+2. SKIPPED 判定会**排除** `_mergedDigestId` 存在的 Job（即 Throttle SKIPPED 的子链不会被算作 SKIPPED）
+3. 如果所有 channel job 都是 `SKIPPED 且有 _mergedDigestId`，则不满足 Priority 4，继续向下走
+4. Priority 7 判定 `allStepsMerged`：`MERGED || (SKIPPED && _mergedDigestId)` → 返回 MERGED
+
+**这意味着**：
+- Throttle 限频跳过的子 Job 链（`status=SKIPPED, _mergedDigestId=throttleJobId`）在 delivery lifecycle 中会被判定为 **MERGED**，而非 SKIPPED
+- 只有真正因条件过滤、用户偏好等原因跳过且 `_mergedDigestId=null` 的 Job，才会被判定为 SKIPPED
+
+**设计意图**：
+- `_mergedDigestId` 在这里被用作"跳过原因"的隐式标记
+- Digest 合并的跳过 → 最终会由 Master Digest Job 送达 → 判定为 MERGED
+- Throttle 限频的跳过 → 不会送达 → 但因代码复用 `updateAllChildJobStatus` 也被写入了 `_mergedDigestId`，导致判定为 MERGED
+- 这可能是一个**设计上的不一致**：Throttle 限频跳过不应被标记为 MERGED，但因为复用了 `updateAllChildJobStatus` 方法而意外获得了 `_mergedDigestId`
+
+**三种调用场景下的 delivery lifecycle 判定**：
+
+| 场景 | Job.status | _mergedDigestId | deliveryLifecycle 判定 |
+|------|-----------|-----------------|----------------------|
+| Digest 合并子 Job | MERGED | masterDigestJobId | MERGED（Priority 7） |
+| Throttle 限频子 Job | SKIPPED | throttleJobId | MERGED（Priority 7，因 _mergedDigestId 存在） |
+| 条件过滤子 Job | SKIPPED | null | SKIPPED（Priority 4） |
+
 ---
 
 ## 五、延迟节点（Delay）
@@ -620,6 +755,8 @@ Delay 和 Digest 节点支持 **extendToSchedule** 选项，允许将延迟到�
 | BullMQ 队列服务 | `libs/application-generic/src/services/bull-mq/bull-mq.service.ts` |
 | 队列基础服务（含 SQS/BullMQ 路由） | `libs/application-generic/src/services/queues/queue-base.service.ts` |
 | 标准 Worker（消费入口） | `apps/worker/src/app/workflow/services/standard.worker.ts` |
+| Job Repository（updateAllChildJobStatus） | `libs/dal/src/repositories/job/job.repository.ts` |
+| Delivery Lifecycle 判定 | `libs/application-generic/src/services/workflow-run.service.ts` |
 | Job Schema | `libs/dal/src/repositories/job/job.schema.ts` |
 | Digest 校验 | `apps/worker/src/app/workflow/usecases/add-job/validation.ts` |
 | Delay 控制 Schema | `libs/application-generic/src/schemas/control/delay-control.schema.ts` |
