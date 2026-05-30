@@ -519,6 +519,65 @@ if (type === 'fixed') {
 - 用户看到的 `throttledUntil` 可能与实际可重新获取配额的时间不一致
 - 如果配置了 1 分钟窗口，用户看到 `throttledUntil` 是 1 分钟后，但 Redis 实际要 1 分 30 秒后才会重置
 
+##### 4.10.2.1 throttledUntil 与 Redis 实际配额恢复时刻的精确时序关系
+
+让我们通过一个**精确的时序示例**来理解两者的差异：
+
+**场景**：配置 `windowMs = 60000ms`（1 分钟），`threshold = 1`（每窗口只允许 1 条）
+
+```
+时间轴 (ms):
+t=1000      [事件 E1 到达] → 成功获取配额，Redis Set Key 创建，TTL=ceil((60000+30000)/1000)=90s
+            │
+            ├─ Lua 执行: count=0 < 1 → granted=1, SADD, count==1 → EXPIRE 90
+            └─ Redis Key TTL 到期时间 = t=1000 + 90000 = t=91000
+
+t=2000      [事件 E2 到达] → 被拒绝
+            │
+            ├─ params.nowMs = 2000 (在 add-job.usecase.ts:859 调用 Date.now())
+            ├─ reservationResult.windowStartMs = 2000 (这是 E2 的到达时间，不是窗口起点!)
+            ├─ throttledUntil = 2000 + 60000 = t=62000 (显示给用户)
+            └─ 实际 Redis 配额恢复时刻 = t=91000
+               ↑
+               差异: 91000 - 62000 = 29000ms (≈ 30s buffer + E1/E2 时间差)
+
+t=62000     [用户看到 throttledUntil 已过，以为配额恢复了]
+            [事件 E3 到达] → 仍被拒绝 (Redis Key 还需 29s 才到期)
+
+t=91000     [Redis Key TTL 到期，真正可重新获取配额]
+            [事件 E4 到达] → Lua TTL 检查发现 TTL<=0 → DEL Key → 重新计数
+            └─ 新窗口起点 = t=91000
+```
+
+**精确数学关系**：
+
+| 变量 | 计算方式 |
+|------|---------|
+| 窗口真实起点 `W₀` | 第一个成功事件的到达时间（Lua 设置 TTL 的时刻） |
+| 用户可见 `throttledUntil` | `E_arrivalTime + windowMs`（当前被拒绝事件的到达时间 + 窗口大小） |
+| 实际配额恢复时刻 `T_actual` | `W₀ + windowMs + bufferMs` |
+| 展示误差 `Δ` | `T_actual - throttledUntil = (W₀ - E_arrivalTime) + bufferMs` |
+
+**误差范围**：
+- 最小误差：`bufferMs`（事件刚好在窗口起点之后到达，`W₀ ≈ E_arrivalTime`）
+- 最大误差：`windowMs + bufferMs`（事件刚好在上一个窗口起点之后到达）
+
+##### 4.10.2.2 为什么不使用 Redis 返回的 ttlSecRemaining 计算 throttledUntil？
+
+`redis-throttle.service.ts:200` 实际上从 Redis 获取了 `ttlSecRemaining`：
+```typescript
+ttlMs: ttlSecRemaining > 0 ? ttlSecRemaining * 1000 : 0,
+```
+
+但 `add-job.usecase.ts:901` 并没有使用这个值，而是使用了 `windowStartMs + windowMs`。这可能是一个**历史遗留问题**或**设计选择**：
+- 使用 `windowStartMs + windowMs` 给用户的感觉是"限频到 X 时间为止"，是一个绝对时间点
+- 使用 `ttlMs` 会给用户"还需要等待 X 毫秒"，是一个相对时长
+- 从用户体验角度，绝对时间点可能更友好，但牺牲了精确性
+
+**另外一个隐藏问题**：即使使用 `ttlSecRemaining` 计算，也仍然有 `bufferMs` 的差异，因为 TTL 包含了 30s buffer。
+
+---
+
 #### 4.10.3 SKIPPED 子链写入 _mergedDigestId 对 delivery lifecycle 判定优先级的影响
 
 `updateAllChildJobStatus()`（`job.repository.ts:262-301`）在更新子 Job 状态时，会**同时写入 `_mergedDigestId: activeDigestId`**：
@@ -591,6 +650,103 @@ const skippedJobs = channelJobs.filter(
 | Digest 合并子 Job | MERGED | masterDigestJobId | MERGED（Priority 7） |
 | Throttle 限频子 Job | SKIPPED | throttleJobId | MERGED（Priority 7，因 _mergedDigestId 存在） |
 | 条件过滤子 Job | SKIPPED | null | SKIPPED（Priority 4） |
+
+---
+
+#### 4.10.4 Mixed Channel 状态下 SKIPPED/MERGED/PENDING 最终分类判定表
+
+当工作流有多个 Channel Step（如 Email + SMS），且各步骤状态不一致时，`buildDeliveryLifecycle()` 会按照优先级链进行判定。以下是**完整的 mixed 状态判定表**（仅包含 SKIPPED、MERGED、PENDING 三种结果的触发条件）：
+
+##### 4.10.4.1 判定表（按优先级从高到低）
+
+> **注意**：Priority 1-3（INTERACTED/DELIVERED/SENT）优先级更高，只要满足就不会走到下面的判定。本表聚焦 SKIPPED/MERGED/PENDING，因此假设不满足 Priority 1-3。
+
+| 最终结果 | 判定优先级 | 触发条件（最小集合） | channelJobs 状态组合示例 |
+|---------|-----------|---------------------|-------------------------|
+| **SKIPPED** | Priority 4 | 1. 所有 channel job 都是终态（COMPLETED/FAILED/CANCELED/MERGED/SKIPPED）<br>2. 至少 1 个 channel job 的 `deliveryLifecycleState.status='skipped'` **且** `_mergedDigestId=null` | [SKIPPED(null), COMPLETED]<br>[SKIPPED(null), MERGED]<br>[SKIPPED(null), FAILED]<br>[SKIPPED(null), SKIPPED(id)] |
+| **MERGED** | Priority 7 | 1. 不满足 Priority 4、5、6<br>2. 所有 channel job 满足：<br>`status=MERGED` **或** (`status=SKIPPED` **且** `_mergedDigestId != null`) | [MERGED, MERGED]<br>[MERGED, SKIPPED(id)]<br>[SKIPPED(id), SKIPPED(id)] |
+| **PENDING** | Priority 8 | 1. 不满足 Priority 1-7<br>2. 任一 channel job 状态为：PENDING / QUEUED / RUNNING / DELAYED | [PENDING, COMPLETED]<br>[DELAYED, SKIPPED(null)]<br>[RUNNING, MERGED]<br>[QUEUED, SKIPPED(id)] |
+
+##### 4.10.4.2 触发各分支的最小条件集合
+
+**✅ 触发 SKIPPED（Priority 4）的最小条件**：
+```
+必须同时满足：
+  [A] 所有 channel jobs ∈ {COMPLETED, FAILED, CANCELED, MERGED, SKIPPED}
+  [B] ∃ 至少 1 个 job:
+        job.deliveryLifecycleState?.status === 'skipped'
+        AND job._mergedDigestId == null
+  [C] 不满足 Priority 1-3（无 INTERACTED/DELIVERED/SENT）
+
+最小反例（不触发）：
+  [SKIPPED(id)] → 不满足 [B]（有 _mergedDigestId）→ 走到 Priority 7 → MERGED
+  [SKIPPED(null), PENDING] → 不满足 [A]（有非终态）→ 走到 Priority 8 → PENDING
+```
+
+**✅ 触发 MERGED（Priority 7）的最小条件**：
+```
+必须同时满足：
+  [A] 不满足 Priority 1-6
+  [B] ∀ channel jobs:
+        job.status === MERGED
+        OR (job.status === SKIPPED AND job._mergedDigestId != null)
+
+最小正例：
+  [MERGED] → MERGED
+  [SKIPPED(throttleJobId)] → MERGED （这是 Throttle 限频跳过的典型场景）
+
+最小反例（不触发）：
+  [MERGED, SKIPPED(null)] → 不满足 [B]（有 SKIPPED 无 _mergedDigestId）→ Priority 4 → SKIPPED
+  [MERGED, COMPLETED] → 不满足 [B]（有 COMPLETED）→ 走到 Fallback → ERRORED
+```
+
+**✅ 触发 PENDING（Priority 8）的最小条件**：
+```
+必须同时满足：
+  [A] 不满足 Priority 1-7
+  [B] ∃ 至少 1 个 job:
+        job.status ∈ {PENDING, QUEUED, RUNNING, DELAYED}
+
+最小正例：
+  [PENDING] → PENDING
+  [DELAYED, SKIPPED(null)] → PENDING
+
+最小反例（不触发）：
+  [PENDING, MERGED] → 不满足 [A]（有 PENDING，也不满足 Priority 7 的"所有 job"条件）→ 仍走到 Priority 8 → PENDING
+  [COMPLETED, FAILED] → 不满足 [B]（无进行中状态）→ 不满足 Priority 1-7 → Fallback ERRORED
+```
+
+##### 4.10.4.3 复杂 mixed 状态判定示例
+
+| channelJobs 状态组合 | 判定过程 | 最终结果 |
+|---------------------|---------|---------|
+| [SKIPPED(null), MERGED, SKIPPED(id)] | Priority 4: all终态=true, 有 SKIPPED(null) → 满足 | **SKIPPED** |
+| [SKIPPED(id), SKIPPED(id), DELAYED] | Priority 4: all终态=false（有 DELAYED）<br>Priority 8: 有 DELAYED → 满足 | **PENDING** |
+| [MERGED, COMPLETED] | Priority 4: 无 SKIPPED(null)<br>Priority 5: 无 CANCELED<br>Priority 6: 非 all FAILED<br>Priority 7: COMPLETED 不满足 `MERGED || SKIPPED(id)`<br>Priority 8: 无进行中<br>→ Fallback | **ERRORED** |
+| [SKIPPED(id), PENDING, SKIPPED(id)] | Priority 4: all终态=false（有 PENDING）<br>Priority 8: 有 PENDING → 满足 | **PENDING** |
+| [FAILED, SKIPPED(null)] | Priority 4: all终态=true, 有 SKIPPED(null) → 满足 | **SKIPPED** |
+| [MERGED, SKIPPED(id)] | Priority 7: 所有都满足 `MERGED || SKIPPED(id)` → 满足 | **MERGED** |
+| [SKIPPED(id), SKIPPED(id), SKIPPED(id)] | Priority 7: 所有都是 SKIPPED(id) → 满足 | **MERGED**（Throttle 全限频场景） |
+
+##### 4.10.4.4 Throttle 限频场景下的典型判定链
+
+**场景**：工作流有 Email 和 SMS 两个 Channel Step，均被 Throttle 限频
+
+```
+Email Job: status=SKIPPED, _mergedDigestId=throttleJobId
+SMS Job:   status=SKIPPED, _mergedDigestId=throttleJobId
+
+判定过程:
+  Priority 1-3: 无 message，不满足
+  Priority 4: all终态=true ✓, 但所有 SKIPPED 都有 _mergedDigestId → 无 SKIPPED(null) → 不满足
+  Priority 5: 无 CANCELED → 不满足
+  Priority 6: 非 all FAILED → 不满足
+  Priority 7: 所有都是 SKIPPED(id) → 满足 ✓
+
+最终结果: MERGED
+```
+
+**用户视角的误导**：用户在 Activity Feed 中看到的是"已聚合（MERGED）"，但实际上两个 Channel 都被限频跳过，**没有任何消息会被发送**。这是一个潜在的 UX 问题。
 
 ---
 
