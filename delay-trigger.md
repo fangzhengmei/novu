@@ -581,13 +581,13 @@ public shouldBackoff(error: Error): boolean {
 
 #### 4.2.1 webhookFilterBackoff 退避策略注册机制
 
-退避策略通过 BullMQ Worker 的 `settings.backoffStrategy` 注册，而非硬编码在失败处理逻辑中：
+退避策略通过 BullMQ Worker 的 `settings.backoffStrategy` 注册，`getBackoffStrategies()` 返回的是**单函数签名**，与 BullMQ 原生约定完全一致。入队时标记的 `backoff.type` 参数在实际执行时被忽略。
 
 **注册点 1 - 入队时标记退避类型**：
 ```typescript
 // add-job.usecase.ts#L96-L99
 if (stepContainsWebhookFilter) {
-  options.backoff = { type: 'webhookFilterBackoff' };  // 标记退避策略类型
+  options.backoff = { type: 'webhookFilterBackoff' };  // 标记（运行时被忽略）
   options.attempts = 3;                                  // 最大尝试次数
 }
 ```
@@ -599,21 +599,37 @@ private getWorkerOptions(): WorkerOptions {
   return {
     ...getStandardWorkerOptions(),
     settings: {
-      backoffStrategy: this.getBackoffStrategies(),  // 注册退避策略映射
+      backoffStrategy: this.getBackoffStrategies(),  // 传入单函数
     },
   };
 }
 ```
 
-**注册点 3 - 策略映射到具体实现**：
-`getBackoffStrategies()` 返回一个对象，键为退避类型名称（`webhookFilterBackoff`），值为一个函数，该函数调用 `webhookFilterBackoffStrategy.execute()` 计算退避延迟。
+**注册点 3 - 单函数签名实现**（`type` 参数被忽略）：
+```typescript
+// standard.worker.ts#L287-L298
+private getBackoffStrategies = () => {
+  return async (attemptsMade: number, type: string, eventError: Error, eventJob: Job): Promise<number> => {
+    // 注：参数 type（即入队时标记的 'webhookFilterBackoff'）在此函数体中未被引用
+    // 所有启用了 attempts 的作业统一走同一策略
+    return await this.webhookFilterBackoffStrategy.execute({
+      attemptsMade,
+      environmentId: eventJob?.data?._environmentId,
+      eventError,
+      eventJob,
+      organizationId: eventJob?.data?._organizationId,
+      userId: eventJob?.data?._userId,
+    });
+  };
+};
+```
 
 **完整调用链路**：
-1. 入队时设置 `backoff.type = 'webhookFilterBackoff'`
-2. Worker 初始化时注册 `backoffStrategy` 映射
-3. 作业失败时，BullMQ 根据 `backoff.type` 查找对应的策略函数
-4. 策略函数调用 `WebhookFilterBackoffStrategy.execute()` 计算退避延迟
-5. 按延迟重新调度作业
+1. 入队时设置 `backoff = { type: 'webhookFilterBackoff' }` + `attempts = 3`
+2. Worker 初始化时将 `settings.backoffStrategy` 设为单函数（4 参数签名）
+3. 作业失败且有剩余 attempts 时，BullMQ 调用 `backoffStrategy(attemptsMade, type, err, job)`
+4. 函数体内忽略 `type`，统一调用 `WebhookFilterBackoffStrategy.execute()` 计算退避延迟
+5. 按计算出的延迟重新调度作业
 
 ### 4.3 退避策略计算
 
