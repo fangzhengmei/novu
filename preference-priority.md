@@ -204,30 +204,138 @@ return {
 
 ### 4.3 运行时 Schedule 检查（Worker 侧）
 
-在 [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L176-L218) 中，Schedule 检查**独立于偏好合并**进行：
+在 [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L176-L256) 中，Schedule 检查**独立于偏好合并**进行，且采用"先尝试延期，不能延期再取消"的两段式策略：
 
 ```
-1. 获取 subscriber 的 Schedule（通过 GetSubscriberSchedule 从 SUBSCRIBER_GLOBAL 偏好读取）
-2. 获取 subscriber 的 timezone
-3. 判断 isOutsideSubscriberSchedule = schedule.isEnabled && !isWithinSchedule(schedule, now, timezone)
-4. 如果在勿扰时段内：
-   a. 先尝试 extendToSubscriberSchedule（仅对 delay/digest 类型且非 critical 的 job）
-      — 将 job 延迟到下一个可用时间（最多 3 次延期）
-   b. 如果不能延期，且非 in-app/critical 类型 → 取消 job
-   c. in-app 消息和 critical 通知始终跳过 Schedule 检查
+isOutsideSubscriberSchedule = schedule.isEnabled && !isWithinSchedule(schedule, now, timezone)
+
+if isOutsideSubscriberSchedule:
+  ├─ 第一步：尝试延期（仅 delay/digest 且非 critical）
+  │    shouldExtendToSubscriberSchedule?
+  │      ├─ 是 → extendJobToNextAvailableSchedule
+  │      │      ├─ 延期成功 → job 状态设为 DELAYED，return（等下一轮触发）
+  │      │      └─ 延期失败 → 继续向下（不 return）
+  │      └─ 否 → 继续向下
+  │
+  └─ 第二步：判断是否取消
+       !shouldSkipScheduleCheck?
+         ├─ 是（不跳过检查）→ job 标记为 CANCELED，return
+         └─ 否（跳过检查）→ 继续向下 → 实际放行
 ```
 
-### 4.4 `isWithinSchedule` 算法
+### 4.4 `isWithinSchedule` 算法与跨夜判定
 
-[schedule-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/schedule-validator.ts#L15-L67)：
+[isWithinSchedule](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/schedule-validator.ts#L15-L67) 的核心是**"两天窗口 + 时段比较"**：
 
-1. 如果没有 schedule 或 `schedule.isEnabled = false` → 允许所有消息
-2. 将当前时间转换到 subscriber 的时区
-3. 查询当天对应的 `DaySchedule`
-4. 还要检查前一天是否有跨夜时段（如 11:00 PM - 02:00 AM）
-5. 判断当前时间是否落在任何一个配置的时间范围内
+**步骤 1：时区转换**
+- 若有 timezone，用 `utcToZonedTime` 把 UTC 现在时刻转到订阅者时区
+- 没有 timezone 就用 UTC 时间
 
-### 4.5 Schedule 与 Critical 的交互
+**步骤 2：确定需要检查哪几天**
+- 初始只检查"今天"
+- 再看"昨天"是否有跨夜时段（`end < start`，即结束时间早于开始时间，说明跨午夜）
+  - 如果有，把"昨天"也加入检查列表
+- 这是为了处理类似 "11:00 PM - 02:00 AM" 这种跨午夜的可用时段：当现在是凌晨 1 点时，它属于昨天晚上开始的那个时段
+
+**步骤 3：逐天检查**
+- 跳过 `isEnabled = false` 的日子
+- 跳过没有配置 hours 的日子
+- 对每个时段调用 `isTimeInRange`
+
+**步骤 4：`isTimeInRange` 的跨夜处理**
+```typescript
+if (endInMinutes < startInMinutes) {
+  // 跨午夜时段：当前时间 >= 开始 或 当前时间 <= 结束 → 在范围内
+  return timeInMinutes >= startInMinutes || timeInMinutes <= endInMinutes;
+}
+// 普通时段：开始 <= 当前时间 <= 结束 → 在范围内
+return timeInMinutes >= startInMinutes && timeInMinutes <= endInMinutes;
+```
+
+**举例**：时段 "11:00 PM - 02:00 AM"（start=23:00, end=2:00）
+- 现在 00:30 → 0:30 < 2:00 → 满足 `time <= end` → 在范围内 ✓
+- 现在 23:30 → 23:30 >= 23:00 → 满足 `time >= start` → 在范围内 ✓
+- 现在 15:00 → 两个都不满足 → 不在范围内 ✗
+
+### 4.5 延期机制与计数挂点
+
+[extendJobToNextAvailableSchedule](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L911-L983) 是 delay/digest 类型 job 的"软处理"路径。
+
+**计数字段**：`job.scheduleExtensionsCount`
+- 挂在 MongoDB 的 `jobs` 集合文档上
+- 初始为 `undefined`，读取时当作 `0`
+- 每次成功延期时 `$set` 为 `currentExtensions + 1`
+
+**最大延期次数**：`MAX_EXTENSIONS = 3`
+
+**延期成功的条件**（全部满足）：
+1. `currentExtensions < MAX_EXTENSIONS`（还没到 3 次）
+2. `calculateNextAvailableTime` 返回的时间与当前时间差 > 0（确实存在未来的可用时间）
+3. job 更新成功
+
+**延期失败的两种情况**：
+| 原因 | 返回值 | 后续行为 |
+|------|--------|----------|
+| 已达 3 次上限 | `false` | 走到第二步判断（取消 or 放行） |
+| 下一可用时间就是现在（delayMs = 0） | `false` | 走到第二步判断（取消 or 放行） |
+
+### 4.6 第 4 次为什么"跳过"即放行
+
+第 4 次触发时，`scheduleExtensionsCount = 3`，达到 `MAX_EXTENSIONS`，`extendJobToNextAvailableSchedule` 返回 `false`。
+
+然后代码继续执行到第二步判断：
+
+```typescript
+if (isOutsideSubscriberSchedule && !this.shouldSkipScheduleCheck(job, notification.critical)) {
+  // → 标记为 CANCELED
+}
+```
+
+关键在于 `shouldSkipScheduleCheck` 对 **delay 和 digest 类型返回 `true`**（表示"跳过 Schedule 检查"）。所以：
+
+```
+!shouldSkipScheduleCheck = !true = false
+```
+
+整个 `if` 条件为 `false`，**不会进入 CANCELED 分支**，代码继续向下执行 → job 正常运行 → 消息实际被发送。
+
+> 这就是"第 4 次走名为跳过实际放行的分支"的含义：`shouldSkipScheduleCheck` 函数名意为"是否跳过 Schedule 检查"，返回 `true` 表示跳过检查，跳过检查的结果就是消息直接放行。
+
+**对不同类型 job 的完整命运矩阵**（在勿扰时段内）：
+
+| job 类型 | critical? | 第一步：尝试延期? | 延期失败后 | 最终命运 |
+|----------|-----------|------------------|-----------|----------|
+| email/sms/push/chat | 否 | 否（shouldExtend=false） | 不跳过检查 → CANCELED | 取消 |
+| email/sms/push/chat | 是 | 否（shouldExtend=false） | 跳过检查 → 放行 | 立即发送 |
+| in-app | 任意 | 否（shouldExtend=false） | 跳过检查 → 放行 | 立即发送 |
+| delay/digest | 否 | 是，最多延 3 次 | 跳过检查 → 放行 | 前 3 次延期，第 4 次强发 |
+| delay/digest | 是 | 否（shouldExtend=false） | 跳过检查 → 放行 | 立即发送 |
+| trigger | 任意 | 否 | 跳过检查 → 放行 | 立即执行 |
+
+### 4.7 下一可用时间预扫算法
+
+[calculateNextAvailableTime](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/schedule-validator.ts#L140-L229) 用于找到"下一个开始时间"。算法是**以天为外层循环，以时段为内层循环的线性扫描**：
+
+**扫描窗口**：`dayOffset` 从 `-1` 到 `7`，共 9 天
+- dayOffset = -1：昨天（用于检测跨午夜且当前正处于跨夜时段中）
+- dayOffset = 0：今天
+- dayOffset = 1 ~ 7：未来 7 天（保证覆盖完整一周）
+
+**对每一天**：
+1. 取那天的星期几（monday/tuesday/...）
+2. 如果那天没启用或没有 hours，跳过
+3. 对那天的每个时段：
+   a. 解析 start/end 为时分
+   b. 构造当天的 startZoned 和 endZoned 时刻
+   c. 如果 end 在 start 之前（跨午夜），把 endZoned 加 1 天
+   d. **如果是昨天或今天，且当前时间正好在时段内** → 返回当前时间（现在就在可用时段里）
+   e. **如果是未来的某天，或 start 在当前时间之后** → 返回 start 时刻（下一个开始点）
+
+**返回的都是 UTC 时间**（如果输入有时区，用 `zonedTimeToUtc` 转回 UTC）。
+
+**边界情况**：如果 9 天都扫完了还没找到可用时段（理论上不应该发生，因为一周内至少有一天配置了时段），兜底返回 `nowUtc`。
+
+### 4.8 Schedule 与 Critical 的交互
 
 ```typescript
 // run-job.usecase.ts
@@ -249,45 +357,60 @@ private shouldSkipScheduleCheck(job: JobEntity, critical: boolean | undefined): 
 
 ## 五、完整优先级决策流程
 
-当一条通知触发后，决策路径如下：
+当一条通知触发后，决策路径如下（**注意：Step 2 实际包含两次独立的偏好叠加**）：
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ Step 1: MergePreferences 合并偏好                     │
-│                                                      │
-│  WORKFLOW_RESOURCE ─┐                               │
-│  USER_WORKFLOW     ─┤── 深度合并 ──→ workflowResult   │
-│                      │                               │
-│  SUBSCRIBER_GLOBAL ──┤                               │
-│  SUBSCRIBER_WORKFLOW─┘── 深度合并 ──→ subscriberResult │
-│                                                      │
-│  如果 readOnly=true 或 excludeSubscriber=true:        │
-│    finalPreferences = workflowResult                  │
-│  否则:                                               │
-│    finalPreferences = merge(workflowResult, subscriberResult) │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Step 1: MergePreferences 4 层深度合并                                  │
+│                                                                      │
+│  WORKFLOW_RESOURCE ─┐                                                │
+│  USER_WORKFLOW     ─┤── 深度合并 ──→ workflowResult                   │
+│                      │                                                │
+│  SUBSCRIBER_GLOBAL ──┤                                                │
+│  SUBSCRIBER_WORKFLOW─┘── 深度合并 ──→ subscriberResult                │
+│                                                                      │
+│  如果 readOnly=true 或 excludeSubscriber=true:                         │
+│    finalPreferences = workflowResult                                   │
+│  否则:                                                                │
+│    finalPreferences = merge(workflowResult, subscriberResult)         │
+│         ↓                                                             │
+│  产出：WorkflowPreferences 结构化对象（all + channels）                │
+└──────────────────────────────────────────────────────────────────────┘
           │
           ▼
-┌─────────────────────────────────────────────────────┐
-│ Step 2: evaluateChannelPreference 渠道偏好检查         │
-│                                                      │
-│  将合并后的 WorkflowPreferences 转为 IPreferenceChannels │
-│  调用 stepPreferred():                               │
-│    result = all.enabled && channels[currentChannel]   │
-│  如果 result = false → SKIPPED (SUBSCRIBER_PREFERENCE)│
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Step 2: evaluateChannelPreference 渠道偏好检查（含二次叠加）            │
+│                                                                      │
+│  子步骤 2a：从 MergePreferences 拿 channels 映射                       │
+│            WorkflowPreferences.channels → { email: true, sms: false } │
+│                                                                      │
+│  子步骤 2b：overridePreferences 三路扁平覆盖                           │
+│                                                                      │
+│            initialChannels = { email:true, sms:true, push:true, ... } │
+│              ← TEMPLATE (旧版 preferenceSettings) 覆盖                │
+│              ← WORKFLOW_OVERRIDE (租户维度) 覆盖                       │
+│              ← SUBSCRIBER (来自子步骤 2a 的渠道映射) 覆盖              │
+│                                                                      │
+│            产出：最终 channels + overrides 来源追踪                    │
+│                                                                      │
+│  子步骤 2c：stepPreferred 判定                                         │
+│            result = all.enabled && channels[currentChannel]            │
+│            若 result = false → SKIPPED (SUBSCRIBER_PREFERENCE)        │
+└──────────────────────────────────────────────────────────────────────┘
           │
           ▼
-┌─────────────────────────────────────────────────────┐
-│ Step 3: Schedule 勿扰窗口检查（独立于 Step 1-2）        │
-│                                                      │
-│  从 SUBSCRIBER_GLOBAL 偏好获取 schedule               │
-│  如果 schedule.isEnabled && !isWithinSchedule():      │
-│    对 delay/digest 非 critical → 延迟到下一可用时间     │
-│    对 email/sms/push/chat 非 critical → CANCELED      │
-│    in-app / critical → 始终放行                       │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ Step 3: Schedule 勿扰窗口检查（独立于 Step 1-2）                         │
+│                                                                      │
+│  从 SUBSCRIBER_GLOBAL 偏好获取 schedule                                │
+│  如果 schedule.isEnabled && !isWithinSchedule():                       │
+│    对 delay/digest 非 critical → 最多延期 3 次，第 4 次强发             │
+│    对 email/sms/push/chat 非 critical → CANCELED                      │
+│    in-app / critical / trigger → 始终放行                             │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+> 重要提示：Step 2b 的 `WORKFLOW_OVERRIDE`（租户维度覆盖）**仅在发送链（Worker）路径中生效**，Dashboard 的偏好展示路径会传空对象 `{}` 跳过这一层。
 
 ---
 
@@ -304,6 +427,64 @@ const PRIORITY_ORDER = [
 ```
 
 按此顺序依次覆盖 `channels` 的布尔值，后者的值覆盖前者。此函数既用于 Dashboard 展示"覆盖来源"信息，**也直接参与 Worker 发送决策**（详见第九章、第十一章）。
+
+---
+
+## 七、写全局偏好时顺手清除工作流级同名渠道
+
+### 7.1 触发时机
+
+在 [upsertSubscriberGlobalPreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts#L66-L79) 方法中，**写入全局偏好之前**，会先调用 `deleteSubscriberWorkflowChannelPreferences`：
+
+```typescript
+public async upsertSubscriberGlobalPreferences(command: UpsertSubscriberGlobalPreferencesCommand) {
+  await this.deleteSubscriberWorkflowChannelPreferences(command);  // ← 先清
+  return this.upsert({ ... });                                    // ← 再写
+}
+```
+
+### 7.2 清除逻辑
+
+[deleteSubscriberWorkflowChannelPreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts#L81-L108) 的行为：
+
+1. 提取本次更新涉及的所有渠道（`command.preferences.channels` 的 keys）
+2. 如果没有渠道字段被更新，直接返回（不做任何清除）
+3. 构造 MongoDB `$unset` payload：
+   ```
+   {
+     "preferences.channels.email": "",
+     "preferences.channels.sms": "",
+     ...
+   }
+   ```
+4. 查找所有 `type = SUBSCRIBER_WORKFLOW` 的偏好记录，要求至少有一个目标渠道字段存在（`$exists: true`）
+5. 对匹配的记录执行 `$unset`，删除这些渠道字段
+
+**作用范围**：只清除 `SUBSCRIBER_WORKFLOW`（订阅者工作流级）偏好中的对应渠道，不碰 `SUBSCRIPTION_SUBSCRIBER_WORKFLOW`（订阅级）和工作流层偏好。
+
+### 7.3 设计意图
+
+这是一个**"回退"机制**：当用户在全局层面重新设定某个渠道的偏好时，之前在各个工作流上单独设置的渠道覆盖就变得没有意义了——因为全局值已经改变，工作流级的旧值是相对于旧全局值的覆盖。系统选择直接清除工作流级的渠道字段，让合并时自然回退到新的全局值。
+
+**举例**：
+- 初始状态：全局 `email=true`，工作流 A `email=false`（用户在工作流 A 上关了 email）
+- 用户修改全局偏好：`email=false`（全局关掉 email）
+- 系统自动清除所有 SUBSCRIBER_WORKFLOW 记录中的 `preferences.channels.email` 字段
+- 结果：工作流 A 不再有独立的 email 覆盖，合并时继承全局的 `email=false`
+
+### 7.4 副作用
+
+这种"顺带清除"的设计有一个值得注意的副作用：**用户之前在各工作流上精心配置的个性化偏好，会因为一次全局偏好修改而全部丢失**，且无法恢复。
+
+例如用户在 5 个工作流上分别设置了不同的 email 开关，某天他修改了全局的 sms 偏好，结果所有工作流上的 sms 个性化设置都被清掉了。
+
+### 7.5 反向不成立
+
+注意这个清除是**单向的**：
+- ✅ 写全局偏好 → 清除工作流级同名渠道
+- ❌ 写工作流级偏好 → 不会影响全局偏好
+
+这符合"更具体的层可以覆盖更通用的层，但通用层的修改会重置具体层"的设计哲学。
 
 ---
 
