@@ -849,26 +849,172 @@ public async execute(command, error) {
 
 ### 5.1 入队阶段兜底
 
-1. **THROTTLE 配置错误兜底**：[add-job.usecase.ts#L828-L856](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L828-L856)
-   - 缺 amount/unit、缺 dynamicKey、unknown type → 返回 `shouldSkip: false`，不做限流，立即继续执行
-   - 异常捕获 → 标记 DELAY_MISCONFIGURATION，返回错误
+**THROTTLE 四条 warn + early-return 兜底路径**（与 2.3 节结构呼应）：
 
-2. **THROTTLE 预留异常兜底**：[add-job.usecase.ts#L299-L307](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L299-L307)
-   - Redis 预留异常 → `handleStepValidationError()` → 返回 `DELAY_MISCONFIGURATION`，不重试
+#### 5.1.1 路径① - fixed 类缺 amount 或 unit
 
-3. **延迟 > 15 分钟**：[queue-base.service.ts#L112-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L112-L120)
+**源码位置**：[add-job.usecase.ts#L828-L831](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L828-L831)
+
+**触发条件**：`type === 'fixed'` 时，`throttleConfig` 中缺少 `amount` 或 `unit` 字段。
+
+**完整代码**：
+```typescript
+// add-job.usecase.ts#L826-L831
+if (type === 'fixed') {
+  const { amount, unit } = throttleConfig;
+  if (!amount || !unit) {
+    this.logger.warn(`Fixed throttle configuration missing amount or unit for job ${job._id}`);
+    return { shouldSkip: false };
+  }
+```
+
+**行为**：`logger.warn` 记录配置缺失 → `return { shouldSkip: false }`，不做 Redis 槽位预留，跳过限流，`delayAmount` 为 undefined，最终 `delay = 0` 立即继续执行后续步骤。
+
+---
+
+#### 5.1.2 路径② - dynamic 类缺 dynamicKey
+
+**源码位置**：[add-job.usecase.ts#L841-L844](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L841-L844)
+
+**触发条件**：`type === 'dynamic'` 时，`throttleConfig` 中缺少 `dynamicKey` 字段。
+
+**完整代码**：
+```typescript
+// add-job.usecase.ts#L839-L844
+} else if (type === 'dynamic') {
+  const { dynamicKey } = throttleConfig;
+  if (!dynamicKey) {
+    this.logger.warn(`Dynamic throttle configuration missing dynamicKey for job ${job._id}`);
+    return { shouldSkip: false };
+  }
+```
+
+**行为**：`logger.warn` 记录配置缺失 → `return { shouldSkip: false }`，不做 Redis 槽位预留，跳过限流，`delayAmount` 为 undefined，最终 `delay = 0` 立即继续执行后续步骤。
+
+---
+
+#### 5.1.3 路径③ - unknown type
+
+**源码位置**：[add-job.usecase.ts#L854-L857](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L854-L857)
+
+**触发条件**：`type` 既不是 `'fixed'` 也不是 `'dynamic'`，即未知类型。
+
+**完整代码**：
+```typescript
+// add-job.usecase.ts#L854-L857
+} else {
+  this.logger.warn(`Unknown throttle type '${type}' for job ${job._id}`);
+  return { shouldSkip: false };
+}
+```
+
+**行为**：`logger.warn` 记录未知类型 → `return { shouldSkip: false }`，不做 Redis 槽位预留，跳过限流，`delayAmount` 为 undefined，最终 `delay = 0` 立即继续执行后续步骤。
+
+---
+
+#### 5.1.4 路径④ - validateThrottleWindow 异常（含两个 throw 源头）
+
+**调用链路**（与 2.3 节路径④完全一致）：
+```
+handleThrottle() L862
+  └─ validateThrottleWindow() L1137-L1146
+        └─ [仅 dynamic 类型] validateDynamicDuration() L473-L528
+              ├─ 源头 A: durationMs <= 0（窗口落在过去）L483-L499
+              └─ 源头 B: tier 限制校验不通过 L501-L527
+executeDeferredJob() L299-L307 catch
+  └─ handleStepValidationError() L530-L574
+        ├─ 写执行详情（DELAY_MISCONFIGURATION）
+        ├─ 标记 job.status = FAILED，写入 error 字段
+        ├─ 写 StepRun FAILED 记录
+        └─ 返回 workflowStatus = ERROR
+```
+
+**调用点**：[add-job.usecase.ts#L862](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L862)
+
+```typescript
+// handleThrottle() 内
+await this.validateThrottleWindow(command, job, windowMs, type);
+```
+
+**源头 A：durationMs <= 0（窗口落在过去）** [add-job.usecase.ts#L483-L499](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L483-L499)：
+```typescript
+// validateDynamicDuration() 内
+if (durationMs <= 0) {
+  this.logger.error(`Dynamic throttle must be in the future. durationMs: ${durationMs}, jobId: ${job._id}`);
+  await this.createExecutionDetails.execute({
+    detail: DetailEnum.THROTTLE_WINDOW_IN_PAST,
+    source: ExecutionDetailsSourceEnum.INTERNAL,
+    status: ExecutionDetailsStatusEnum.FAILED,
+    raw: JSON.stringify({ error: `throttle must be in the future` }),
+  });
+  throw new Error(`Dynamic throttle must be in the future. durationMs: ${durationMs}`);
+}
+```
+
+**源头 B：tier 限制校验不通过** [add-job.usecase.ts#L501-L527](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L501-L527)：
+```typescript
+// validateDynamicDuration() 内
+const tierValidationErrors = await this.tierRestrictionsValidateUsecase.execute({
+  stepType: StepTypeEnum.THROTTLE,
+  deferDurationMs: windowMs,
+});
+
+if (tierValidationErrors && tierValidationErrors.length > 0) {
+  await this.createExecutionDetails.execute({
+    detail: DetailEnum.DEFER_DURATION_LIMIT_EXCEEDED,
+    source: ExecutionDetailsSourceEnum.INTERNAL,
+    status: ExecutionDetailsStatusEnum.FAILED,
+    raw: JSON.stringify({ errorMessage }),
+  });
+  throw new Error(`throttle duration exceeds tier limits: ${errorMessage}`);
+}
+```
+
+**外层捕获点** [add-job.usecase.ts#L299-L307](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L299-L307)：
+```typescript
+} catch (error) {
+  return await this.handleStepValidationError(
+    command, job, error, StepTypeEnum.THROTTLE, DetailEnum.DELAY_MISCONFIGURATION
+  );
+}
+```
+
+**统一失败处理** [add-job.usecase.ts#L530-L574](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L530-L574)：
+```typescript
+// 1. 写入执行详情（DELAY_MISCONFIGURATION，FAILED 状态）
+await createExecutionDetails.execute(...);
+
+// 2. 更新 job 为 FAILED，保存完整 error 对象
+await jobRepository.updateOne({ _id: job._id }, {
+  $set: { status: JobStatusEnum.FAILED, error: { message, name, stack } }
+});
+
+// 3. 创建 StepRun FAILED 记录
+await stepRunRepository.create(job, { status: JobStatusEnum.FAILED });
+
+// 4. 返回 ERROR 工作流状态，后续不入队
+return { workflowStatus: WorkflowRunStatusEnum.ERROR, ... };
+```
+
+**行为**：异常沿调用栈向上抛出，被 `executeDeferredJob()` 中的 try/catch 捕获，走统一的 `handleStepValidationError()` 失败处理，最终标记 job 为 FAILED，不入队，工作流终止。
+
+---
+
+**其他入队兜底**：
+
+5. **延迟 > 15 分钟**：[queue-base.service.ts#L112-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L112-L120)
    - SQS 不支持 > 15 分钟延迟 → 强制走 BullMQ
 
-4. **无 organizationId**：[queue-base.service.ts#L134-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L134-L138)
+6. **无 organizationId**：[queue-base.service.ts#L134-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L134-L138)
    - 无法路由 → BullMQ 兜底
 
-5. **组织不存在**：[queue-base.service.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L169-L173)
+7. **组织不存在**：[queue-base.service.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L169-L173)
    - 跳过作业（返回 null，不入队）
 
-6. **SQS 写入失败**：[queue-base.service.ts#L226-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L226-L238)
+8. **SQS 写入失败**：[queue-base.service.ts#L226-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L226-L238)
    - LIVE/COMPLETE 模式 → 自动回退 BullMQ
 
-7. **未知队列模式**：[queue-base.service.ts#L261-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L261-L264)
+9. **未知队列模式**：[queue-base.service.ts#L261-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L261-L264)
    - BullMQ 兜底
 
 ### 5.2 执行阶段兜底
