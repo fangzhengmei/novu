@@ -303,11 +303,279 @@ const PRIORITY_ORDER = [
 ];
 ```
 
-按此顺序依次覆盖 `channels` 的布尔值，后者的值覆盖前者。这仅用于 Dashboard 展示"覆盖来源"信息，不影响 Worker 侧的发送决策。
+按此顺序依次覆盖 `channels` 的布尔值，后者的值覆盖前者。此函数既用于 Dashboard 展示"覆盖来源"信息，**也直接参与 Worker 发送决策**（详见第九章、第十一章）。
 
 ---
 
-## 七、关键代码索引
+## 八、订阅上下文分裂（contextKeys）
+
+### 8.1 问题的本质
+
+同一订阅者的偏好记录在数据库中并不是唯一的——`SUBSCRIBER_GLOBAL`、`SUBSCRIBER_WORKFLOW`、`SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 三类偏好都额外携带 `contextKeys: string[]` 字段。不同 `contextKeys` 的记录在 MongoDB 中是**不同的文档**，但属于同一个订阅者。
+
+这意味着同一个订阅者可以拥有**多份**同类型的偏好，按上下文分裂：
+
+```
+subscriber A, type=SUBSCRIBER_GLOBAL, contextKeys=[]         → 文档 1
+subscriber A, type=SUBSCRIBER_GLOBAL, contextKeys=["org:1"]  → 文档 2
+subscriber A, type=SUBSCRIBER_GLOBAL, contextKeys=["org:2"]  → 文档 3
+```
+
+### 8.2 查询时的精确匹配
+
+[buildContextExactMatchQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/base-repository.ts#L74-L111) 实现了严格的多文档匹配逻辑：
+
+```
+contextKeys === undefined || []  →  匹配 { $or: [字段不存在, 字段为 []] }
+contextKeys = ["org:1"]         →  匹配 { contextKeys: { $all: ["org:1"], $size: 1 } }
+```
+
+关键点：**精确匹配**——输入 `["org:1"]` 只匹配恰好包含 `"org:1"` 一项的记录，不会匹配 `["org:1", "team:a"]`。
+
+### 8.3 分裂对合并的影响
+
+在 [get-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts#L193-L264) 中，查询 4 层偏好时，`SUBSCRIBER_WORKFLOW` 和 `SUBSCRIBER_GLOBAL` 的查询都追加了 `contextQuery`：
+
+```typescript
+// SUBSCRIBER_WORKFLOW 查询
+{ _subscriberId, _templateId, type: SUBSCRIBER_WORKFLOW, ...contextQuery }
+
+// SUBSCRIBER_GLOBAL 查询
+{ _subscriberId, type: SUBSCRIBER_GLOBAL, ...contextQuery }
+```
+
+**效果**：同一次合并只会取到对应 contextKeys 的那一份偏好文档。如果 trigger 请求带了 `contextKeys: ["org:1"]`，那么合并使用的就是该上下文下的偏好，而不是默认空上下文的偏好。不同上下文之间的偏好**互不干扰，互不合并**。
+
+### 8.4 Feature Flag 守护
+
+整个 context 分裂机制由 `IS_CONTEXT_PREFERENCES_ENABLED` Feature Flag 控制。当 Flag 关闭时：
+- `buildContextExactMatchQuery` 返回空对象 `{}`，不追加任何 context 过滤
+- 所有上下文的偏好记录都可能被返回（取决于 MongoDB 的 findOne 行为，通常返回第一条匹配）
+- 写入时，`contextKeys` 设为 `undefined`（不存储字段）
+
+> 参见 [upsert-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts#L176-L193)
+
+### 8.5 分裂的实际效果
+
+| 维度 | 无 contextKeys | 有 contextKeys=["org:1"] |
+|------|----------------|--------------------------|
+| SUBSCRIBER_GLOBAL | 全局默认偏好 | org:1 上下文下的全局偏好 |
+| SUBSCRIBER_WORKFLOW | 工作流级偏好 | org:1 上下文下的工作流级偏好 |
+| Schedule（勿扰） | 来自默认全局偏好 | 来自 org:1 的全局偏好 |
+| 合并逻辑 | 不变 | 不变，只是输入的偏好记录不同 |
+
+---
+
+## 九、租户维度覆盖 — WorkflowOverride
+
+### 9.1 WorkflowOverride 是什么
+
+`WorkflowOverride` 是一张**完全独立于 preferences 集合**的表，键为 `(workflowId, tenantId)`，值是 `IPreferenceChannels`（扁平的渠道布尔映射）：
+
+```typescript
+// workflow-override.entity.ts
+class WorkflowOverrideEntity {
+  _workflowId: string;
+  _tenantId: string;
+  active: boolean;
+  preferenceSettings: IPreferenceChannels;  // { email: true, sms: false, ... }
+}
+```
+
+> 实体定义见 [workflow-override.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/workflow-override/workflow-override.entity.ts#L9-L37)
+
+它**不进 `MergePreferences`**，不在 4 层合并的任何位置。它仅通过 `overridePreferences` 函数在**展示层**叠加一次。
+
+### 9.2 进入点：GetSubscriberTemplatePreference
+
+[get-subscriber-template-preference.usecase.ts#L44-L79](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts#L44-L79) 的执行流程：
+
+```
+1. 获取 initialChannels（工作流活跃步骤对应的渠道）
+2. 获取 workflowOverride（仅当 command.tenant.identifier 存在时）
+3. 获取 templateChannelPreference = template.preferenceSettings（旧版字段）
+4. 获取 subscriberWorkflowPreference（通过 GetPreferences → MergePreferences 合并后的结果）
+5. 调用 overridePreferences({
+     template: templateChannelPreference,
+     subscriber: subscriberWorkflowPreference.channels,
+     workflowOverride: workflowOverride?.preferenceSettings,
+   }, initialChannels)
+```
+
+### 9.3 overridePreferences 的三路叠加
+
+```typescript
+const PRIORITY_ORDER = [
+  PreferenceOverrideSourceEnum.TEMPLATE,           // 1. 模板 preferenceSettings（最低）
+  PreferenceOverrideSourceEnum.WORKFLOW_OVERRIDE,   // 2. 租户维度覆盖（中间）
+  PreferenceOverrideSourceEnum.SUBSCRIBER,          // 3. 订阅者合并后偏好（最高）
+];
+```
+
+[overridePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts#L288-L310) 按此顺序依次用每个 source 的渠道布尔值覆盖 `initialChannels`，后写覆盖前写，最终产出 `channels` + `overrides`（记录每个渠道被谁覆盖）。
+
+### 9.4 WorkflowOverride 在发送决策中的真实权重
+
+关键发现：**`overridePreferences` 的结果直接影响 Worker 的发送决策**。
+
+在 [send-message.usecase.ts#L362-L379](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts#L362-L379) 中，`evaluateChannelPreference` 调用 `GetSubscriberTemplatePreference`，后者内部执行了 `overridePreferences`，返回的 `preference.channels` 直接被 `stepPreferred` 使用：
+
+```typescript
+// stepPreferred 判定逻辑
+const workflowPreferred = preference.enabled;
+const channelPreferred = Object.keys(preference.channels || {})
+  .some(key => key === job.type && preference.channels?.[job.type]);
+return workflowPreferred && channelPreferred;
+```
+
+这意味着 **WorkflowOverride 虽然不在 MergePreferences 中，但它可以通过 overridePreferences 二次叠加来关闭某个渠道**，且此关闭优先于订阅者偏好中该渠道的开启。
+
+### 9.5 两条路径的差异
+
+| 路径 | 是否含 WorkflowOverride | 何时走 |
+|------|------------------------|--------|
+| Worker SendMessage → evaluateChannelPreference → GetSubscriberTemplatePreference | **含**（前提：有 tenant） | 每个渠道步骤发送前 |
+| Dashboard GetSubscriberPreference → calculateChannelsAndOverrides | **不含**（传空 `{}`） | 展示偏好列表时 |
+
+Dashboard 路径在 [get-subscriber-preference.usecase.ts#L216-L225](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscribers/usecases/get-subscriber-preference/get-subscriber-preference.usecase.ts#L216-L225) 中传入 `workflowOverride: {}`，刻意忽略租户覆盖。这导致**用户在 Dashboard 看到的偏好状态可能与实际发送决策不一致**——Dashboard 不体现租户覆盖。
+
+### 9.6 template.preferenceSettings 与 WORKFLOW_RESOURCE 的关系
+
+`template.preferenceSettings` 是 NotificationTemplate 实体上的旧版字段（标记为 `@deprecated`），格式为 `IPreferenceChannels`（扁平布尔），不是 `WorkflowPreferences`（结构化对象）。
+
+在新架构中，`WORKFLOW_RESOURCE` 偏好替代了 `preferenceSettings` 的角色。但 `overridePreferences` 仍然把 `preferenceSettings` 作为 TEMPLATE 层参与叠加，这是因为旧版工作流没有 `WORKFLOW_RESOURCE` 偏好记录，需要兼容。
+
+对于新版 Framework 创建的工作流，`preferenceSettings` 通常为 `undefined`，TEMPLATE 层不参与覆盖。
+
+---
+
+## 十、SUBSCRIPTION_SUBSCRIBER_WORKFLOW — 名义最高优先级但不进主合并
+
+### 10.1 设计意图
+
+`SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 在 `PreferencesTypeEnum` 注释中被标记为优先级 1（最高），但它**不参与 `MergePreferences` 的 4 层深度合并**。
+
+`MergePreferencesCommand` 只有 4 个偏好输入槽位，不含 subscription 维度：
+
+```typescript
+workflowResourcePreference?
+workflowUserPreference?
+subscriberGlobalPreference?
+subscriberWorkflowPreference?
+// 注意：没有 subscriptionSubscriberWorkflowPreference
+```
+
+### 10.2 实际执行路径：前置过滤，而非合并叠加
+
+`SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 的生效方式是在 [subscriber-job-bound.usecase.ts#L430-L493](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L493) 中的 `evaluateSubscriptionPreferences` 做前置判断：
+
+```
+对于 trigger 中的每个 topic subscription：
+  1. 从 preferences 集合中查找 type=SUBSCRIPTION_SUBSCRIBER_WORKFLOW 的记录
+     （需匹配 _subscriberId + _templateId + _topicSubscriptionId + contextKeys）
+  2. 如果找到记录：
+     a. 检查 all.condition — 如果有 JSON Logic 条件，用 payload 求值
+     b. 如果没有 condition，使用 all.enabled 的值
+  3. 如果求值结果为 false → 该 topic subscription 被过滤掉（从 topics 列表中移除）
+  4. 如果未找到记录 → 默认放行（result: true）
+```
+
+### 10.3 与主合并的关系
+
+```
+Trigger 请求进入
+  │
+  ├─ 有 topics? → evaluateSubscriptionPreferences (SUBSCRIPTION_SUBSCRIBER_WORKFLOW)
+  │   │
+  │   ├─ 某个 subscription 被过滤 → 整个 trigger 对该 subscription 不会产生 notification
+  │   └─ 某个 subscription 通过 → 继续执行
+  │
+  ├─ 获取 critical 标志（通过 GetPreferences → MergePreferences，不含 subscription 层）
+  │
+  └─ 创建 notification jobs → Worker 执行
+       │
+       ├─ RunJob: Schedule 检查
+       └─ SendMessage: evaluateChannelPreference（GetSubscriberTemplatePreference → MergePreferences + overridePreferences）
+```
+
+**关键区别**：
+- `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 的决策粒度是 **"这个 topic subscription 是否允许通知"**，是全量开关（all.enabled / all.condition）
+- 主合并（4 层 MergePreferences + overridePreferences）的决策粒度是 **"某个渠道是否允许发送"**，可以精确到渠道级别
+
+### 10.4 创建时机
+
+[create-subscription-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscriptions/usecases/create-subscription-preferences/create-subscription-preferences.usecase.ts) 在订阅创建时，调用 `GetPreferences` 获取**仅工作流层的偏好**（`excludeSubscriberPreferences: true`），将其快照为 `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 记录：
+
+```typescript
+// 获取工作流层偏好时排除了订阅者偏好
+const getPreferencesResult = await this.getPreferences.safeExecute(
+  GetPreferencesCommand.create({
+    ...
+    excludeSubscriberPreferences: true,  // ← 关键：只用工作流层
+  })
+);
+enabled = getPreferencesResult?.preferences.all?.enabled;
+```
+
+这意味着 subscription 偏好的初始值来自工作流定义，之后用户可以通过 Inbox API 的 `UpdatePreferences` 单独修改。
+
+### 10.5 订阅级偏好的 condition 字段
+
+`SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 支持 `all.condition`（JSON Logic 表达式），在 `evaluateSubscriptionPreferences` 中用 `{ payload }` 求值。其他 4 层偏好的 `condition` 字段目前仅在创建时存储，**不在发送链中求值**（仅 subscription 层做了 condition 求值）。
+
+---
+
+## 十一、overridePreferences 在发送链上的二次叠加
+
+### 11.1 两条合并路径的叠加
+
+发送决策实际上经历了**两次独立的偏好合并**：
+
+**第一次：MergePreferences（深度合并，结构化）**
+
+```
+WORKFLOW_RESOURCE + USER_WORKFLOW + SUBSCRIBER_GLOBAL + SUBSCRIBER_WORKFLOW
+→ 深度合并 → WorkflowPreferences（含 all + channels 结构）
+```
+
+**第二次：overridePreferences（扁平覆盖，渠道级）**
+
+```
+initialChannels（全部 true）
+← TEMPLATE（旧版 preferenceSettings）覆盖
+← WORKFLOW_OVERRIDE（租户维度）覆盖
+← SUBSCRIBER（MergePreferences 合并后的渠道映射）覆盖
+→ 最终 channels + overrides 来源追踪
+```
+
+### 11.2 二次叠加带来的复杂性
+
+由于 `overridePreferences` 的 SUBSCRIBER 层输入来自 `MergePreferences` 的合并结果，而 TEMPLATE 和 WORKFLOW_OVERRIDE 来自独立数据源，可能出现：
+
+**场景**：管理员在 Dashboard 设置 WORKFLOW_RESOURCE `email.enabled = true`，租户 A 设置 WorkflowOverride `email = false`，用户设置 SUBSCRIBER_WORKFLOW `email.enabled = true`
+
+- MergePreferences 结果：`email.enabled = true`（用户偏好覆盖工作流默认）
+- overridePreferences：
+  1. TEMPLATE 层：无值（新版工作流无 preferenceSettings）→ 不覆盖
+  2. WORKFLOW_OVERRIDE 层：`email = false` → 覆盖为 false
+  3. SUBSCRIBER 层：`email = true`（来自 MergePreferences）→ 覆盖回 true
+- 最终结果：`email = true`
+
+虽然在这个例子中最终结果符合预期（用户偏好最高），但覆盖路径是"先被租户关闭，再被用户打开"，而非"用户直接覆盖工作流"。这导致 `overrides` 追踪数组中会同时出现 WORKFLOW_OVERRIDE 和 SUBSCRIBER 两个来源。
+
+### 11.3 Dashboard 展示与实际发送的脱节
+
+由于 Dashboard 路径（`GetSubscriberPreference`）传入 `workflowOverride: {}`，而 Worker 路径（`GetSubscriberTemplatePreference`）传入实际的 WorkflowOverride，两个路径的最终渠道结果可能不同。
+
+具体来说，如果存在 WorkflowOverride 关闭了某个渠道：
+- Dashboard 展示：不体现租户覆盖，渠道显示为开启
+- 实际发送：租户覆盖生效，渠道可能被关闭
+
+这是一个已知的展示/行为不一致。
+
+---
+
+## 十二、关键代码索引
 
 | 文件 | 作用 |
 |------|------|
@@ -322,5 +590,11 @@ const PRIORITY_ORDER = [
 | [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts) | Worker 侧 Schedule 检查入口 |
 | [send-message.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts) | 渠道偏好评估（stepPreferred） |
 | [upsert-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts) | 偏好写入（含全局偏好 channel 联动清理） |
-| [get-subscriber-template-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts) | 旧版 overridePreferences 展示逻辑 |
+| [get-subscriber-template-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts) | overridePreferences 叠加（含 WorkflowOverride） |
 | [get-subscriber-schedule.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-schedule/get-subscriber-schedule.usecase.ts) | 独立获取 Schedule |
+| [base-repository.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/base-repository.ts#L74-L111) | buildContextExactMatchQuery 定义 |
+| [subscriber-job-bound.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L493) | SUBSCRIPTION_SUBSCRIBER_WORKFLOW 前置过滤 |
+| [workflow-override.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/workflow-override/workflow-override.entity.ts) | 租户维度偏好覆盖实体 |
+| [create-subscription-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscriptions/usecases/create-subscription-preferences/create-subscription-preferences.usecase.ts) | 订阅偏好初始化（excludeSubscriberPreferences） |
+| [update-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts) | Inbox 偏好更新（含 subscription 级偏好路由） |
+| [get-subscriber-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscribers/usecases/get-subscriber-preference/get-subscriber-preference.usecase.ts) | Dashboard 偏好列表（不含 WorkflowOverride） |
