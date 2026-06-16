@@ -2,15 +2,48 @@
 
 ## 一、偏好来源分层（4 层 + 1 专项）
 
-Novu 的偏好体系由 4 种类型（`PreferencesTypeEnum`）组成，按**具体度从高到低**排列：
+Novu 的偏好体系由 5 种类型（`PreferencesTypeEnum`）组成。**注意：文档注释中的"具体度排序"与代码中实际的决策顺序不一致。**
 
-| 优先级 | 枚举值 | 含义 | 存储位置 | 设定者 |
-|--------|--------|------|----------|--------|
-| 1（最高） | `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` | 订阅范围内的工作流偏好 | preferences 集合 | 订阅 API |
-| 2 | `SUBSCRIBER_WORKFLOW` | 订阅者对某工作流的偏好 | preferences 集合 | 终端用户在偏好面板 |
-| 3 | `SUBSCRIBER_GLOBAL` | 订阅者全局偏好（含勿扰日程） | preferences 集合 | 终端用户在偏好面板 |
-| 4 | `USER_WORKFLOW` | Dashboard 用户对工作流的偏好 | preferences 集合 | 管理员在 Dashboard |
-| 5（最低） | `WORKFLOW_RESOURCE` | Framework 代码定义的工作流默认偏好 | preferences 集合 | 开发者在代码中定义 |
+### 1.1 名义优先级（来自 `PreferencesTypeEnum` 注释）
+
+[workflow-channel-preferences.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/types/workflow-channel-preferences.ts#L3-L21) 的 enum 注释声称优先级为 1 到 5，数字越小优先级越高：
+
+| 名义优先级 | 枚举值 | 含义 |
+|-----------|--------|------|
+| 1（最高） | `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` | 订阅范围内的工作流偏好 |
+| 2 | `SUBSCRIBER_WORKFLOW` | 订阅者对某工作流的偏好 |
+| 3 | `SUBSCRIBER_GLOBAL` | 订阅者全局偏好（含勿扰日程） |
+| 4 | `USER_WORKFLOW` | Dashboard 用户对工作流的偏好 |
+| 5（最低） | `WORKFLOW_RESOURCE` | Framework 代码定义的工作流默认偏好 |
+
+### 1.2 实际决策顺序（对照代码的真实路径）
+
+实际代码中，**`SUBSCRIPTION_SUBSCRIBER_WORKFLOW` 不参与 `MergePreferences` 的主合并**，而是在 trigger 阶段做独立的前置过滤。完整的决策顺序按时间线排列如下：
+
+```
+Trigger 进入 → ① 订阅级前置过滤 → ② MergePreferences 4 层深度合并 → ③ overridePreferences 三路扁平覆盖 → ④ Schedule 勿扰检查
+```
+
+每层的具体定位：
+
+| 阶段 | 实际顺序 | 枚举值 | 决策点 |
+|------|---------|--------|--------|
+| ① 前置过滤 | 第 1 位 | `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` | 在 [SubscriberJobBound](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L493) 中逐 subscription 判断，粒度为 `all.enabled` + `all.condition` |
+| ② 主合并 | 第 2~5 位 | `WORKFLOW_RESOURCE` → `USER_WORKFLOW` → `SUBSCRIBER_GLOBAL` → `SUBSCRIBER_WORKFLOW` | 在 [MergePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/merge-preferences/merge-preferences.usecase.ts#L58-L98) 中深度合并 |
+| ③ 二次叠加 | 第 6 位 | 含 `WORKFLOW_OVERRIDE`（独立表） | 在 [overridePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts#L288-L310) 中扁平覆盖 |
+| ④ 勿扰检查 | 第 7 位 | 来自 `SUBSCRIBER_GLOBAL` 的 `schedule` 字段 | 在 [RunJob](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L176-L256) 中独立检查 |
+
+**修正后的完整分层表**：
+
+| 实际决策顺序 | 枚举值 | 含义 | 存储位置 | 设定者 |
+|-------------|--------|------|----------|--------|
+| 1（最早判定） | `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` | 订阅范围内的工作流偏好 | preferences 集合 | 订阅 API / Inbox |
+| 2 | `WORKFLOW_RESOURCE` | Framework 代码定义的工作流默认偏好 | preferences 集合 | 开发者在代码中定义 |
+| 3 | `USER_WORKFLOW` | Dashboard 用户对工作流的偏好 | preferences 集合 | 管理员在 Dashboard |
+| 4 | `SUBSCRIBER_GLOBAL` | 订阅者全局偏好（含勿扰日程） | preferences 集合 | 终端用户在偏好面板 |
+| 5 | `SUBSCRIBER_WORKFLOW` | 订阅者对某工作流的偏好 | preferences 集合 | 终端用户在偏好面板 |
+| 6（独立表） | *`WorkflowOverride`* | 租户维度渠道覆盖 | workflow-overrides 集合 | 租户管理员 |
+| 7（独立检查） | *`Schedule`* | 勿扰窗口 | preferences 集合（SUBSCRIBER_GLOBAL 上） | 终端用户 |
 
 > 枚举定义见 [workflow-channel-preferences.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/types/workflow-channel-preferences.ts#L15-L21)
 
@@ -756,26 +789,305 @@ initialChannels（全部 true）
 
 ---
 
-## 十二、关键代码索引
+## 十二、工作流偏好写入后进程内缓存不主动失效
+
+### 12.1 缓存的位置和范围
+
+在 [get-preferences.usecase.ts#L304-L329](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts#L304-L329) 中，`WORKFLOW_RESOURCE` 和 `USER_WORKFLOW` 这两层工作流偏好使用 `InMemoryLRUCacheService` 做进程内缓存：
+
+```typescript
+const workflowPreferences = await this.inMemoryLRUCacheService.get(
+  InMemoryLRUCacheStore.WORKFLOW_PREFERENCES,
+  `${command.environmentId}:${command.templateId}`,  // key = environmentId:templateId
+  async (): Promise<[PreferencesEntity | null, PreferencesEntity | null]> => {
+    // 从数据库查询 WORKFLOW_RESOURCE + USER_WORKFLOW
+  },
+  cacheOptions
+);
+```
+
+**缓存特性**（来自 [in-memory-lru-cache.store.ts#L84-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.store.ts#L84-L88)）：
+- 缓存 key：`environmentId:templateId`
+- 存储内容：`[workflowResourcePref, workflowUserPref]` 二元组
+- TTL：**1 分钟**
+- 容量：最多 1000 条
+- Feature Flag：`IS_LRU_CACHE_ENABLED`
+
+### 12.2 问题：写入后没有主动失效
+
+关键发现：**`UpsertPreferences` 的所有 upsert 方法（包括 `upsertUserWorkflowPreferences` 和 `upsertWorkflowPreferences`）都没有调用 `inMemoryLRUCacheService.invalidate(WORKFLOW_PREFERENCES, key)`。**
+
+```typescript
+// upsert-preferences.usecase.ts
+public async upsertUserWorkflowPreferences(command: UpsertUserWorkflowPreferencesCommand) {
+  const result = await this.upsert({ ... });  // ← 只写 DB，不失效缓存
+  return result as WorkflowPreferencesFull;
+}
+```
+
+这意味着：
+
+1. 管理员在 Dashboard 上修改了工作流偏好（`USER_WORKFLOW`）
+2. 写入数据库成功
+3. **但所有进程内的缓存仍然是旧值**
+4. 最多需要等 **1 分钟**（TTL）之后，新的偏好才会体现在发送决策中
+
+**影响场景**：
+- 多进程部署时，只有执行写入操作的那个进程可能立即感知到变化（但代码也没有主动失效它自己的缓存），其他进程全靠 TTL 自然过期
+- 管理员刚改完偏好就立刻触发通知，可能仍然使用旧的偏好设置
+- 对于 critical 状态切换尤其敏感：如果管理员把一个通知设为 critical，可能 1 分钟内发出的消息仍然遵循旧的非 critical 路径
+
+### 12.3 订阅者层偏好没有缓存
+
+注意缓存仅覆盖 **WORKFLOW_RESOURCE 和 USER_WORKFLOW** 这两层工作流偏好。`SUBSCRIBER_GLOBAL` 和 `SUBSCRIBER_WORKFLOW` 两层**不缓存**，每次都查数据库。所以用户修改个人偏好不会有缓存不一致问题。
+
+### 12.4 现有的失效机制
+
+`InMemoryLRUCacheService` 提供了 `invalidate()` 方法（[in-memory-lru-cache.service.ts#L82-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.service.ts#L82-L93)），支持精确 key 匹配和前缀匹配（`key:v:*`），但在整个 `upsert-preferences.usecase.ts` 中**没有被调用过**。
+
+---
+
+## 十三、数据落库唯一索引依据 — `contextKeysHash` 而非 `contextKeys` 数组本身
+
+### 13.1 为什么不能直接用数组做唯一索引
+
+MongoDB 的唯一索引对数组字段的行为是**多键索引**——如果字段是数组 `["a", "b"]`，索引会为每个数组元素单独创建一条索引条目，这意味着：
+- 记录 A `{ contextKeys: ["a", "b"] }` 和记录 B `{ contextKeys: ["a"] }` 会冲突（都有 `"a"`）
+- 这不是我们想要的行为
+
+### 13.2 解决方案：`contextKeysHash` 哈希字段
+
+[preferences.schema.ts#L106-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts#L106-L132) 在 `pre('save')` 和 `pre('insertMany')` 钩子中自动计算并写入 `contextKeysHash` 字段：
+
+```typescript
+function generateContextKeysHash(contextKeys: string[] | undefined): string {
+  if (!contextKeys || contextKeys.length === 0) {
+    return 'DEFAULT_CONTEXT';
+  }
+  const sorted = [...contextKeys].sort();
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex').substring(0, 16);
+}
+
+preferencesSchema.pre('save', function (next) {
+  if (shouldApplyContextKeysHash(this.type)) {
+    this.contextKeysHash = generateContextKeysHash(this.contextKeys);
+  }
+  next();
+});
+```
+
+**关键点**：
+1. 排序后哈希 → `["a", "b"]` 和 `["b", "a"]` 生成相同的 hash
+2. 空数组或 undefined → 统一哈希为 `"DEFAULT_CONTEXT"`
+3. 仅对三类 context 敏感的类型计算 hash：`SUBSCRIBER_GLOBAL`、`SUBSCRIBER_WORKFLOW`、`SUBSCRIPTION_SUBSCRIBER_WORKFLOW`
+
+### 13.3 四张唯一索引（按类型隔离）
+
+[preferences.schema.ts#L134-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts#L134-L214) 使用 `partialFilterExpression` 按类型分四张独立的唯一索引，这就是**类型隔离**机制：
+
+| 索引类型 | 唯一键字段 | partialFilterExpression |
+|---------|-----------|------------------------|
+| SUBSCRIBER_GLOBAL | `{ _environmentId, _subscriberId, type, contextKeysHash }` | `{ type: SUBSCRIBER_GLOBAL, contextKeysHash: { $exists: true } }` |
+| SUBSCRIBER_WORKFLOW | `{ _environmentId, _subscriberId, _templateId, type, contextKeysHash }` | `{ type: SUBSCRIBER_WORKFLOW, contextKeysHash: { $exists: true } }` |
+| SUBSCRIPTION_SUBSCRIBER_WORKFLOW | `{ _environmentId, _subscriberId, _topicSubscriptionId, _templateId, type, contextKeysHash }` | `{ type: SUBSCRIPTION_SUBSCRIBER_WORKFLOW, contextKeysHash: { $exists: true } }` |
+| WORKFLOW 层（USER_WORKFLOW + WORKFLOW_RESOURCE） | `{ _environmentId, _templateId, type }` | `{ type: { $in: [USER_WORKFLOW, WORKFLOW_RESOURCE] } }` |
+
+### 13.4 类型隔离如何避免索引冲突
+
+每个唯一索引只对特定 `type` 的文档生效。这意味着：
+
+- 一条 `SUBSCRIBER_GLOBAL` 记录和一条 `SUBSCRIBER_WORKFLOW` 记录可以有完全相同的 `(_environmentId, _subscriberId)` 值，不会冲突——因为它们命中的是不同的索引
+- 一条 `USER_WORKFLOW` 和一条 `WORKFLOW_RESOURCE` 可以有相同的 `(_environmentId, _templateId)`，但因为 `type` 不同，也不会冲突
+
+这就是"**如何通过类型隔离来避免唯一索引冲突**"——表面上是同一张表，实际上通过 `partialFilterExpression` 分成了 4 张逻辑上独立的唯一约束空间。
+
+### 13.5 `partialFilterExpression` 的意义
+
+没有 `partialFilterExpression` 的话，索引会对所有文档生效，那么：
+- 一条 `SUBSCRIBER_GLOBAL` 记录（没有 `_templateId`）和一条 `SUBSCRIBER_WORKFLOW` 记录（有 `_templateId`）会因为 `_templateId = null` 和 `_templateId = ObjectId("xxx")` 而不冲突，但如果两者都没有 `_templateId` 就可能冲突
+- `partialFilterExpression` 确保索引只对特定类型的文档生效，从根本上隔离了不同类型的键空间
+
+---
+
+## 十四、条件表达式错误或返回值不对的备用链
+
+### 14.1 三层备用链结构
+
+[evaluateSubscriptionPreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L535) 的设计中有三层备用链（fail-safe），目标是在异常情况下**偏向放行**（默认通过），而不是默默关闭订阅。
+
+```
+evaluateSubscriptionPreferences
+  ├─ 外层 try-catch（L437）
+  │    └─ catch → return { result: true }
+  │
+  └─ if (subscriptionPreference)
+        └─ evaluatePreferenceCondition
+              ├─ 条件求值 try-catch（L502）
+              │    └─ catch → return false （注意：这里是 false！）
+              │
+              ├─ 返回值类型检查（L505）
+              │    └─ typeof !== boolean → return false
+              │
+              └─ no condition → enabled 判断 → undefined/null → return true
+```
+
+### 14.2 内层：`evaluatePreferenceCondition` 的备用链
+
+```typescript
+// subscriber-job-bound.usecase.ts L495-L535
+private async evaluatePreferenceCondition(
+  preferences: WorkflowPreferencesPartial,
+  payload: Record<string, unknown>
+): Promise<boolean> {
+  const condition = preferences.all?.condition;
+
+  // 第 1 层：有 condition 表达式
+  if (condition !== undefined && condition !== null) {
+    try {
+      const result = jsonLogic.apply(condition as RulesLogic, { payload });
+
+      // 返回值不是 boolean → 警告 + 返回 false
+      if (typeof result !== 'boolean') {
+        this.logger.warn(...);
+        return false;  // ← 可能导致订阅被默默关闭
+      }
+
+      return result;
+    } catch (error) {
+      // 表达式求值异常（语法错误、引用不存在字段等） → 错误 + 返回 false
+      this.logger.error(...);
+      return false;  // ← 可能导致订阅被默默关闭
+    }
+  }
+
+  // 第 2 层：没有 condition 时看 enabled 字段
+  const enabled = preferences.all?.enabled;
+
+  if (enabled === undefined || enabled === null) {
+    return true;  // ← 没有明确设定时，默认放行
+  }
+
+  return enabled;
+}
+```
+
+### 14.3 外层：`evaluateSubscriptionPreferences` 的备用链
+
+```typescript
+// subscriber-job-bound.usecase.ts L430-L493
+try {
+  // ... 查询 subscriptionPreference ...
+
+  if (subscriptionPreference) {
+    const passes = await this.evaluatePreferenceCondition(...);
+    if (!passes) {
+      return { result: false, ... };  // ← 被内层返回 false 时，走到这里
+    }
+    return { result: true, ... };
+  }
+
+  // 没有 subscriptionPreference 记录 → 默认放行
+  return { result: true, subscriptionIdentifier };
+} catch (error) {
+  // 最外层兜底：任何未被捕获的异常（如数据库查询失败等）→ 放行
+  this.logger.error(...);
+  return { result: true, subscriptionIdentifier };
+}
+```
+
+### 14.4 可能导致订阅被默默关闭的场景
+
+**注意：只有内层两处路径会返回 `false`（关闭订阅），外层全部是放行导向。**
+
+| 场景 | 行为 | 结果 |
+|------|------|------|
+| condition 语法错误（如无效 JSON Logic） | `jsonLogic.apply` 抛异常 → catch → `return false` | 订阅被关闭 |
+| condition 返回非 boolean（如返回字符串/数字/对象） | `typeof result !== 'boolean'` → 警告 → `return false` | 订阅被关闭 |
+| condition 求值正常，返回 `false` | 正常业务逻辑 → `return false` | 订阅被关闭 |
+| condition 求值正常，返回 `true` | → `return true` | 订阅放行 |
+| 没有 condition，但 `all.enabled = false` | → `return false` | 订阅被关闭 |
+| 没有 condition，且 `all.enabled` 未设定 | → `return true` | 订阅放行 |
+| 数据库查询 subscriptionPreference 抛异常 | 外层 catch → `return true` | 订阅放行 |
+| 没有找到 subscriptionPreference 记录 | → `return true` | 订阅放行 |
+
+### 14.5 设计考量：平衡安全性与可用性
+
+这个三层备用链的设计体现了一种权衡：
+- 对**表达式错误/返回值错误**采取保守策略（`false`），避免错误配置的条件意外放行通知
+- 对**系统级错误**（如数据库不可用）采取宽容策略（`true`），避免系统故障导致所有订阅失效
+
+代价就是：条件表达式写错（语法错、返回类型错）会导致订阅被"默默关闭"——用户在 UI 上可能看到订阅是正常的，但实际上所有通知都被过滤掉了，而且只有日志中有 warn/error 记录，没有其他告警渠道。
+
+---
+
+## 十五、类型隔离避免唯一索引冲突的进一步说明
+
+### 15.1 同一张表，多个唯一索引
+
+`preferences` 集合只有一个物理表，但定义了 **4 个独立的唯一索引**，每个索引通过 `partialFilterExpression` 只作用于特定 `type` 的文档：
+
+```
+物理表 preferences
+  ├─ 唯一索引 1（仅 SUBSCRIBER_GLOBAL）：键 = { env, subscriber, type, contextKeysHash }
+  ├─ 唯一索引 2（仅 SUBSCRIBER_WORKFLOW）：键 = { env, subscriber, template, type, contextKeysHash }
+  ├─ 唯一索引 3（仅 SUBSCRIPTION_...）：键 = { env, subscriber, topicSubscription, template, type, contextKeysHash }
+  └─ 唯一索引 4（仅 WORKFLOW_RESOURCE + USER_WORKFLOW）：键 = { env, template, type }
+```
+
+### 15.2 为什么需要 `type` 在键中
+
+即使有 `partialFilterExpression` 过滤，键中仍然包含 `type` 字段。这是因为：
+- 对于第 4 个索引（工作流层），同一个 `(env, template)` 组合下需要区分 `USER_WORKFLOW` 和 `WORKFLOW_RESOURCE` 两条独立记录
+- 没有 `type` 在键中，这两条记录会冲突
+- 其他三个索引的 `partialFilterExpression` 已经限定了单个 type，键中的 `type` 更多是形式上的一致性
+
+### 15.3 各类型可共存的键空间示例
+
+以下 5 条记录可以**同时存在于同一张表中**，不会触发任何唯一索引冲突：
+
+| 记录 | type | _subscriberId | _templateId | _topicSubscriptionId | contextKeysHash | 命中的索引 |
+|------|------|---------------|-------------|---------------------|----------------|-----------|
+| ① | SUBSCRIBER_GLOBAL | S1 | (无) | (无) | DEFAULT_CONTEXT | 索引 1 |
+| ② | SUBSCRIBER_WORKFLOW | S1 | T1 | (无) | DEFAULT_CONTEXT | 索引 2 |
+| ③ | SUBSCRIPTION_SUBSCRIBER_WORKFLOW | S1 | T1 | TS1 | DEFAULT_CONTEXT | 索引 3 |
+| ④ | USER_WORKFLOW | (无) | T1 | (无) | (不存在) | 索引 4 |
+| ⑤ | WORKFLOW_RESOURCE | (无) | T1 | (无) | (不存在) | 索引 4 |
+
+记录 ④ 和 ⑤ 命中同一个索引（索引 4），但因为键中的 `type` 不同（`USER_WORKFLOW` vs `WORKFLOW_RESOURCE`），所以不冲突。
+
+### 15.4 为什么不分成 5 张物理表
+
+当前设计的权衡：
+- ✅ 单一集合便于查询（`GetPreferences` 只需查一个集合就能拿到所有层）
+- ✅ 通过 `partialFilterExpression` 实现逻辑隔离，运维简单
+- ❌ 索引结构复杂，需要理解 `partialFilterExpression` 的行为
+- ❌ 不同类型的记录共享表空间，数据增长时可能需要考虑分片策略
+
+---
+
+## 十六、关键代码索引
 
 | 文件 | 作用 |
 |------|------|
 | [merge-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/merge-preferences/merge-preferences.usecase.ts) | 核心合并逻辑 |
 | [merge-preferences.command.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/merge-preferences/merge-preferences.command.ts) | 合并命令定义 |
 | [merge-preferences.spec.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/merge-preferences/merge-preferences.spec.ts) | 合并测试用例（覆盖所有组合） |
-| [get-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts) | 从数据库收集 4 层偏好 |
+| [get-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts) | 从数据库收集 4 层偏好（含工作流层 LRU 缓存） |
 | [buildWorkflowPreferences.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/utils/buildWorkflowPreferences.ts) | 部分偏好 → 完整偏好填充 |
 | [preferences.const.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/consts/preferences/preferences.const.ts) | 默认偏好常量 |
 | [workflow-channel-preferences.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/types/workflow-channel-preferences.ts) | 类型定义（PreferencesTypeEnum, Schedule 等） |
 | [schedule-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/schedule-validator.ts) | 勿扰时段判断 + 下次可用时间计算 |
 | [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts) | Worker 侧 Schedule 检查入口 |
 | [send-message.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts) | 渠道偏好评估（stepPreferred） |
-| [upsert-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts) | 偏好写入（含全局偏好 channel 联动清理） |
+| [upsert-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts) | 偏好写入（含全局偏好 channel 联动清理，**缺少缓存失效**） |
 | [get-subscriber-template-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-template-preference/get-subscriber-template-preference.usecase.ts) | overridePreferences 叠加（含 WorkflowOverride） |
 | [get-subscriber-schedule.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-schedule/get-subscriber-schedule.usecase.ts) | 独立获取 Schedule |
 | [base-repository.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/base-repository.ts#L74-L111) | buildContextExactMatchQuery 定义 |
-| [subscriber-job-bound.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L493) | SUBSCRIPTION_SUBSCRIBER_WORKFLOW 前置过滤 |
+| [subscriber-job-bound.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L535) | SUBSCRIPTION 级前置过滤 + condition 备用链 |
 | [workflow-override.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/workflow-override/workflow-override.entity.ts) | 租户维度偏好覆盖实体 |
 | [create-subscription-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscriptions/usecases/create-subscription-preferences/create-subscription-preferences.usecase.ts) | 订阅偏好初始化（excludeSubscriberPreferences） |
 | [update-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts) | Inbox 偏好更新（含 subscription 级偏好路由） |
 | [get-subscriber-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscribers/usecases/get-subscriber-preference/get-subscriber-preference.usecase.ts) | Dashboard 偏好列表（不含 WorkflowOverride） |
+| [preferences.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts) | 数据落库 Schema + 4 张唯一索引（partialFilterExpression 类型隔离） |
+| [in-memory-lru-cache.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.service.ts) | LRU 缓存服务（get / invalidate 方法） |
+| [in-memory-lru-cache.store.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.store.ts) | LRU 缓存配置（WORKFLOW_PREFERENCES TTL = 1 分钟） |
