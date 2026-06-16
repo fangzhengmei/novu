@@ -164,6 +164,133 @@ return { shouldSkip: false, executionCount, threshold, throttledUntil };
 - `shouldSkip: true` → 调用 `handleThrottleSkip()`，返回 `COMPLETED + SKIPPED`
 - `shouldSkip: false` → 继续执行，由于 `delayAmount` 始终为 undefined，最终 `delay = 0`，立即执行后续步骤
 
+**四条 warn + early-return 兜底路径**：
+
+| 路径 | 触发条件 | 源码行号 | 行为 |
+|------|----------|----------|------|
+| ① | fixed 类型缺 amount 或 unit | [add-job.usecase.ts#L828-L831](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L828-L831) | `logger.warn` → `return { shouldSkip: false }`，不预留，跳过限流 |
+| ② | dynamic 类型缺 dynamicKey | [add-job.usecase.ts#L841-L844](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L841-L844) | `logger.warn` → `return { shouldSkip: false }`，不预留，跳过限流 |
+| ③ | throttle type 为 unknown（非 fixed/dynamic） | [add-job.usecase.ts#L854-L857](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L854-L857) | `logger.warn` → `return { shouldSkip: false }`，不预留，跳过限流 |
+| ④ | validateThrottleWindow 校验抛出异常 | [add-job.usecase.ts#L862](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L862) → 被外层 [add-job.usecase.ts#L299-L307](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L299-L307) 捕获 | 走 `handleStepValidationError()` → `setJobAsFailed`，标记 FAILED，终止执行 |
+
+**路径 ① 完整代码**（fixed 缺 amount/unit）：
+```typescript
+// add-job.usecase.ts#L826-L831
+if (type === 'fixed') {
+  const { amount, unit } = throttleConfig;
+  if (!amount || !unit) {
+    this.logger.warn(`Fixed throttle configuration missing amount or unit for job ${job._id}`);
+    return { shouldSkip: false };
+  }
+```
+
+**路径 ② 完整代码**（dynamic 缺 dynamicKey）：
+```typescript
+// add-job.usecase.ts#L839-L844
+} else if (type === 'dynamic') {
+  const { dynamicKey } = throttleConfig;
+  if (!dynamicKey) {
+    this.logger.warn(`Dynamic throttle configuration missing dynamicKey for job ${job._id}`);
+    return { shouldSkip: false };
+  }
+```
+
+**路径 ③ 完整代码**（unknown type）：
+```typescript
+// add-job.usecase.ts#L854-L857
+} else {
+  this.logger.warn(`Unknown throttle type '${type}' for job ${job._id}`);
+  return { shouldSkip: false };
+}
+```
+
+**路径 ④ 完整代码链路**（validateThrottleWindow 异常）：
+
+沿着调用栈逐层展开，异常有**两个源头**，最终被外层 try/catch 捕获，走统一的失败处理链路：
+
+```
+handleThrottle() L862
+  └─ validateThrottleWindow() L1137-L1146
+        └─ [仅 dynamic 类型] validateDynamicDuration() L473-L528
+              ├─ 源头 A: durationMs <= 0（窗口落在过去）L483-L499
+              └─ 源头 B: tier 限制校验不通过 L501-L527
+executeDeferredJob() L299-L307 catch
+  └─ handleStepValidationError() L530-L574
+        ├─ 写执行详情（DELAY_MISCONFIGURATION）
+        ├─ 标记 job.status = FAILED，写入 error 字段
+        ├─ 写 StepRun FAILED 记录
+        └─ 返回 workflowStatus = ERROR
+```
+
+**源头 A：durationMs <= 0（窗口落在过去）** [add-job.usecase.ts#L483-L499](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L483-L499)：
+```typescript
+// validateDynamicDuration() 内
+if (durationMs <= 0) {
+  this.logger.error(`Dynamic throttle must be in the future. durationMs: ${durationMs}, jobId: ${job._id}`);
+  await this.createExecutionDetails.execute({
+    detail: DetailEnum.THROTTLE_WINDOW_IN_PAST,   // 与 DELAY 区分的专属 detail
+    source: ExecutionDetailsSourceEnum.INTERNAL,
+    status: ExecutionDetailsStatusEnum.FAILED,
+    raw: JSON.stringify({ error: `throttle must be in the future` }),
+  });
+  throw new Error(`Dynamic throttle must be in the future. durationMs: ${durationMs}`);
+}
+```
+
+**源头 B：tier 限制校验不通过** [add-job.usecase.ts#L501-L527](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L501-L527)：
+```typescript
+// validateDynamicDuration() 内
+const tierValidationErrors = await this.tierRestrictionsValidateUsecase.execute({
+  stepType: StepTypeEnum.THROTTLE,
+  deferDurationMs: windowMs,
+});
+
+if (tierValidationErrors && tierValidationErrors.length > 0) {
+  await this.createExecutionDetails.execute({
+    detail: DetailEnum.DEFER_DURATION_LIMIT_EXCEEDED,  // 与 DELAY/DIGEST 共用
+    source: ExecutionDetailsSourceEnum.INTERNAL,
+    status: ExecutionDetailsStatusEnum.FAILED,
+    raw: JSON.stringify({ errorMessage }),
+  });
+  throw new Error(`throttle duration exceeds tier limits: ${errorMessage}`);
+}
+```
+
+**外层捕获点：executeDeferredJob 中 THROTTLE try/catch** [add-job.usecase.ts#L283-L307](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L283-L307)：
+```typescript
+if (job.type === StepTypeEnum.THROTTLE) {
+  try {
+    const throttleResult = await this.handleThrottle(command, job, bridgeResponse);
+    if (throttleResult.shouldSkip) {
+      // ... handleThrottleSkip() 正常路径
+    }
+  } catch (error) {
+    // validateThrottleWindow 抛出的异常统一进入此分支
+    // 默认 detail = DetailEnum.DELAY_MISCONFIGURATION（与实际写入的 detail 不同，实际以 validateDynamicDuration 内写的为准）
+    return await this.handleStepValidationError(
+      command, job, error, StepTypeEnum.THROTTLE, DetailEnum.DELAY_MISCONFIGURATION
+    );
+  }
+}
+```
+
+**统一失败处理：handleStepValidationError** [add-job.usecase.ts#L530-L574](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L530-L574)：
+```typescript
+// 1. 写入执行详情（DELAY_MISCONFIGURATION，FAILED 状态）
+await createExecutionDetails.execute(...);
+
+// 2. 更新 job 为 FAILED，保存完整 error 对象（message/name/stack）
+await jobRepository.updateOne({ _id: job._id }, {
+  $set: { status: JobStatusEnum.FAILED, error: { message, name, stack } }
+});
+
+// 3. 创建 StepRun FAILED 记录
+await stepRunRepository.create(job, { status: JobStatusEnum.FAILED });
+
+// 4. 返回 ERROR 工作流状态，后续不入队
+return { workflowStatus: WorkflowRunStatusEnum.ERROR, deliveryLifecycleStatus: DeliveryLifecycleStatusEnum.ERRORED };
+```
+
 ---
 
 ### 2.4 队列路由机制
