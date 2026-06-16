@@ -789,9 +789,310 @@ initialChannels（全部 true）
 
 ---
 
-## 十二、工作流偏好写入后进程内缓存不主动失效
+## 十二、读路径与写路径使用两套不同的深合并工具
 
-### 12.1 缓存的位置和范围
+### 12.1 读路径：`es-toolkit/toMerged`
+
+[MergePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/merge-preferences/merge-preferences.usecase.ts#L5) 在读路径中使用 `toMerged`（来自 `es-toolkit`）：
+
+```typescript
+import { toMerged } from 'es-toolkit';
+
+const merged = preferencesList.reduce(
+  (acc, preference) => toMerged(acc, preference),
+  {}
+);
+```
+
+`toMerged` 的行为特点：
+- 递归深合并，对对象做 merge，对非对象做**直接替换**
+- **数组行为**：源数组**完全替换**目标数组（不逐元素合并）
+- 不提供自定义合并策略的入口
+
+这在偏好场景下是合适的：`preferences.channels.email` 是一个对象 `{ enabled: true }`，应该被递归合并；而 `preferences.all.condition` 是一个 JSON Logic 对象，替换语义也是正确的。
+
+### 12.2 写路径：自研 `deepMerge`
+
+[UpsertPreferences.updatePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts#L214-L217) 在写路径中使用自研的 [deepMerge](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/utils/deepmerge.ts#L186-L192)：
+
+```typescript
+import { deepMerge } from '../../utils';
+
+const mergedPreferences = deepMerge([
+  foundPreference.preferences,       // 数据库中的现有值
+  command.preferences as WorkflowPreferencesPartial,  // 用户提交的部分更新
+]);
+```
+
+`deepMerge` 的行为特点（源自 [deepmerge](https://github.com/TehShrike/deepmerge) 库）：
+- 递归深合并，行为与 `toMerged` 类似
+- **数组行为**：默认 `arrayMerge` 策略是**concat + clone**（拼接而非替换）
+- 支持 `customMerge` 自定义特定 key 的合并策略
+- 支持 `isMergeableObject` 控制哪些值被视为可合并对象
+
+### 12.3 两套工具的关键差异
+
+| 维度 | `toMerged`（读路径） | `deepMerge`（写路径） |
+|------|---------------------|---------------------|
+| 来源 | `es-toolkit` 第三方库 | 自研（fork 自 deepmerge） |
+| 数组合并策略 | **替换**（source 覆盖 target） | **拼接**（concat） |
+| 自定义合并 | 不支持 | 支持 `customMerge` |
+| 使用场景 | 多层偏好合并（跨文档合并） | 单层偏好局部更新（同文档合并） |
+| 输入 | 两个对象 | 对象数组 |
+
+**为什么不用同一套**：读路径需要"后者覆盖前者"的语义（更具体的层覆盖更通用的层），数组替换正好符合；写路径需要"局部 patch"的语义——用户可能只提交 `{ channels: { email: { enabled: false } } }`，需要和数据库中的完整记录合并，而不是替换。
+
+### 12.4 写路径中 condition 字段的显式再覆盖
+
+`deepMerge` 合并后，[updatePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/upsert-preferences/upsert-preferences.usecase.ts#L226-L235) 又对 `condition` 字段做了一次显式覆盖：
+
+```typescript
+$set: {
+  preferences: {
+    ...mergedPreferences,
+    ...(mergedPreferences.all && {
+      all: {
+        ...mergedPreferences.all,
+        ...(command.preferences.all?.condition !== undefined && {
+          condition: command.preferences.all?.condition,
+        }),
+      },
+    }),
+  },
+  schedule: command.schedule,
+  _userId: command.userId,
+}
+```
+
+**原因**：`condition` 是一个 JSON Logic 对象，`deepMerge` 会把它当作可合并对象做递归合并。但 condition 的语义是**完整替换**，不是逐字段合并——用户提交了新的 condition，就应该完全覆盖旧的，不能把新旧两个 condition 的字段混在一起。
+
+**机制**：`command.preferences.all?.condition !== undefined` 判断用户是否提交了 condition 字段：
+- 提交了（包括 `null`）→ 用提交的值覆盖合并结果
+- 没提交（`undefined`）→ 保持合并结果中的旧 condition 不变
+
+这是一个**"合后再覆盖"的兜底模式**——先让通用工具做默认合并，再对特殊语义的字段做显式修正。
+
+---
+
+## 十三、偏好面板点开关路由到三种不同层
+
+### 13.1 `PreferenceLevelEnum` 与路由逻辑
+
+[PreferenceLevelEnum](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/packages/shared/src/entities/subscriber-preference/subscriber-preference.interface.ts#L43-L46) 定义了两个级别：
+
+```typescript
+export enum PreferenceLevelEnum {
+  GLOBAL = 'global',
+  TEMPLATE = 'template',
+}
+```
+
+在 [UpdatePreferences.storePreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts#L306-L378) 中，同一个偏好面板的开关点击，根据是否携带工作流和订阅信息，被路由到三种不同的写入层：
+
+```
+storePreferences(item):
+  if item.workflowId && item.subscriptionId:
+    → upsertTopicSubscriptionPreferences     // SUBSCRIPTION_SUBSCRIBER_WORKFLOW
+
+  else if item.workflowId:
+    → upsertSubscriberWorkflowPreferences    // SUBSCRIBER_WORKFLOW
+
+  else:
+    → upsertSubscriberGlobalPreferences      // SUBSCRIBER_GLOBAL
+```
+
+### 13.2 三种路由场景
+
+| 请求参数 | level | 写入层 | 含义 |
+|---------|-------|--------|------|
+| 无 workflowId，无 subscriptionId | `global` | `SUBSCRIBER_GLOBAL` | 用户改全局偏好 |
+| 有 workflowId，无 subscriptionId | `template` | `SUBSCRIBER_WORKFLOW` | 用户改某个工作流的偏好 |
+| 有 workflowId + subscriptionId | `template` | `SUBSCRIPTION_SUBSCRIBER_WORKFLOW` | 用户改某个订阅上下文的工作流偏好 |
+
+### 13.3 写入后的读取路由
+
+[UpdatePreferences.findPreference](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts#L206-L304) 同样按三级路由读取，但读路径的差异更大：
+
+| 场景 | 读取方式 | 特点 |
+|------|---------|------|
+| template + subscriptionIdentifier + workflowId | 直接查 preferences 集合 | **绕过 MergePreferences**，直接读 SUBSCRIPTION_SUBSCRIBER_WORKFLOW 记录 |
+| template + workflowId | 调用 `GetSubscriberTemplatePreference` | 走完整合并路径（MergePreferences + overridePreferences） |
+| 无 workflowId | 调用 `GetSubscriberGlobalPreference` | 只读全局层 + 填充默认值 |
+
+**关键发现**：订阅级偏好的读取路径**不经过 MergePreferences**，直接从数据库读取单条记录。这意味着用户在偏好面板上看到的订阅级偏好值，和发送决策中经过多层合并后的值可能不同——因为发送决策走的是完整合并路径，而面板只展示该层自己的值。
+
+### 13.4 Critical 工作流的保护
+
+[UpdatePreferences.getWorkflow](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/inbox/usecases/update-preferences/update-preferences.usecase.ts#L93-L113) 在写入前检查工作流是否 critical：
+
+```typescript
+if (workflow.critical) {
+  throw new BadRequestException(
+    `Critical workflow with id: ${command.workflowIdOrIdentifier} can not be updated`
+  );
+}
+```
+
+这是 API 层的保护，阻止用户通过 Inbox API 修改 critical 工作流的偏好。但注意这个检查只发生在 `level === TEMPLATE` 且有 `workflowIdOrIdentifier` 时——`level === GLOBAL` 的修改不受此限制。
+
+---
+
+## 十四、查全局偏好的三个独立入口
+
+### 14.1 入口一：`GetSubscriberGlobalPreference`（API 层）
+
+[get-subscriber-global-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscribers/usecases/get-subscriber-global-preference/get-subscriber-global-preference.usecase.ts) — 用于 Dashboard 和 Inbox 的全局偏好展示：
+
+- 调用 `GetPreferences.getSubscriberGlobalPreference` 获取合并后的全局偏好
+- 额外计算活跃渠道列表（通过遍历所有工作流的 steps），过滤掉不活跃的渠道
+- 填充默认值（未设置的渠道默认 `true`）
+- 返回 `{ enabled, channels, schedule }` 格式
+
+**用途**：Inbox API 和 Dashboard 的偏好面板展示。
+
+### 14.2 入口二：`GetSubscriberSchedule`（Worker 层）
+
+[get-subscriber-schedule.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-subscriber-schedule/get-subscriber-schedule.usecase.ts) — 用于 Worker 的 Schedule 检查：
+
+- 直接查 `preferencesRepository.findOne`，取 `SUBSCRIBER_GLOBAL` 类型记录
+- **完全绕过 `GetPreferences`**，不经过任何合并逻辑
+- 只返回 `subscriberGlobalPreference?.schedule`
+- 不关心 `preferences` 字段
+
+**为什么绕过主路径**：Schedule 检查在 Worker 的 RunJob 热路径上，每次执行 job 都会触发。走完整的 `GetPreferences` → `MergePreferences` 路径太重——Schedule 只需要 `schedule` 字段，不需要 4 层合并后的渠道偏好。直接查一条记录比合并 4 条记录快得多。
+
+### 14.3 入口三：`GetPreferences.getSubscriberGlobalPreference`（内部层）
+
+[get-preferences.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts) 中的 `getSubscriberGlobalPreference` 方法 — 用于内部服务调用：
+
+- 只取 `SUBSCRIBER_GLOBAL` 一层偏好
+- 用 `buildWorkflowPreferences` 填充默认值
+- 返回结构化的 `WorkflowPreferences` 对象
+- **不合并其他层**——只看全局层自己的值
+
+**用途**：被 `GetSubscriberGlobalPreference`（入口一）和其他需要全局偏好原始值的场景调用。
+
+### 14.4 三个入口的对比
+
+| 入口 | 调用者 | 经过合并? | 返回内容 | 绕过主路径的原因 |
+|------|--------|----------|---------|----------------|
+| `GetSubscriberGlobalPreference` | Inbox/Dashboard API | 仅全局层 | `{ enabled, channels, schedule }` + 活跃渠道过滤 | 需要展示友好的全局偏好视图 |
+| `GetSubscriberSchedule` | Worker RunJob | 完全不合并 | 仅 `schedule` | 热路径性能优化，不需要渠道偏好 |
+| `GetPreferences.getSubscriberGlobalPreference` | 内部服务 | 仅全局层 | 结构化 `WorkflowPreferences` | 只需原始全局值，不需多层合并 |
+
+---
+
+## 十五、Schedule 是文档顶层字段而非合并对象属性
+
+### 15.1 Schema 定义
+
+在 [preferences.schema.ts#L76](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts#L76) 中，`schedule` 是 `preferencesSchema` 的**顶层字段**，与 `preferences` 对象平级：
+
+```typescript
+const preferencesSchema = new Schema<PreferencesDBModel>({
+  _environmentId: ...,
+  _subscriberId: ...,
+  type: ...,
+  preferences: {         // ← 偏好合并对象
+    all: { ... },
+    channels: { ... },
+  },
+  schedule: Schema.Types.Mixed,  // ← 顶层独立字段，不在 preferences 内
+  contextKeys: ...,
+  contextKeysHash: ...,
+});
+```
+
+### 15.2 对合并逻辑的影响
+
+`MergePreferences` 使用 `toMerged` 做深度合并时，输入的每个偏好实体被展平为 `preference.preferences`（不包含 `schedule`）。`schedule` 的透传在合并完成后单独处理：
+
+```typescript
+// merge-preferences.usecase.ts
+return {
+  preferences: mergedPreferences.preferences,  // 来自 toMerged 的结果
+  schedule: mergedPreferences.schedule,         // 直接从最后一条有 schedule 的记录透传
+  type: mergedPreferences.type,
+  source,
+};
+```
+
+这意味着 `schedule` **永远不参与深度合并**——如果某条记录上有 `schedule`，它就原样透传；如果没有，就是 `undefined`。
+
+### 15.3 写入时的特殊处理
+
+在 `updatePreferences` 中，`schedule` 也被单独处理，不参与 `deepMerge`：
+
+```typescript
+$set: {
+  preferences: { ...mergedPreferences, ... },  // deepMerge 的结果
+  schedule: command.schedule,                   // 直接覆盖，不合并
+  _userId: command.userId,
+}
+```
+
+如果用户提交了 `schedule: undefined`，MongoDB 的 `$set` 会把 `schedule` 设为 `undefined`（等同于删除）。如果用户没有提交 `schedule` 字段，`command.schedule` 为 `undefined`，也会被 `$set` 覆盖。
+
+**注意**：这意味着任何一次偏好更新（即使只改渠道开关）如果不带 `schedule` 字段，都可能意外清除已有的 Schedule 设定。但由于只有 `upsertSubscriberGlobalPreferences` 会传 `schedule` 参数，且前端在更新全局偏好时通常会把当前 Schedule 一起传回来，所以实际上不太容易触发这个问题。
+
+---
+
+## 十六、条件表达式访问触发数据的固定前缀 `payload`
+
+### 16.1 jsonLogic 调用的数据绑定
+
+[evaluatePreferenceCondition](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L503) 使用 jsonLogic 求值时的数据绑定：
+
+```typescript
+const result = jsonLogic.apply(condition as RulesLogic, { payload });
+```
+
+第二个参数 `{ payload }` 就是传给 jsonLogic 的数据上下文。这意味着在 condition 表达式中，**必须通过 `payload` 前缀访问触发数据**。
+
+### 16.2 正确 vs 错误的 condition 写法
+
+假设触发时传入了 `{ "event_type": "order_created", "amount": 100 }`，则：
+
+**正确写法**：
+```json
+{ "==": [{ "var": "payload.event_type" }, "order_created"] }
+{ ">": [{ "var": "payload.amount" }, 50] }
+```
+
+**错误写法**（不会报错，但永远匹配不到）：
+```json
+{ "==": [{ "var": "event_type" }, "order_created"] }
+{ ">": [{ "var": "amount" }, 50] }
+```
+
+因为 jsonLogic 的 `{ "var": "event_type" }` 会在数据上下文的顶层查找 `event_type` 键，而数据上下文的顶层只有 `payload` 键——实际的触发数据被嵌套了一层。
+
+### 16.3 与工作流 step filter 的对比
+
+工作流 step 的 filter（ConditionsFilter）使用不同的数据绑定结构：
+
+```typescript
+// conditions-filter.usecase.ts
+const variables = {
+  payload: command.payload,
+  subscriber: command.subscriber,
+  ...
+};
+```
+
+这里 subscriber、payload 等都在顶层，所以 step filter 中可以用 `{ "var": "payload.event_type" }` 来访问——格式恰好与偏好 condition 一致。
+
+但偏好 condition 的数据上下文**只有 `payload`**，不支持访问 `subscriber` 等其他上下文变量。这是一个功能限制：condition 表达式不能基于订阅者属性做条件判断。
+
+### 16.4 设计原因
+
+将触发数据包裹在 `payload` 前缀下，目的是**命名空间隔离**——防止 condition 表达式意外访问到 jsonLogic 内部状态或其他非预期数据。如果直接把触发数据展开到顶层，当触发数据中包含与 jsonLogic 保留字冲突的键名时，可能导致不可预期的行为。
+
+---
+
+## 十七、工作流偏好写入后进程内缓存不主动失效
+
+### 17.1 缓存的位置和范围
 
 在 [get-preferences.usecase.ts#L304-L329](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/usecases/get-preferences/get-preferences.usecase.ts#L304-L329) 中，`WORKFLOW_RESOURCE` 和 `USER_WORKFLOW` 这两层工作流偏好使用 `InMemoryLRUCacheService` 做进程内缓存：
 
@@ -813,7 +1114,7 @@ const workflowPreferences = await this.inMemoryLRUCacheService.get(
 - 容量：最多 1000 条
 - Feature Flag：`IS_LRU_CACHE_ENABLED`
 
-### 12.2 问题：写入后没有主动失效
+### 17.2 问题：写入后没有主动失效
 
 关键发现：**`UpsertPreferences` 的所有 upsert 方法（包括 `upsertUserWorkflowPreferences` 和 `upsertWorkflowPreferences`）都没有调用 `inMemoryLRUCacheService.invalidate(WORKFLOW_PREFERENCES, key)`。**
 
@@ -837,25 +1138,25 @@ public async upsertUserWorkflowPreferences(command: UpsertUserWorkflowPreference
 - 管理员刚改完偏好就立刻触发通知，可能仍然使用旧的偏好设置
 - 对于 critical 状态切换尤其敏感：如果管理员把一个通知设为 critical，可能 1 分钟内发出的消息仍然遵循旧的非 critical 路径
 
-### 12.3 订阅者层偏好没有缓存
+### 17.3 订阅者层偏好没有缓存
 
 注意缓存仅覆盖 **WORKFLOW_RESOURCE 和 USER_WORKFLOW** 这两层工作流偏好。`SUBSCRIBER_GLOBAL` 和 `SUBSCRIBER_WORKFLOW` 两层**不缓存**，每次都查数据库。所以用户修改个人偏好不会有缓存不一致问题。
 
-### 12.4 现有的失效机制
+### 17.4 现有的失效机制
 
 `InMemoryLRUCacheService` 提供了 `invalidate()` 方法（[in-memory-lru-cache.service.ts#L82-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.service.ts#L82-L93)），支持精确 key 匹配和前缀匹配（`key:v:*`），但在整个 `upsert-preferences.usecase.ts` 中**没有被调用过**。
 
 ---
 
-## 十三、数据落库唯一索引依据 — `contextKeysHash` 而非 `contextKeys` 数组本身
+## 十八、数据落库唯一索引依据 — `contextKeysHash` 而非 `contextKeys` 数组本身
 
-### 13.1 为什么不能直接用数组做唯一索引
+### 18.1 为什么不能直接用数组做唯一索引
 
 MongoDB 的唯一索引对数组字段的行为是**多键索引**——如果字段是数组 `["a", "b"]`，索引会为每个数组元素单独创建一条索引条目，这意味着：
 - 记录 A `{ contextKeys: ["a", "b"] }` 和记录 B `{ contextKeys: ["a"] }` 会冲突（都有 `"a"`）
 - 这不是我们想要的行为
 
-### 13.2 解决方案：`contextKeysHash` 哈希字段
+### 18.2 解决方案：`contextKeysHash` 哈希字段
 
 [preferences.schema.ts#L106-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts#L106-L132) 在 `pre('save')` 和 `pre('insertMany')` 钩子中自动计算并写入 `contextKeysHash` 字段：
 
@@ -881,7 +1182,7 @@ preferencesSchema.pre('save', function (next) {
 2. 空数组或 undefined → 统一哈希为 `"DEFAULT_CONTEXT"`
 3. 仅对三类 context 敏感的类型计算 hash：`SUBSCRIBER_GLOBAL`、`SUBSCRIBER_WORKFLOW`、`SUBSCRIPTION_SUBSCRIBER_WORKFLOW`
 
-### 13.3 四张唯一索引（按类型隔离）
+### 18.3 四张唯一索引（按类型隔离）
 
 [preferences.schema.ts#L134-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts#L134-L214) 使用 `partialFilterExpression` 按类型分四张独立的唯一索引，这就是**类型隔离**机制：
 
@@ -892,7 +1193,7 @@ preferencesSchema.pre('save', function (next) {
 | SUBSCRIPTION_SUBSCRIBER_WORKFLOW | `{ _environmentId, _subscriberId, _topicSubscriptionId, _templateId, type, contextKeysHash }` | `{ type: SUBSCRIPTION_SUBSCRIBER_WORKFLOW, contextKeysHash: { $exists: true } }` |
 | WORKFLOW 层（USER_WORKFLOW + WORKFLOW_RESOURCE） | `{ _environmentId, _templateId, type }` | `{ type: { $in: [USER_WORKFLOW, WORKFLOW_RESOURCE] } }` |
 
-### 13.4 类型隔离如何避免索引冲突
+### 18.4 类型隔离如何避免索引冲突
 
 每个唯一索引只对特定 `type` 的文档生效。这意味着：
 
@@ -901,7 +1202,7 @@ preferencesSchema.pre('save', function (next) {
 
 这就是"**如何通过类型隔离来避免唯一索引冲突**"——表面上是同一张表，实际上通过 `partialFilterExpression` 分成了 4 张逻辑上独立的唯一约束空间。
 
-### 13.5 `partialFilterExpression` 的意义
+### 18.5 `partialFilterExpression` 的意义
 
 没有 `partialFilterExpression` 的话，索引会对所有文档生效，那么：
 - 一条 `SUBSCRIBER_GLOBAL` 记录（没有 `_templateId`）和一条 `SUBSCRIBER_WORKFLOW` 记录（有 `_templateId`）会因为 `_templateId = null` 和 `_templateId = ObjectId("xxx")` 而不冲突，但如果两者都没有 `_templateId` 就可能冲突
@@ -909,9 +1210,9 @@ preferencesSchema.pre('save', function (next) {
 
 ---
 
-## 十四、条件表达式错误或返回值不对的备用链
+## 十九、条件表达式错误或返回值不对的备用链
 
-### 14.1 三层备用链结构
+### 19.1 三层备用链结构
 
 [evaluateSubscriptionPreferences](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/worker/src/app/workflow/usecases/subscriber-job-bound/subscriber-job-bound.usecase.ts#L430-L535) 的设计中有三层备用链（fail-safe），目标是在异常情况下**偏向放行**（默认通过），而不是默默关闭订阅。
 
@@ -931,7 +1232,7 @@ evaluateSubscriptionPreferences
               └─ no condition → enabled 判断 → undefined/null → return true
 ```
 
-### 14.2 内层：`evaluatePreferenceCondition` 的备用链
+### 19.2 内层：`evaluatePreferenceCondition` 的备用链
 
 ```typescript
 // subscriber-job-bound.usecase.ts L495-L535
@@ -971,7 +1272,7 @@ private async evaluatePreferenceCondition(
 }
 ```
 
-### 14.3 外层：`evaluateSubscriptionPreferences` 的备用链
+### 19.3 外层：`evaluateSubscriptionPreferences` 的备用链
 
 ```typescript
 // subscriber-job-bound.usecase.ts L430-L493
@@ -995,7 +1296,7 @@ try {
 }
 ```
 
-### 14.4 可能导致订阅被默默关闭的场景
+### 19.4 可能导致订阅被默默关闭的场景
 
 **注意：只有内层两处路径会返回 `false`（关闭订阅），外层全部是放行导向。**
 
@@ -1010,7 +1311,7 @@ try {
 | 数据库查询 subscriptionPreference 抛异常 | 外层 catch → `return true` | 订阅放行 |
 | 没有找到 subscriptionPreference 记录 | → `return true` | 订阅放行 |
 
-### 14.5 设计考量：平衡安全性与可用性
+### 19.5 设计考量：平衡安全性与可用性
 
 这个三层备用链的设计体现了一种权衡：
 - 对**表达式错误/返回值错误**采取保守策略（`false`），避免错误配置的条件意外放行通知
@@ -1020,9 +1321,9 @@ try {
 
 ---
 
-## 十五、类型隔离避免唯一索引冲突的进一步说明
+## 二十、类型隔离避免唯一索引冲突的进一步说明
 
-### 15.1 同一张表，多个唯一索引
+### 20.1 同一张表，多个唯一索引
 
 `preferences` 集合只有一个物理表，但定义了 **4 个独立的唯一索引**，每个索引通过 `partialFilterExpression` 只作用于特定 `type` 的文档：
 
@@ -1034,14 +1335,14 @@ try {
   └─ 唯一索引 4（仅 WORKFLOW_RESOURCE + USER_WORKFLOW）：键 = { env, template, type }
 ```
 
-### 15.2 为什么需要 `type` 在键中
+### 20.2 为什么需要 `type` 在键中
 
 即使有 `partialFilterExpression` 过滤，键中仍然包含 `type` 字段。这是因为：
 - 对于第 4 个索引（工作流层），同一个 `(env, template)` 组合下需要区分 `USER_WORKFLOW` 和 `WORKFLOW_RESOURCE` 两条独立记录
 - 没有 `type` 在键中，这两条记录会冲突
 - 其他三个索引的 `partialFilterExpression` 已经限定了单个 type，键中的 `type` 更多是形式上的一致性
 
-### 15.3 各类型可共存的键空间示例
+### 20.3 各类型可共存的键空间示例
 
 以下 5 条记录可以**同时存在于同一张表中**，不会触发任何唯一索引冲突：
 
@@ -1055,7 +1356,7 @@ try {
 
 记录 ④ 和 ⑤ 命中同一个索引（索引 4），但因为键中的 `type` 不同（`USER_WORKFLOW` vs `WORKFLOW_RESOURCE`），所以不冲突。
 
-### 15.4 为什么不分成 5 张物理表
+### 20.4 为什么不分成 5 张物理表
 
 当前设计的权衡：
 - ✅ 单一集合便于查询（`GetPreferences` 只需查一个集合就能拿到所有层）
@@ -1065,7 +1366,7 @@ try {
 
 ---
 
-## 十六、关键代码索引
+## 二十一、关键代码索引
 
 | 文件 | 作用 |
 |------|------|
@@ -1091,3 +1392,5 @@ try {
 | [preferences.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/dal/src/repositories/preferences/preferences.schema.ts) | 数据落库 Schema + 4 张唯一索引（partialFilterExpression 类型隔离） |
 | [in-memory-lru-cache.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.service.ts) | LRU 缓存服务（get / invalidate 方法） |
 | [in-memory-lru-cache.store.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.store.ts) | LRU 缓存配置（WORKFLOW_PREFERENCES TTL = 1 分钟） |
+| [deepmerge.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/libs/application-generic/src/utils/deepmerge.ts) | 写路径深合并工具（自研 fork 自 deepmerge） |
+| [get-subscriber-global-preference.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/6-novu/apps/api/src/app/subscribers/usecases/get-subscriber-global-preference/get-subscriber-global-preference.usecase.ts) | 全局偏好查询入口之一（API 层，含活跃渠道过滤） |
