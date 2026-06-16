@@ -1,0 +1,635 @@
+# 定时排程与延时通知代码链路分析
+
+## 一、概述
+
+Novu 的延时通知和定时排程体系涉及三个核心环节：**调度入队** → **到期触发** → **失败重试**。整个链路横跨 API 层、Worker 层、队列层（BullMQ/SQS）以及可选的 Cloudflare Durable Object 调度器。
+
+---
+
+## 二、调度入队链路
+
+### 2.1 入口：AddJob Usecase
+
+**核心文件**：[add-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts)
+
+#### 2.1.1 作业类型分流
+
+```typescript
+// add-job.usecase.ts#L168-L170
+const result = isJobDeferredType(job.type)
+  ? await this.executeDeferredJob(command)
+  : await this.executeNoneDeferredJob(command);
+```
+
+**Deferred 类型**（需要入队等待）：
+- `StepTypeEnum.DELAY` - 延时步骤
+- `StepTypeEnum.DIGEST` - 聚合步骤
+- `StepTypeEnum.THROTTLE` - 限流步骤
+
+**Non-Deferred 类型**（立即执行）：
+- Trigger、Email、SMS、In-App 等
+
+#### 2.1.2 延时类型处理入口（executeDeferredJob）
+
+**关键时机点**：
+1. 条件过滤（conditionsFilter）- 如果过滤不通过，直接返回 SKIPPED
+2. Bridge 数据获取（fetchBridgeData）- V2 框架从 Bridge 获取动态配置
+3. 各类型专属处理：
+   - DIGEST：[handleDigest](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L914-L967) - 计算聚合延迟，处理合并逻辑
+   - THROTTLE：[handleThrottle](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L815-L912) - Redis 限流槽位预留
+   - DELAY：[handleDelay](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts#L428-L471) - 计算延时时长
+
+### 2.2 延迟计算服务
+
+**核心文件**：[compute-job-wait-duration.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/calculate-delay/compute-job-wait-duration.service.ts)
+
+#### 2.2.1 延迟类型分支
+
+```typescript
+// compute-job-wait-duration.service.ts#L35-L126
+if (digestType === DelayTypeEnum.SCHEDULED) {
+  // 从 payload 指定路径读取目标时间
+} else if (digestType === DelayTypeEnum.DYNAMIC) {
+  // 动态延迟：支持 ISO8601 时间戳或 {amount, unit} 对象
+} else if (digestType === DigestTypeEnum.REGULAR / BACKOFF / DelayTypeEnum.REGULAR) {
+  // 固定时长延迟
+} else if (digestType === DigestTypeEnum.TIMED) {
+  // 定时排程：通过 RRule 计算下一个触发时间点
+}
+```
+
+#### 2.2.2 定时排程计算（TIMED 类型）
+
+**核心文件**：[timed-digest-delay.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/calculate-delay/timed-digest-delay.service.ts)
+
+```typescript
+// timed-digest-delay.service.ts#L67-L109
+public static calculate({ dateStart, unit, amount, timeConfig, timezone }): number {
+  // 1. 解析 atTime → hours, minutes, seconds
+  // 2. 转换时区（toZonedTime）
+  // 3. 计算 bysetpos/byweekday/bymonthday 字段
+  // 4. 构建 RRule 规则
+  // 5. rule.after(dateStartTz) 获取下一个执行时间
+  // 6. 转回 UTC 计算与当前时间的差值（毫秒）
+}
+```
+
+**RRule 配置**：
+- `dtstart`: 起始时间（按时区转换后）
+- `freq`: 频率（分钟/小时/天/周/月）
+- `interval`: 间隔次数
+- `byhour/byminute/bysecond`: 指定时间点
+- `byweekday/bymonthday/bysetpos`: 复杂排程规则
+
+### 2.3 队列路由机制
+
+**核心文件**：[queue-base.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts)
+
+#### 2.3.1 入队入口
+
+```typescript
+// add-job.usecase.ts#L1061-L1097
+public async queueJob({ job, delay, untilDate, timezone }) {
+  const options: JobsOptions = { delay };
+  
+  // Webhook Filter 特殊处理：启用重试和退避
+  if (stepContainsWebhookFilter) {
+    options.backoff = { type: 'webhookFilterBackoff' };
+    options.attempts = 3;
+  }
+
+  await this.standardQueueService.add({
+    name: job._id,
+    data: { _environmentId, _id, _organizationId, _userId },
+    groupId: job._organizationId,
+    options,
+  });
+}
+```
+
+#### 2.3.2 StandardQueueService 延迟路由
+
+**核心文件**：[standard-queue.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/standard-queue.service.ts)
+
+```typescript
+// standard-queue.service.ts#L40-L51
+public async add(data: IStandardJobDto) {
+  const delay = data.options?.delay || 0;
+  const hasDelay = delay > 0;
+
+  // 有延迟的作业走 CF Scheduler + BullMQ 双轨
+  if (hasDelay) {
+    return await this.handleDelayedJob(data, delay);
+  }
+
+  // 无延迟走 SQS/BullMQ 常规路由
+  return await super.add(data);
+}
+```
+
+#### 2.3.3 Cloudflare Scheduler 模式
+
+**核心文件**：[scheduler.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/enterprise/workers/scheduler/src/scheduler.ts)
+
+四种模式（`CF_SCHEDULER_MODE` 特性开关控制）：
+
+| 模式 | 行为 |
+|------|------|
+| `OFF` | 仅 BullMQ |
+| `SHADOW` | BullMQ 为主，CF Scheduler 同步写入用于验证 |
+| `LIVE` | CF Scheduler 为主，BullMQ 写入 skipProcessing 标记的影子作业 |
+| `COMPLETE` | 仅 CF Scheduler |
+
+#### 2.3.4 QueueBaseService 后端路由
+
+**核心逻辑**：[queue-base.service.ts#L109-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L109-L264)
+
+```
+add(params)
+  │
+  ├─ 延迟 > 15 分钟 → 强制 BullMQ（SQS 限制）
+  │
+  ├─ 无 organizationId → BullMQ 兜底
+  │
+  └─ getQueueBackendMode() → 四种模式：
+     ├─ BULLMQ → 仅 BullMQ
+     ├─ SHADOW → BullMQ + SQS(skipProcessing)
+     ├─ LIVE → SQS 为主，失败回退 BullMQ
+     └─ COMPLETE → 仅 SQS，失败回退 BullMQ
+```
+
+**关键兜底分支**：
+- SQS 写入失败时，自动回退到 BullMQ（LIVE/COMPLETE 模式）
+- 组织查询失败 → 跳过作业（返回 null）
+- 未知模式 → BullMQ 兜底
+
+---
+
+## 三、到期触发链路
+
+### 3.1 触发源分类
+
+#### 3.1.1 BullMQ 内部延迟队列
+
+**核心文件**：[bull-mq.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/bull-mq/bull-mq.service.ts)
+
+BullMQ 原生支持 `delay` 选项，内部基于 Redis sorted set 实现：
+- 入队时：`ZADD delayed: {timestamp} {jobId}`
+- 轮询时：`ZRANGEBYSCORE delayed: -inf {now}` 取出到期作业
+- 到期后移入 waiting 队列等待 Worker 消费
+
+#### 3.1.2 SQS 延迟消息
+
+SQS 原生支持 `DelaySeconds`（最大 15 分钟），到期后消息变为可见，消费者拉取处理。
+
+#### 3.1.3 Cloudflare Durable Object Alarm
+
+**核心文件**：[scheduler.ts#L47-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/enterprise/workers/scheduler/src/scheduler.ts#L47-L66)
+
+```typescript
+// 入队时设置 alarm
+await this.state.storage.setAlarm(request.scheduledFor);
+
+// alarm 到期自动触发
+async alarm(): Promise<void> {
+  const job = await this.state.storage.get<ScheduledJob>(JOB_KEY);
+  try {
+    await this.executeJob(job);  // 回调 Novu API
+  } finally {
+    await this.state.storage.deleteAll();
+  }
+}
+```
+
+**回调目标**：`/v1/internal/scheduler/callback`
+
+#### 3.1.4 订阅者定时排程（Subscriber Schedule）
+
+**核心文件**：[schedule-validator.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/schedule-validator.ts)
+
+在 RunJob 执行时检查：
+```typescript
+// run-job.usecase.ts#L195-L256
+const isOutsideSubscriberSchedule = schedule?.isEnabled
+  ? !isWithinSchedule(schedule, new Date(), timezone)
+  : false;
+
+if (isOutsideSubscriberSchedule) {
+  if (shouldExtendToSubscriberSchedule) {
+    // 延长到下一个可用时间窗口
+    await extendJobToNextAvailableSchedule(job, schedule, timezone);
+  } else {
+    // 取消作业
+    await jobRepository.updateStatus(..., CANCELED);
+  }
+}
+```
+
+**排程延长逻辑**：[extendJobToNextAvailableSchedule](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L911-L1020)
+- 最大延长次数：3 次
+- 计算下一个可用时间：`calculateNextAvailableTime()`
+- 更新 `scheduleExtensionsCount` 并重新入队
+
+### 3.2 消费入口：StandardWorker
+
+**核心文件**：[standard.worker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/services/standard.worker.ts)
+
+#### 3.2.1 Worker 初始化
+
+```typescript
+// standard.worker.ts#L48-L89
+this.initWorker(processor, options, true);
+
+// 监听 BullMQ 事件
+this.bullMqWorker.on('failed', async (job, error) => {
+  await this.jobHasFailed(job, error);
+});
+this.bullMqWorker.on('completed', async (job) => {
+  await this.jobHasCompleted(job);
+});
+
+// SQS 处理器
+this.setSqsFailedHandler(async (job, error) => {
+  return await this.jobHasFailed(job, error);
+});
+```
+
+#### 3.2.2 处理器核心
+
+```typescript
+// standard.worker.ts#L141-L199
+private getWorkerProcessor() {
+  return async ({ data }) => {
+    // 1. Kill Switch 检查（组织级熔断）
+    if (await isKillSwitchEnabled(data)) return;
+    
+    // 2. skipProcessing 标记检查（迁移影子流量）
+    if (data.skipProcessing) return;
+    
+    // 3. 组织存在性校验
+    if (!await organizationExist(data)) return;
+    
+    // 4. 执行 RunJob
+    return await this.runJob.execute(RunJobCommand.create(minimalJobData));
+  };
+}
+```
+
+### 3.3 RunJob 执行链路
+
+**核心文件**：[run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts)
+
+#### 3.3.1 执行前检查
+
+```typescript
+// run-job.usecase.ts#L84-L114
+public async execute(command: RunJobCommand) {
+  // 1. 加载 Job
+  const job = await jobRepository.findOne(...);
+  
+  // 2. 延迟事件取消检查
+  const { canceled, activeDigestFollower } = await delayedEventIsCanceled(job);
+  if (canceled && !activeDigestFollower) {
+    await stepRunRepository.create(..., CANCELED);
+    return;
+  }
+  
+  // 3. Digest 取消兜底：找到 follower 顶替执行
+  if (activeDigestFollower) {
+    job = assignNewDigestExecutor(activeDigestFollower);
+  }
+}
+```
+
+**延迟取消检查**：[delayedEventIsCanceled](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L682-L698)
+- 针对 DELAY/DIGEST/THROTTLE 类型
+- 如果 Job 状态为 CANCELED，检查是否有活跃的 Digest follower 需要顶替
+
+#### 3.3.2 订阅者排程检查
+
+```typescript
+// run-job.usecase.ts#L176-L256
+// 1. 获取订阅者排程配置
+const schedule = await getSubscriberSchedule.execute(...);
+
+// 2. 检查是否在排程窗口内
+const isOutsideSubscriberSchedule = schedule?.isEnabled
+  ? !isWithinSchedule(schedule, new Date(), timezone)
+  : false;
+
+// 3. 分支处理
+if (isOutsideSubscriberSchedule) {
+  if (shouldExtendToSubscriberSchedule) {
+    // 延迟步骤且非紧急 → 延长到下一个窗口
+    const extended = await extendJobToNextAvailableSchedule(job, schedule, timezone);
+    if (extended) return;  // 已重新入队，终止当前执行
+  }
+  
+  if (!shouldSkipScheduleCheck) {
+    // 非延迟/非紧急 → 取消作业
+    await jobRepository.updateStatus(..., CANCELED);
+    return;
+  }
+}
+```
+
+**跳过排程检查的条件**：
+- TRIGGER / IN_APP / DELAY / DIGEST / HTTP_REQUEST 类型
+- critical 标记为 true 的消息
+
+#### 3.3.3 消息发送与后续链式调度
+
+```typescript
+// run-job.usecase.ts#L274-L370
+const sendMessageResult = await this.sendMessage.execute(...);
+
+if (sendMessageResult.status === 'success') {
+  await jobRepository.updateStatus(..., COMPLETED);
+} else if (sendMessageResult.status === 'failed') {
+  await jobRepository.update(..., { status: FAILED, error: ... });
+  
+  if (shouldHaltOnStepFailure(job)) {
+    shouldQueueNextJob = false;
+    await cancelPendingJobs(...);  // 取消后续作业
+  }
+}
+
+// finally 块：链式调度下一个作业
+finally {
+  if (shouldQueueNextJob && !isJobExtendedToSubscriberSchedule) {
+    await tryQueueNextJobs(job, notification, !!error);
+  }
+}
+```
+
+**链式调度**：[tryQueueNextJobs](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L468-L637)
+- 通过 `_parentId` 找到下一个作业
+- 循环调用 `addJobUsecase.execute()` 直到遇到需要延迟的步骤
+- 如果下一个作业被条件过滤 SKIPPED，继续查找后续作业
+
+---
+
+## 四、失败重试链路
+
+### 4.1 重试触发入口
+
+**核心文件**：[standard.worker.ts#L230-L285](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/services/standard.worker.ts#L230-L285)
+
+```typescript
+private async jobHasFailed(job: Job, error: Error): Promise<boolean> {
+  const minimalData = this.extractMinimalJobData(job.data);
+  
+  // 1. 判断是否需要退避重试（Webhook Filter 场景）
+  const hasToBackoff = this.runJob.shouldBackoff(error);
+  
+  // 2. 判断是否达到最大尝试次数（DEFAULT_ATTEMPTS = 3）
+  const hasReachedMaxAttempts = job.attemptsMade >= this.DEFAULT_ATTEMPTS;
+  
+  // 3. 最后一次失败处理
+  const shouldHandleLastFailedJob = hasToBackoff && hasReachedMaxAttempts;
+  
+  // 4. 标记 Job 失败（非退避场景 或 最后一次失败）
+  const shouldBeSetAsFailed = !hasToBackoff || shouldHandleLastFailedJob;
+  if (shouldBeSetAsFailed) {
+    await setJobAsFailed.execute(...);
+  }
+  
+  // 5. 最后一次失败的特殊处理
+  if (shouldHandleLastFailedJob) {
+    await handleLastFailedJob.execute(...);
+  }
+  
+  // 6. 返回值决定是否重试：需要退避且未达最大次数 → 重试
+  return hasToBackoff && !hasReachedMaxAttempts;
+}
+```
+
+**返回值语义**（SQS 场景）：
+- `true` → 抛出错误，SQS 保持消息，可见性超时后重新投递
+- `false` → 不抛出，SQS 删除消息（确认消费）
+
+### 4.2 退避条件判断
+
+```typescript
+// run-job.usecase.ts#L725-L727
+public shouldBackoff(error: Error): boolean {
+  return error?.message?.includes(EXCEPTION_MESSAGE_ON_WEBHOOK_FILTER);
+}
+```
+
+**仅 Webhook Filter 失败场景会触发重试**。这是因为 Webhook Filter 是用户自定义的外部接口，可能因网络波动等临时故障失败。
+
+### 4.3 退避策略计算
+
+**核心文件**：[webhook-filter-backoff-strategy.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts)
+
+```typescript
+// webhook-filter-backoff-strategy.usecase.ts#L11-L36
+public async execute(command): Promise<number> {
+  // 1. 记录执行详情
+  await createExecutionDetails.execute({
+    detail: DetailEnum.WEBHOOK_FILTER_FAILED_RETRY,
+    isRetry: true,
+    raw: { message: ..., attempt: attemptsMade }
+  });
+  
+  // 2. 指数退避 + 随机抖动
+  // delay = random(0, 1) * 2^attempts * 1000 ms
+  return Math.round(Math.random() * 2 ** attemptsMade * 1000);
+}
+```
+
+**退避曲线**（近似值，含随机抖动）：
+| 尝试次数 | 延迟范围 |
+|---------|---------|
+| 第1次重试 | 0 - 2 秒 |
+| 第2次重试 | 0 - 4 秒 |
+| 第3次重试 | 0 - 8 秒 |
+
+### 4.4 最后一次失败处理
+
+**核心文件**：[handle-last-failed-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/handle-last-failed-job/handle-last-failed-job.usecase.ts)
+
+```typescript
+// handle-last-failed-job.usecase.ts#L33-L66
+public async execute(command) {
+  // 1. 记录最后一次重试失败
+  await createExecutionDetails.execute({
+    detail: DetailEnum.WEBHOOK_FILTER_FAILED_LAST_RETRY,
+    isRetry: true,
+    raw: { message: ... }
+  });
+  
+  // 2. 如果配置为不中止流程，继续调度下一个作业
+  if (!shouldHaltOnStepFailure(job)) {
+    await queueNextJob.execute({ parentId: job._id, ... });
+  }
+}
+```
+
+### 4.5 SQS 与 BullMQ 重试差异
+
+| 维度 | BullMQ | SQS |
+|------|--------|-----|
+| 重试触发 | `worker.on('failed')` 事件 | `setSqsFailedHandler` 返回值 |
+| 重试间隔 | 退避策略计算的精确延迟 | 统一的 `VisibilityTimeout`（默认 30 秒） |
+| 最大次数 | `attempts` 选项（Webhook Filter 为 3） | `RedrivePolicy.maxReceiveCount`（标准队列为 3） |
+| 死信队列 | BullMQ 内置 `failed` 状态 | SQS RedrivePolicy 配置的 DLQ |
+| attemptsMade | BullMQ 原生维护 | 通过 `createSqsJobAdapter` 从 `meta.receiveCount` 映射 |
+
+### 4.6 失败标记：SetJobAsFailed
+
+**核心文件**：[set-job-as-failed.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/update-job-status/set-job-as-failed.usecase.ts)
+
+```typescript
+// set-job-as-failed.usecase.ts#L24-L55
+public async execute(command, error) {
+  // 1. 更新状态为 FAILED
+  const jobEntity = await updateJobStatus.execute({ status: FAILED });
+  
+  // 2. 保存错误信息
+  await jobRepository.setError(organizationId, jobId, error);
+  
+  // 3. 写入 StepRun 记录
+  await stepRunRepository.create(..., {
+    status: FAILED,
+    errorCode: 'job_failed',
+    errorMessage: error.message,
+  });
+  
+  // 4. 更新工作流交付生命周期
+  await workflowRunService.updateDeliveryLifecycle({
+    workflowStatus: isLastJobFailed ? COMPLETED : PROCESSING,
+  });
+}
+```
+
+---
+
+## 五、兜底分支与边界情况汇总
+
+### 5.1 入队阶段兜底
+
+1. **延迟 > 15 分钟**：[queue-base.service.ts#L112-L120](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L112-L120)
+   - SQS 不支持 > 15 分钟延迟 → 强制走 BullMQ
+
+2. **无 organizationId**：[queue-base.service.ts#L134-L138](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L134-L138)
+   - 无法路由 → BullMQ 兜底
+
+3. **组织不存在**：[queue-base.service.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L169-L173)
+   - 跳过作业（返回 null，不入队）
+
+4. **SQS 写入失败**：[queue-base.service.ts#L226-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L226-L238)
+   - LIVE/COMPLETE 模式 → 自动回退 BullMQ
+
+5. **未知队列模式**：[queue-base.service.ts#L261-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L261-L264)
+   - BullMQ 兜底
+
+### 5.2 执行阶段兜底
+
+1. **Job 已取消**：[run-job.usecase.ts#L102-L114](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L102-L114)
+   - 到期触发时 Job 已被取消 → 标记 CANCELED 并退出
+
+2. **Digest 主作业取消，follower 顶替**：[run-job.usecase.ts#L116-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L116-L119)
+   - 找到同 digestKey 的 follower 继续执行
+
+3. **排程窗口外**：[run-job.usecase.ts#L195-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L195-L256)
+   - 可延长 → 重新入队到下一个窗口
+   - 不可延长 → 取消作业
+
+4. **Kill Switch 熔断**：[standard.worker.ts#L143-L149](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/services/standard.worker.ts#L143-L149)
+   - 组织级熔断开启 → 跳过作业
+
+5. **影子流量标记**：[standard.worker.ts#L151-L155](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/services/standard.worker.ts#L151-L155)
+   - `skipProcessing: true` → 跳过执行
+
+### 5.3 失败阶段兜底
+
+1. **非 Webhook Filter 错误**：[standard.worker.ts#L243](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/services/standard.worker.ts#L243)
+   - 不重试，直接标记 FAILED
+
+2. **最后一次重试失败**：[handle-last-failed-job.usecase.ts#L55-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/handle-last-failed-job/handle-last-failed-job.usecase.ts#L55-L65)
+   - 不中止流程 → 继续调度下一个作业
+
+3. **SQS 永久性客户端错误**：[worker-base.service.ts#L227-L249](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/workers/worker-base.service.ts#L227-L249)
+   - 4xx 错误（排除 408、429）→ 确认消费，不重试
+
+4. **排程延长超限**：[run-job.usecase.ts#L919-L942](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L919-L942)
+   - 超过最大延长次数（3 次）→ 不再延长，立即发送
+
+---
+
+## 六、完整链路时序图
+
+```
+API 触发事件
+    ↓
+TriggerEvent Usecase
+    ↓
+创建 Job（DELAY/DIGEST/THROTTLE 类型）
+    ↓
+AddJob.execute()
+    ├─ 条件过滤
+    ├─ Bridge 数据获取（V2）
+    ├─ handleDelay/handleDigest/handleThrottle
+    │   └─ ComputeJobWaitDurationService.calculateDelay()
+    │       ├─ REGULAR: 固定时长
+    │       ├─ DYNAMIC: 从 payload 解析
+    │       └─ TIMED: RRule 计算下一个时间点
+    └─ queueJob()
+        └─ StandardQueueService.add()
+            ├─ delay > 0 → handleDelayedJob()
+            │   └─ CF Scheduler 模式检查
+            │       ├─ OFF → BullMQ
+            │       ├─ SHADOW → BullMQ + CF(验证)
+            │       ├─ LIVE → CF 为主, BullMQ 影子
+            │       └─ COMPLETE → 仅 CF
+            └─ delay = 0 → QueueBaseService.add()
+                ├─ delay > 15min → BullMQ
+                ├─ 无 orgId → BullMQ
+                └─ 按 QUEUE_BACKEND_MODE 路由
+                    ├─ BULLMQ → BullMQ
+                    ├─ SHADOW → BullMQ + SQS(skip)
+                    ├─ LIVE → SQS 失败回退 BullMQ
+                    └─ COMPLETE → SQS 失败回退 BullMQ
+
+============= 到期等待 ============
+BullMQ: Redis sorted set 轮询 → 到期移入 waiting
+SQS: DelaySeconds → 到期变为可见
+CF Scheduler: Durable Object Alarm → 到期回调 API
+
+============= 到期触发 ============
+StandardWorker.getWorkerProcessor()
+    ├─ Kill Switch 检查
+    ├─ skipProcessing 检查
+    ├─ 组织存在性检查
+    └─ RunJob.execute()
+        ├─ 加载 Job
+        ├─ 延迟取消检查（含 Digest follower 兜底）
+        ├─ 订阅者排程检查
+        │   ├─ 在窗口内 → 继续
+        │   ├─ 可延长 → extendJobToNextAvailableSchedule() → 重新入队
+        │   └─ 不可延长 → 标记 CANCELED
+        ├─ SendMessage.execute()
+        │   └─ DELAY 类型 → SendMessageDelay.execute()
+        └─ tryQueueNextJobs() → 链式调度下一个作业
+
+============= 失败处理 ============
+jobHasFailed()
+    ├─ hasToBackoff = error 含 EXCEPTION_MESSAGE_ON_WEBHOOK_FILTER
+    ├─ hasReachedMaxAttempts = attemptsMade >= 3
+    ├─ !hasToBackoff → 标记 FAILED, 不重试
+    ├─ hasToBackoff && !max → WebhookFilterBackoffStrategy(指数退避) → 重试
+    └─ hasToBackoff && max → 标记 FAILED + HandleLastFailedJob → 继续下一个作业
+```
+
+---
+
+## 七、关键配置参数
+
+| 参数 | 值 | 位置 | 说明 |
+|------|-----|------|------|
+| `DEFAULT_ATTEMPTS` | 3 | [queue-base.service.ts#L16](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L16) | 最大重试次数 |
+| `SQS_MAX_DELAY_SECONDS` | 900 (15min) | [queue-base.service.ts#L9](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/libs/application-generic/src/services/queues/queue-base.service.ts#L9) | SQS 最大延迟 |
+| `MAX_EXTENSIONS` | 3 | [run-job.usecase.ts#L916](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L916) | 排程最大延长次数 |
+| 退避公式 | `random() * 2^attempts * 1000` | [webhook-filter-backoff-strategy.usecase.ts#L35](file:///d:/fz/0601-2/solo-dogfeeding/code/5-novu/apps/worker/src/app/workflow/usecases/webhook-filter-backoff-strategy/webhook-filter-backoff-strategy.usecase.ts#L35) | 指数退避 + 抖动 |
