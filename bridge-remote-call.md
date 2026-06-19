@@ -191,7 +191,7 @@ if (parsed.t < now - SIGNATURE_TIMESTAMP_TOLERANCE || parsed.t > now + SIGNATURE
 
 ### 3.2 deliveryId 的真实定位
 
-`deliveryId` **不是**框架层面的防重放/去重机制。它只是一个请求追踪标识，被放入 payload 中透传。
+`deliveryId` **不是**框架层面的防重放/去重机制。它是 Bridge 内部协议字段，**用户代码根本无法读取到它**。
 
 生成代码：[buildPayload()](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/apps/api/src/app/agents/conversation-runtime/runtime/bridge-executor.service.ts#L262-L305)
 
@@ -202,20 +202,79 @@ deliveryId: `${conversation._id}:${event}:${reaction.messageId}:${timestamp}`  /
 deliveryId: `${conversation._id}:${event}`                          // 其他情况
 ```
 
-**接收侧行为**：
-- SDK 端的 [AgentContextImpl](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/resources/agent/agent.context.ts) 甚至没有将 `deliveryId` 暴露为公共属性
-- 框架层面没有任何基于 `deliveryId` 的去重缓存、数据库索引或幂等判断
-- 它只是 `AgentBridgeRequest` 类型定义中的一个字段，随 payload 一起透传给用户代码
+**协议边界标注**：
 
-**deliveryId 的实际用途**：
-- ✅ **日志/链路追踪**：用户代码可以通过 `deliveryId` 关联同一次投递的多条日志
-- ✅ **业务层幂等（用户自行实现）**：如果用户需要精确一次语义，需要自己基于 `deliveryId` 在业务层做去重（如 Redis SETNX、数据库唯一索引等）
-- ✅ **问题排查**：出现重复投递时，可通过 `deliveryId` 确认是否为同一请求的多次到达
+在 [agent.types.ts L380](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/resources/agent/agent.types.ts#L380-L400) 中，`AgentBridgeRequest` 接口被明确注释为内部类型：
+
+```ts
+// Internal types (bridge protocol — not exposed to SDK consumers)
+// ---------------------------------------------------------------------------
+export interface AgentBridgeRequest {
+  version: number;
+  timestamp: string;
+  deliveryId: string;
+  event: string;
+  // ...
+}
+```
+
+**接收侧真实行为（用户代码不可读）**：
+
+[AgentContextImpl 构造函数](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/resources/agent/agent.context.ts#L279-L298) 从 `AgentBridgeRequest` 中**解构赋值到类属性时，有意漏掉了 `deliveryId`**：
+
+```ts
+constructor(request: AgentBridgeRequest, secretKey: string) {
+  this.event = request.event as AgentEventEnum;       // ✓ 暴露
+  this.action = request.action ?? null;                // ✓ 暴露
+  this.message = request.message;                      // ✓ 暴露
+  this.reaction = request.reaction;                    // ✓ 暴露
+  this.conversation = request.conversation;            // ✓ 暴露
+  this.subscriber = request.subscriber;                // ✓ 暴露
+  this.history = request.history;                      // ✓ 暴露
+  this.platform = request.platform;                    // ✓ 暴露
+  this.platformContext = request.platformContext;      // ✓ 暴露
+  // deliveryId —— 没有这一行！
+  // version      —— 没有这一行！
+  // timestamp    —— 没有这一行！
+  // agentId      —— 没有这一行！
+  // replyUrl     —— 保存到 this._replyUrl（私有）
+  // conversationId —— 保存到 this._conversationId（私有）
+  // integrationIdentifier —— 保存到 this._integrationIdentifier（私有）
+}
+```
+
+对应的**只读公共属性列表**（L251-L267）中也没有 `deliveryId`：
+
+```ts
+export class AgentContextImpl {
+  readonly event: AgentEventEnum;
+  readonly action: AgentAction | null;
+  readonly message: AgentMessage | null;
+  readonly reaction: AgentReaction | null;
+  readonly conversation: AgentConversation;
+  readonly subscriber: AgentSubscriber | null;
+  readonly history: AgentHistoryEntry[];
+  readonly platform: string;
+  readonly platformContext: AgentPlatformContext;
+  readonly metadata: { ... };
+  // 没有 deliveryId！
+```
+
+测试 [agent.test.ts L372-L412](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/resources/agent/agent.test.ts#L372-L412) 也验证了这一点——"should provide read-only context properties from bridge payload" 用例只断言了 `event`、`message.text`、`conversation.identifier`、`subscriber.subscriberId`、`platform`、`platformContext.threadId`、`history`，**没有 `deliveryId`**。
+
+**结论：用户代码无法读取 `deliveryId`，因此无法用它做业务层幂等键。** 如果需要幂等，用户只能自行用 `message.platformMessageId`、`action.id`、`reaction.messageId` 等已暴露字段组合出唯一性标识，或者在业务入口自定义中间件解析原始 HTTP 请求体。
+
+**deliveryId 的实际（内部）用途**：
+- 供 Novu 内部追踪投递链路（日志、审计、问题排查）
+- 目前**没有任何接收侧逻辑（SDK 端或 API 端）基于 deliveryId 做去重判断**——无论框架层还是业务层都没有
 
 **deliveryId 不能做什么**：
+- ❌ 用户代码不能读取，不能做幂等键
 - ❌ 不能替代时间戳容差做防重放（框架不校验）
 - ❌ 不能保证"恰好一次"语义
 - ❌ 不能防止 5 分钟窗口内的重复执行
+
+---
 
 ### 3.3 签名头解析与历史漏洞
 
@@ -239,19 +298,64 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
 }
 ```
 
-**历史安全漏洞**：旧实现使用 `split('=')` 来分割键值对，导致当 value 中包含 `=` 字符时，`timestamp` 会被错误地赋值为字面量字符串 `"t"`。由于 `"t" < now - tolerance` 恒为真，时间戳验证**静默失效**，相当于完全禁用了防重放保护。
+**历史安全漏洞（按代码事实还原）**：
 
-当前实现使用 `indexOf('=')` 只在第一个 `=` 处分割，并按名称查找字段，确保了时间戳解析的正确性。
+旧实现对签名头整体使用 `split('=')` 分割，导致时间戳解析完全错误。[handler.ts L409-L413 注释](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/handler.ts#L409-L413) 明确描述了问题：
+
+> `timestamp` ended up as the literal string **"t"**
+
+具体发生了什么：
+
+签名头格式是 `t=<unix-ms>,v1=<hex-hmac>`，例如：
+```
+novu-signature: t=1718870400000,v1=aabbccddeeff0011...
+```
+
+**旧代码的错误解析路径**（推测为 `header.split('=')` 对整个字符串分割，不区分逗号和等号）：
+
+```
+整个字符串 split('=')：
+  "t=1718870400000,v1=aabbccddeeff..."
+    ↓
+  [0] = "t"
+  [1] = "1718870400000,v1"
+  [2] = "aabbccddeeff..."
+```
+
+如果旧代码将 `parts[0]`（即字面量 `"t"`）当作 timestamp 值，会发生以下连锁反应：
+
+```
+1. parsed.t = Number("t")          // → NaN（不是数字）
+2. parsed.t = undefined             // 因 Number.isFinite(NaN) = false，最终赋值 undefined
+
+3. validateHmac 中的判断：
+   if (parsed.t < now - tolerance || parsed.t > now + tolerance)
+   → undefined < 1718870700000     // JavaScript 中：undefined 参与算术比较时转成 NaN
+   → NaN < anyNumber              // 结果恒为 false
+   → NaN > anyNumber              // 结果恒为 false
+   → false || false
+   → 整个条件为 false，永远不会抛出 SignatureExpiredError
+```
+
+**结果**：时间戳校验被**静默绕过**，防重放保护**完全失效**——攻击者可以在任意时间点重放任意截获的请求，都会通过验证。
+
+**当前修复方案**：
+1. 先按 `,` 拆分成多个字段片段（每段是 `<key>=<value>` 形式）
+2. 对每个片段用 `indexOf('=')` 找到第一个 `=` 的位置，只在该处分割 key/value
+3. 用**名称查找**（`fields.t`、`fields.v1`）而非固定位置索引，避免字段顺序/数量变化导致解析错误
+4. 时间戳解析失败时，显式设为 `undefined` 而非隐式 NaN（但 undefined 同样会让比较失败——如果用户未来有人注入 `parts[0]`，但只要 HMAC 保护了签名完整性，这个问题就不会单独构成漏洞）
+
+**补充说明**：该漏洞的前提是**攻击者已经能截获合法签名的请求**，这通常意味着 MITM 攻击或内网泄露。但 HMAC 签名只能防篡改，不能防截获重放——所以时间戳校验是防重放的唯一防线，一旦该防线被绕过，攻击者就能在任意时刻重放已截获的请求，包括触发付费工作流、重复发送通知等。
 
 ### 3.4 防重放能力总结
 
 | 攻击场景 | 时间戳容差 | deliveryId |
 |----------|-----------|------------|
-| 截获请求后长期保存再重放 | ✅ 阻止 | ❌ 不阻止 |
-| 5 分钟内重复发送同一请求 | ❌ 不阻止 | ❌ 不阻止（框架无校验） |
+| 截获请求后长期保存再重放 | ✅ 阻止 | ❌ 不阻止（无校验） |
+| 5 分钟内重复发送同一请求 | ❌ 不阻止（时间窗口内有效） | ❌ 不阻止（无校验） |
 | 修改时间戳绕过时间窗口 | ✅ 阻止（HMAC 保护完整性） | — |
 | 网络重试导致重复执行 | ❌ 不阻止（设计为至少一次） | ❌ 不阻止 |
-| 用户代码自行实现幂等 | — | ✅ 可作为幂等键 |
+| 用户代码做幂等去重 | — | ❌ 不能用（SDK 端未暴露，用户读不到） |
 
 ---
 
