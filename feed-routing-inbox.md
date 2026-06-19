@@ -265,3 +265,191 @@ contextKeys: {
 3. 统一 Feed 过滤和 Category 概念边界
 4. 补齐 `/inbox` 的 Feed 过滤能力
 5. 补齐 `/widgets` 的 contextKeys 隔离
+
+---
+
+## 9. 消息模板创建时默认 Feed 的写入值
+
+### 9.1 创建路径：显式 `null`
+
+消息模板创建逻辑在 `CreateMessageTemplate.execute()` 中：
+
+```typescript
+_feedId: command.feedId ? command.feedId : null,
+```
+
+关键行为：当 `command.feedId` 为 `undefined`、空字符串、`null` 或其他 falsy 值时，一律写入 **`null`**。不存在"不写入"的中间态。
+
+### 9.2 写入值的三态分析
+
+| `command.feedId` 值 | 写入 `_feedId` | MongoDB 实际存储 |
+|---------------------|---------------|-----------------|
+| `"660a1b..."` (有效 ObjectId) | `"660a1b..."` | ObjectId 引用 |
+| `undefined` (不传) | `null` | `null` |
+| `null` | `null` | `null` |
+| `""` (空字符串) | `null` | `null` |
+
+这意味着：**新创建的 In-App 消息模板，如果不指定 feed，其 `_feedId` 一定是 `null`，而非字段缺失。**
+
+### 9.3 与历史数据的语义差异
+
+| 数据来源 | `_feedId` 存储值 | 查询 `feedId === null` 是否命中 |
+|---------|-----------------|-------------------------------|
+| Feed 引入前创建的旧消息 | 字段不存在（`$exists: false`） | ❌ 不命中 |
+| 新创建（未指定 Feed） | `null` | ✅ 命中 |
+| 新创建后移除 Feed（见第 10 节） | `null` | ✅ 命中 |
+
+`getFilterQueryForMessage` 中 `query.feedId === null` 分支使用 `{ $eq: null }`，此条件同时匹配字段缺失和值为 `null` 的文档，因此实际上新旧数据均被覆盖。
+
+### 9.4 widgets 控制器中的 `feedIdentifier` 传递
+
+在 `widgets.controller.ts` 的 `getNotificationsFeed` 方法中：
+
+```typescript
+let feedsQuery: string[] | undefined;
+if (query.feedIdentifier) {
+  feedsQuery = Array.isArray(query.feedIdentifier) ? query.feedIdentifier : [query.feedIdentifier];
+}
+```
+
+当客户端不传 `feedIdentifier` 时，`feedsQuery` 为 `undefined`，直接传入 `getNotificationsFeedCommand.feedId = undefined`。此值最终到达 `getFilterQueryForMessage` 的 `query.feedId` 参数，由于既非 `null` 也非 truthy，不触发任何 `_feedId` 条件，即 **返回所有 Feed 的消息**。
+
+---
+
+## 10. 移除 Feed 后模板与历史消息同步的不同点
+
+### 10.1 更新模板的两条路径
+
+`UpdateMessageTemplate.execute()` 对 Feed 变更的处理分两种场景：
+
+**场景 A — 设置 Feed（`command.feedId` 有值）：**
+
+```typescript
+if (command.feedId) {
+  updatePayload._feedId = command.feedId;  // $set 操作
+}
+```
+
+MongoDB 操作：`{ $set: { _feedId: "660a1b..." } }` — 将字段设为新 ObjectId。
+
+**场景 B — 移除 Feed（`command.feedId` 为 falsy，但模板原 `_feedId` 存在）：**
+
+```typescript
+if (!command.feedId && existingTemplate._feedId) {
+  unsetPayload._feedId = '';  // $unset 操作
+}
+```
+
+MongoDB 操作：`{ $unset: { _feedId: '' } }` — **删除字段**，而非设为 `null`。
+
+### 10.2 关键差异：模板层 vs 消息层的 Feed 同步
+
+无论场景 A 还是 B，同步到历史消息时调用的是同一个方法：
+
+```typescript
+if (command.feedId || (!command.feedId && existingTemplate._feedId)) {
+  await this.messageRepository.updateFeedByMessageTemplateId(
+    command.environmentId,
+    command.templateId,
+    command.feedId   // 场景 B 时为 undefined
+  );
+}
+```
+
+`updateFeedByMessageTemplateId` 的实现：
+
+```typescript
+async updateFeedByMessageTemplateId(environmentId: string, messageId: string, feedId?: string | null) {
+  return this.update(
+    { _environmentId: environmentId, _messageTemplateId: messageId },
+    { $set: { _feedId: feedId } }   // 始终用 $set
+  );
+}
+```
+
+### 10.3 不同点汇总
+
+| 操作 | 模板层 (MessageTemplate) | 消息层 (Message) |
+|------|------------------------|-----------------|
+| 设置 Feed | `$set: { _feedId: ObjectId }` | `$set: { _feedId: ObjectId }` |
+| 移除 Feed | `$unset: { _feedId: '' }` (字段被删除) | `$set: { _feedId: undefined }` (字段设为 null) |
+| 移除后的存储状态 | `_feedId` 字段不存在 | `_feedId` 值为 `null` |
+
+这种不一致会导致：
+
+- 模板文档中 `_feedId` 字段不存在（`$exists: false`）
+- 关联消息文档中 `_feedId` 值为 `null`
+- 两者在语义上等价（均表示"未分配 Feed"），但在 MongoDB 查询中行为不同：`{ _feedId: null }` 同时匹配字段缺失和值为 null，而 `{ _feedId: { $eq: null } }` 也同时匹配两者
+- **实际查询不会出错**，因为 `getFilterQueryForMessage` 使用 `$eq: null`，但底层存储形态不一致，未来若引入严格等值匹配（如索引查询）可能产生差异
+
+---
+
+## 11. 旧 Inbox 客户端清空 ContextKeys 的兼容分支
+
+### 11.1 问题背景
+
+从 `@novu/js` v3.13.0 起，Inbox SDK 在创建订阅标识符时会自动携带 `:ctx_` 前缀以支持上下文隔离。旧版本客户端不会生成此前缀，但 JWT 中可能已包含 `contextKeys`。如果服务端仍然按 contextKeys 创建订阅，则新旧客户端生成的标识符不一致，导致偏好查找失败。
+
+### 11.2 兼容拦截器实现
+
+`ContextCompatibilityInterceptor` 定义在 `inbox/interceptors/context-compatibility.interceptor.ts`：
+
+```typescript
+function shouldDisableContextForOldClient(clientVersion?: string): boolean {
+  const version = parseClientVersion(clientVersion);
+  if (!version) {
+    return true;  // 无版本头 = 旧客户端，禁用 context
+  }
+  return !isContextAwareVersion(version);  // < 3.13.0 也禁用
+}
+
+intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+  const subscriberSession = request.user;
+  if (!subscriberSession?.contextKeys || subscriberSession.contextKeys.length === 0) {
+    return next.handle();  // 本身无 contextKeys，无需处理
+  }
+  if (shouldDisableContextForOldClient(clientVersion)) {
+    subscriberSession.contextKeys = undefined;  // 清空 contextKeys
+  }
+  return next.handle();
+}
+```
+
+### 11.3 拦截范围
+
+| 控制器 | 拦截方式 | 拦截粒度 |
+|-------|---------|---------|
+| `InboxController` | 方法级 `@UseInterceptors(ContextCompatibilityInterceptor)` | 仅 `PATCH /inbox/subscriptions/:subscriptionIdentifier/preferences/:workflowIdOrIdentifier` |
+| `InboxTopicController` | 类级 `@UseInterceptors(ContextCompatibilityInterceptor)` | 该控制器下所有端点 |
+
+`InboxController` 中仅有一个端点（订阅偏好更新）应用了此拦截器，其余端点（通知列表、计数、标记等）未拦截，因为这些端点本身需要 contextKeys 来正确过滤数据。
+
+### 11.4 兼容分支的三种情况
+
+| 客户端状态 | `Novu-Client-Version` 头 | `contextKeys` 处理 | 行为 |
+|-----------|--------------------------|-------------------|------|
+| 新客户端 (≥ 3.13.0) | `@novu/js@3.13.0` | 保持原值 | 正常上下文隔离 |
+| 旧客户端 (< 3.13.0) | `@novu/js@3.0.0` | 设为 `undefined` | 退回无上下文模式 |
+| 无版本头 | 不传 | 设为 `undefined` | 退回无上下文模式 |
+
+### 11.5 清空 contextKeys 后的查询行为
+
+当 `contextKeys` 被设为 `undefined` 后，在 `buildContextExactMatchQuery` 中：
+
+```typescript
+if (contextKeys === undefined || contextKeys.length === 0) {
+  return {
+    $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }],
+  };
+}
+```
+
+这意味着旧客户端会看到所有"无上下文"的消息和偏好数据，不会看到带上下文隔离的数据。这对旧客户端是安全的，因为旧客户端本身不理解上下文概念。
+
+### 11.6 潜在风险
+
+1. **写操作遗漏**：拦截器仅覆盖订阅偏好的写操作端点。如果旧客户端通过其他写路径（如 `PATCH /inbox/preferences`）修改偏好，这些路径未拦截，可能导致在新上下文下写入旧格式的偏好数据。
+
+2. **读操作不拦截**：`GET /inbox/notifications` 等读操作不应用此拦截器。如果 JWT 中包含 contextKeys，旧客户端仍然只能看到该上下文的数据——但这与旧客户端预期一致（旧客户端获取的 JWT 本身就不应包含 contextKeys，因为 session 创建时旧客户端不会传递 context 参数）。
+
+3. **Session 创建的防线**：在 `session.usecase.ts` 中，`resolveContexts` 方法仅在客户端请求体包含 `context` 字段时才解析上下文。旧客户端不会发送此字段，因此其 JWT 中 `contextKeys` 为空数组，拦截器不会触发清空逻辑——这构成了第一道防线。
