@@ -161,9 +161,63 @@ HMAC 验证可通过 [Client 构造选项](file:///d:/fz/0601-2/solo-dogfeeding/
 
 ## 3. 防重放
 
-防重放机制是 HMAC 签名验证的组成部分，通过 **时间戳容差检查** 实现。
+Bridge 框架的防重放机制是一个**单一机制**——即 HMAC 签名中嵌入的时间戳容差检查。`deliveryId` 不是框架层面的防重放手段，它只是请求追踪标识。
 
-### 3.1 签名头解析
+### 3.1 唯一的防重放机制：时间戳容差
+
+**机制原理**：签名头中包含请求生成时的 Unix 毫秒时间戳 `t`，接收端验证该时间戳与当前时间的差值在容差范围内。
+
+代码位置：[validateHmac()](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/handler.ts#L371-L396)
+
+```ts
+if (parsed.t < now - SIGNATURE_TIMESTAMP_TOLERANCE || parsed.t > now + SIGNATURE_TIMESTAMP_TOLERANCE) {
+  throw new SignatureExpiredError();
+}
+```
+
+[SIGNATURE_TIMESTAMP_TOLERANCE = ±5 分钟](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/constants/api.constants.ts#L6-L7)
+
+**能防什么**：
+- ✅ **过期请求重放**：攻击者截获请求后保存，数小时/数天后再重放 —— 时间戳已过期，直接被拒绝
+- ✅ **离线截获的请求重放**：中间人截获后长期保存用于后续攻击 —— 同样被时间窗口拦截
+- ✅ **大范围时间漂移攻击**：攻击者尝试用非当前时间戳伪造请求 —— HMAC 签名保护了时间戳的完整性，无法篡改
+
+**不能防什么**：
+- ❌ **5 分钟窗口内的重放攻击**：攻击者在签名生成后的 5 分钟内，将同一请求重复发送 N 次 —— 时间戳仍然有效，签名验证通过，框架层面无任何去重逻辑
+- ❌ **同一会话内的重复执行**：因网络抖动导致的重试（Novu 端的重试机制）会造成用户代码被执行多次 —— 这是设计上的取舍，重试被视为合法的"至少一次"投递语义
+- ❌ **时钟漂移过大的场景**：两端时钟差超过 5 分钟时，合法请求也会被拒绝
+
+**关键设计前提**：HMAC 签名覆盖了时间戳（签名输入是 `<timestamp>.<payload>`），因此攻击者无法在不持有 secretKey 的情况下修改 `t` 来绕过时间检查。
+
+### 3.2 deliveryId 的真实定位
+
+`deliveryId` **不是**框架层面的防重放/去重机制。它只是一个请求追踪标识，被放入 payload 中透传。
+
+生成代码：[buildPayload()](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/apps/api/src/app/agents/conversation-runtime/runtime/bridge-executor.service.ts#L262-L305)
+
+```ts
+deliveryId: `${conversation._id}:${message.id}`                    // 有消息时
+deliveryId: `${conversation._id}:${event}:${action.id}:${timestamp}`  // 有 action 时
+deliveryId: `${conversation._id}:${event}:${reaction.messageId}:${timestamp}`  // 有 reaction 时
+deliveryId: `${conversation._id}:${event}`                          // 其他情况
+```
+
+**接收侧行为**：
+- SDK 端的 [AgentContextImpl](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/resources/agent/agent.context.ts) 甚至没有将 `deliveryId` 暴露为公共属性
+- 框架层面没有任何基于 `deliveryId` 的去重缓存、数据库索引或幂等判断
+- 它只是 `AgentBridgeRequest` 类型定义中的一个字段，随 payload 一起透传给用户代码
+
+**deliveryId 的实际用途**：
+- ✅ **日志/链路追踪**：用户代码可以通过 `deliveryId` 关联同一次投递的多条日志
+- ✅ **业务层幂等（用户自行实现）**：如果用户需要精确一次语义，需要自己基于 `deliveryId` 在业务层做去重（如 Redis SETNX、数据库唯一索引等）
+- ✅ **问题排查**：出现重复投递时，可通过 `deliveryId` 确认是否为同一请求的多次到达
+
+**deliveryId 不能做什么**：
+- ❌ 不能替代时间戳容差做防重放（框架不校验）
+- ❌ 不能保证"恰好一次"语义
+- ❌ 不能防止 5 分钟窗口内的重复执行
+
+### 3.3 签名头解析与历史漏洞
 
 [parseSignatureHeader()](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/handler.ts#L415-L439) 从 `novu-signature` 头中解析 `t`（时间戳）和 `v1`（签名值）：
 
@@ -173,7 +227,7 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
   for (const rawPart of header.split(',')) {
     const part = rawPart.trim();
     if (!part) continue;
-    const eqIdx = part.indexOf('=');
+    const eqIdx = part.indexOf('=');   // 只在第一个 '=' 处分割
     if (eqIdx <= 0) continue;
     const key = part.slice(0, eqIdx);
     const value = part.slice(eqIdx + 1);
@@ -185,29 +239,19 @@ function parseSignatureHeader(header: string): ParsedSignatureHeader {
 }
 ```
 
-注意：使用 `indexOf('=')` 而非 `split('=')` 来分割键值对，这是修复之前的一个安全漏洞——旧实现中 `timestamp` 会被错误地赋值为字符串 `"t"`，导致时间戳验证失效，从而**静默禁用了重放保护**。
+**历史安全漏洞**：旧实现使用 `split('=')` 来分割键值对，导致当 value 中包含 `=` 字符时，`timestamp` 会被错误地赋值为字面量字符串 `"t"`。由于 `"t" < now - tolerance` 恒为真，时间戳验证**静默失效**，相当于完全禁用了防重放保护。
 
-### 3.2 时间戳容差
+当前实现使用 `indexOf('=')` 只在第一个 `=` 处分割，并按名称查找字段，确保了时间戳解析的正确性。
 
-[SIGNATURE_TIMESTAMP_TOLERANCE = 5 分钟](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/packages/framework/src/constants/api.constants.ts#L6-L7)
+### 3.4 防重放能力总结
 
-```ts
-const SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES = 5;
-const SIGNATURE_TIMESTAMP_TOLERANCE = SIGNATURE_TIMESTAMP_TOLERANCE_MINUTES * 60 * 1000;
-```
-
-验证逻辑：若 `parsed.t` 与当前时间 `Date.now()` 的差值超过 ±5 分钟，抛出 `SignatureExpiredError`。
-
-### 3.3 deliveryId 去重标识
-
-在 Agent Bridge 场景中，[buildPayload()](file:///d:/fz/0601-2/solo-dogfeeding/code/60-novu/apps/api/src/app/agents/conversation-runtime/runtime/bridge-executor.service.ts#L262-L305) 为每次投递生成唯一的 `deliveryId`，用于消费端去重：
-
-```ts
-deliveryId: `${conversation._id}:${message.id}`           // 有消息时
-deliveryId: `${conversation._id}:${event}:${action.id}:${timestamp}`  // 有 action 时
-deliveryId: `${conversation._id}:${event}:${reaction.messageId}:${timestamp}`  // 有 reaction 时
-deliveryId: `${conversation._id}:${event}`                 // 其他情况
-```
+| 攻击场景 | 时间戳容差 | deliveryId |
+|----------|-----------|------------|
+| 截获请求后长期保存再重放 | ✅ 阻止 | ❌ 不阻止 |
+| 5 分钟内重复发送同一请求 | ❌ 不阻止 | ❌ 不阻止（框架无校验） |
+| 修改时间戳绕过时间窗口 | ✅ 阻止（HMAC 保护完整性） | — |
+| 网络重试导致重复执行 | ❌ 不阻止（设计为至少一次） | ❌ 不阻止 |
+| 用户代码自行实现幂等 | — | ✅ 可作为幂等键 |
 
 ---
 
