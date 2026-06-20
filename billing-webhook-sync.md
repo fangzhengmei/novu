@@ -4,6 +4,8 @@
 
 > **证据边界声明**：计费 webhook 的核心实现位于 `@novu/ee-billing` 企业包（git submodule，当前工作区源码未检出）。控制器、路由、签名验证、事件分发等 HTTP 层逻辑均在该包内部，可见代码中无法直接查阅。以下分析仅限于共享代码、e2e 测试、模块注册和类型定义中能够验证的部分。
 
+> **E2E 测试执行状态声明**：billing e2e 共 13 个测试套件中，**仅 `customer-subscription-deleted` 套件被 `describe.skip()` 标记为跳过**，其余 12 个套件正常执行。跳过套件中的所有用例不能作为已验证行为证据。
+
 ---
 
 ## 一、整体架构概览
@@ -36,14 +38,14 @@
 | **核心处理** | 套餐变更、支付事件、账户状态 | 更新 ExecutionDetails 状态 | 更新 ExecutionDetails 状态 |
 | **业务影响** | 组织套餐等级、额度限流、账单 | 仅通知投递状态记录 | 仅通知投递状态记录 |
 
-### 1.3 计费入站的业务流程（基于 e2e 测试验证的事实）
+### 1.3 计费入站的业务流程（区分验证状态）
 
 ```
 Stripe Platform → [BillingModule 内部 Controller（证据边界）]
     → 事件路由分发（证据边界）
-        → CheckoutSessionCompletedHandler
-        → CustomerSubscriptionCreatedHandler
-        → CustomerSubscriptionDeletedHandler
+        ├─ CheckoutSessionCompletedHandler  [✅ 已验证：5 项断言全部通过]
+        ├─ CustomerSubscriptionCreatedHandler [✅ 已验证：5 项断言全部通过]
+        └─ CustomerSubscriptionDeletedHandler [⚠️ describe.skip：未执行，不验证]
             → VerifyCustomer (customer → organization 映射)
             → 业务逻辑（取消旧订阅 / 创建子订阅 / 降级判断）
             → UpdateServiceLevel (更新 organization.apiServiceLevel)
@@ -134,13 +136,13 @@ expect(createSubscriptionStub.lastCall.args[1].idempotencyKey).to.equal(
 
 #### 事实 3：Handler 具备业务幂等（early exit 机制）
 
-多个检查点提前返回，避免重复处理产生副作用：
+> 注意：以下 early exit 条件**仅以非 skipped 套件中的断言为准**。
 
-| Handler | early exit 条件 | 证据 |
-|---------|----------------|------|
-| CheckoutSessionCompleted | organization 为 null → 直接返回，不执行任何变更，不触发 analytics | [checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L187-L197) |
-| CustomerSubscriptionCreated | 1. apiServiceLevel 不是合法枚举值<br>2. 纯 metered 订阅 | [customer-subscription-created.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L104-L111) |
-| CustomerSubscriptionDeleted | 组织不存在 → 直接返回 | [customer-subscription-deleted.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-deleted.e2e-ee.ts#L116-L125) |
+| Handler | early exit 条件 | 验证状态 | 证据 |
+|---------|----------------|---------|------|
+| CheckoutSessionCompleted | organization 为 null → 直接返回，不触发 analytics | ✅ 已验证 | [checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L187-L197)：`expect(analyticsServiceStub.track.called).to.be.false` |
+| CustomerSubscriptionCreated | 1. organization 为 null → `updateServiceLevelStub.called === false`<br>2. `apiServiceLevel` 为非法值 → `updateServiceLevelStub.called === false` | ✅ 已验证 | [customer-subscription-created.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L168-L178) 与 [L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296) |
+| CustomerSubscriptionDeleted | organization 为 null → 不调用 UpdateServiceLevel | ⚠️ 套件 skipped，不验证 | — |
 
 #### 事实 4：全局 IdempotencyInterceptor 不适用于计费 webhook
 
@@ -193,54 +195,83 @@ export enum StripeBillingIntervalEnum {
 | 月付 (month) | 单一 Subscription，包含 2 个 Item | Item 1: flat licensed；Item 2: usage metered |
 | 年付 (year) | 两个独立 Subscription | Sub A: 年付 licensed（一次性收费）；Sub B: 月付 metered（追踪用量），通过 `metadata.parentSubscriptionId` 关联 |
 
-证据：[checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L235-L241) 中年付场景下额外创建 metered 子订阅并设置 `parentSubscriptionId`。
+证据：[checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L218-L242) 中年付场景下额外创建 metered 子订阅并设置 `parentSubscriptionId`。
 
-### 4.3 三大核心 Handler 行为（事实，基于 e2e 测试）
+### 4.3 Handler 行为（按验证状态区分）
 
-#### CheckoutSessionCompletedHandler
+> **重要说明**：本章中 CustomerSubscriptionDeletedHandler 的所有描述均来自 `describe.skip` 套件中的**未执行用例**，代码结构可说明 Handler 设计意图，但**不代表已验证行为**。
+
+#### CheckoutSessionCompletedHandler [✅ 全部 5 项断言已验证]
 
 触发事件：`checkout.session.completed`
 
-流程：
-1. **VerifyCustomer**：通过 `customer.metadata.organizationId` 映射到 Novu 组织
-2. **early exit**：组织不存在 → 返回，不触发 analytics
-3. **取消旧订阅**：调用 `stripe.subscriptions.cancel()` 取消除本次触发订阅外的所有其他订阅
-4. **更新默认支付方式**：`stripe.customers.update()` 设置 `invoice_settings.default_payment_method`
-5. **年付专属逻辑**：若为年付，额外创建月度 metered 订阅，设置 `metadata.parentSubscriptionId`
-6. **缓存失效**：`InvalidateCacheService.invalidateByKey()`
-7. **埋点上报**：AnalyticsService
+| 步骤 | 行为 | 断言 |
+|-----|------|------|
+| 1 | VerifyCustomer：通过 `customer.metadata.organizationId` 映射 | 隐式 |
+| 2 | 组织不存在 → early exit（不触发 analytics） | `track.called === false` ([L187-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L187-L197)) |
+| 3 | 取消除触发订阅外的所有其他旧订阅 | `cancel.callCount === 1`，`cancel.lastCall.args[0] === 'subscription_id'` ([L199-L205](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L199-L205)) |
+| 4 | 更新 customer 默认支付方式 | `customers.update` 设置 `invoice_settings.default_payment_method` ([L207-L216](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L207-L216)) |
+| 5 | 年付专属：额外创建月度 metered 子订阅，设置 `metadata.parentSubscriptionId` | `subscriptions.create` 参数校验 ([L218-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L218-L242)) |
+| 6 | 缓存失效 | `invalidateByKey.called === true` ([L244-L249](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts#L244-L249)) |
 
-#### CustomerSubscriptionCreatedHandler
+> 注意：CheckoutSessionCompletedHandler **不直接调用 UpdateServiceLevel**（不注入 UpdateServiceLevel 依赖），等级更新由后续的 `customer.subscription.created` 事件触发。
+
+---
+
+#### CustomerSubscriptionCreatedHandler [✅ 全部 5 项断言已验证]
 
 触发事件：`customer.subscription.created`
 
-流程：
-1. **VerifyCustomer**：customer → organization 映射校验
-2. **套餐解析**：从 `subscription.items.data[].price.product.metadata.apiServiceLevel` 提取等级
-3. **early exit**：apiServiceLevel 非法 或 纯 metered 订阅 → 跳过等级更新
-4. **UpdateServiceLevel**：更新 `apiServiceLevel` 和 `isTrial`
-5. **缓存失效 + 埋点**
+| 步骤 | 行为 | 断言 |
+|-----|------|------|
+| 1 | VerifyCustomer：customer → organization 映射 | 隐式 |
+| 2 | 组织不存在 → early exit | `updateServiceLevelStub.called === false` ([L168-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L168-L178)) |
+| 3 | **licensed 订阅**：提取 `apiServiceLevel` 并更新等级 | `updateServiceLevelStub` 参数 = `{organizationId, BUSINESS, isTrial:false}` ([L180-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L180-L189)) |
+| 4 | 缓存失效（licensed） | `invalidateByKey.called === true` ([L191-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L191-L196)) |
+| 5 | **metered 订阅**：**仍调用 UpdateServiceLevel**（❌ 原结论错误，已修正） | `updateServiceLevelStub.called === true` ([L198-L231](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L198-L231)) |
+| 6 | apiServiceLevel 为非法值（如 `'invalid'`）→ early exit | `updateServiceLevelStub.called === false` ([L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296)) |
 
-#### CustomerSubscriptionDeletedHandler
+> ⚠️ **重要修正**：之前的分析断言"纯 metered 订阅跳过等级更新"是**错误的**。该用例标题写的是 "should exit early with known organization and metered subscription"，但实际断言是 `expect(updateServiceLevelStub.called).to.be.true`——明确要求 UpdateServiceLevel **被调用**。因此 **metered 订阅不会跳过等级更新**，Handler 会在该分支下调用 UpdateServiceLevel（具体参数未在此用例中断言）。
+
+---
+
+#### CustomerSubscriptionDeletedHandler [⚠️ describe.skip：套件未执行]
 
 触发事件：`customer.subscription.deleted`
 
-流程：
-1. **VerifyCustomer**：组织映射校验
-2. **级联取消关联订阅**：licensed ↔ metered 双向关联，取消一个自动取消另一个
-3. **降级判断**：仍有有效订阅则保持最高等级；否则创建 FREE 套餐并降级
-4. **缓存失效 + 埋点**
+套件定义位置：[customer-subscription-deleted.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-deleted.e2e-ee.ts#L100)：
+
+```typescript
+describe.skip('webhook event - customer.subscription.deleted #novu-v2', () => {
+```
+
+**状态说明**：整个测试套件被 `describe.skip()` 标记，所有 6 项用例均**未实际执行**。以下内容仅反映用例编写时的**设计意图**，不代表已验证行为：
+
+| 用例 | 预期断言 | 状态 |
+|-----|---------|------|
+| 组织不存在 → early exit | `updateServiceLevelStub.called === false` | ⚠️ skipped |
+| 年付 licensed 取消 → 级联取消 metered 子订阅 | `cancel('linked_metered_subscription_id') === true` | ⚠️ skipped |
+| 年付 metered 取消 → 级联取消父 licensed 订阅 | `cancel('licensed_subscription_id') === true` | ⚠️ skipped |
+| 无剩余订阅 → 创建 FREE 套餐并降级 | `createSubscriptionStub.called === true` + `UpdateServiceLevel(FREE)` | ⚠️ skipped |
+| 有剩余订阅 → 保持最高等级 | `UpdateServiceLevel(BUSINESS)` 保持不变 | ⚠️ skipped |
+| 缓存失效 | `invalidateByKey.called === true` | ⚠️ skipped |
+
+**对账户状态更新判断的影响**：
+- "级联取消关联订阅"机制（licensed ↔ metered 双向）：**未验证**
+- "取消后无订阅自动降级 FREE" 逻辑：**未验证**
+- "有剩余订阅则保持最高等级"逻辑：**未验证**
+- 实际生产环境中 Handler 是否按这些预期工作，需在 ee-billing 源码或启用该套件后确认。
 
 ### 4.4 VerifyCustomer 行为（事实）
 
 [verify-customer.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/verify-customer.e2e-ee.ts)：
 
-| 场景 | 行为 |
-|-----|------|
-| Stripe customer 不存在 | 抛出 `Customer not found` 异常 |
-| Stripe customer 已标记 deleted | 抛出 `Customer is deleted: 'customer_id'` 异常 |
-| customer.metadata.organizationId 对应组织不存在 | 打 verbose 日志，返回 `{ organization: null, customer }` |
-| 正常场景 | 返回 `{ organization, customer, subscriptions }` |
+| 场景 | 行为 | 验证状态 |
+|-----|------|---------|
+| Stripe customer 不存在 | 抛出 `Customer not found` 异常 | ✅ 已验证 |
+| Stripe customer 已标记 deleted | 抛出 `Customer is deleted: 'customer_id'` 异常 | ✅ 已验证 |
+| customer.metadata.organizationId 对应组织不存在 | 打 verbose 日志，返回 `{ organization: null, customer }` | ✅ 已验证 |
+| 正常场景 | 返回 `{ organization, customer, subscriptions }` | ✅ 已验证 |
 
 ### 4.5 用量记录同步（事实）
 
@@ -351,7 +382,18 @@ const organizationSchema = new Schema<OrganizationDBModel>({
 | 自动翻译 | ❌ | ❌ | ✅ | ✅ |
 | RBAC | ❌ | ❌ | ✅ | ✅ |
 
-### 6.3 配额限流拦截器（事实）
+### 6.3 套餐等级变更的触发路径（区分验证状态）
+
+| 事件 | 等级变更操作 | 验证状态 | 说明 |
+|-----|------------|---------|------|
+| `checkout.session.completed` | — | ✅ | Handler 不注入 UpdateServiceLevel，只做订阅级操作，等级更新留给后续事件 |
+| `customer.subscription.created`（licensed） | ✅ UpdateServiceLevel 被调用，参数具体断言 BUSINESS | ✅ | [L180-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L180-L189) |
+| `customer.subscription.created`（metered） | ✅ UpdateServiceLevel 被调用（参数未断言） | ✅ | [L198-L231](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L198-L231)：`called === true` |
+| `customer.subscription.deleted`（级联取消） | 设计意图：级联取消 licensed ↔ metered | ⚠️ skipped | 未执行，不验证 |
+| `customer.subscription.deleted`（无剩余订阅） | 设计意图：CreateSubscription(FREE) + UpdateServiceLevel(FREE) | ⚠️ skipped | 未执行，不验证 |
+| `customer.subscription.deleted`（有剩余） | 设计意图：保持最高等级 | ⚠️ skipped | 未执行，不验证 |
+
+### 6.4 配额限流拦截器（事实）
 
 全局注册：[app.module.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app.module.ts#L109-L118)
 
@@ -363,7 +405,7 @@ const enterpriseQuotaThrottlerInterceptor =
     : [];
 ```
 
-限流行为（基于 [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts)）：
+限流行为（基于 [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts) ✅ 已验证）：
 
 | 场景 | 行为 |
 |-----|------|
@@ -372,31 +414,60 @@ const enterpriseQuotaThrottlerInterceptor =
 | PRO/BUSINESS/ENTERPRISE 超额 | 不拦截（按超额计费） |
 | fallback（locked: false） | 不拦截（降级保护） |
 
-### 6.4 GetSubscription DTO（事实）
+### 6.5 GetSubscription DTO（事实）
 
 [get-subscription.dto.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/packages/shared/src/dto/subscription/get-subscription.dto.ts) 定义了前端所需字段：`apiServiceLevel`、`isActive`、`status`、`hasPaymentMethod`、`currentPeriodStart/End`、`billingInterval`、`events{current,included}`、`trial{start,end,isActive,daysTotal}`、`cancelAt`。
+
+### 6.6 套餐状态机（已验证部分）
+
+根据已验证的事件路径，**已确认**的状态流转如下（未确认的 skipped 分支已排除）：
+
+```
+组织创建 → FREE (default)
+  → 用户点击升级 → CreateCheckoutSession → Stripe 支付
+      → checkout.session.completed
+          [✅] 取消旧订阅
+          [✅] 设置默认支付方式
+          [✅] 年付则创建 metered 子订阅
+      → customer.subscription.created
+          [✅] licensed 订阅：UpdateServiceLevel(FREE → BUSINESS)
+          [✅] metered 订阅：UpdateServiceLevel 仍被调用（❌ 原"跳过"结论错误）
+          [✅] apiServiceLevel 非法值 → early exit
+```
+
+**未确认的 skipped 分支**（不可作为依据）：
+```
+      → customer.subscription.deleted [⚠️ skipped]
+          [?] 级联取消 licensed ↔ metered
+          [?] 无订阅 → FREE 降级
+          [?] 有剩余订阅 → 保持最高等级
+```
 
 ---
 
 ## 七、核心结论汇总表
 
-| 分析项 | 结论 | 性质 | 证据 |
-|-------|------|------|------|
-| **计费 webhook 入口位置** | 在 `@novu/ee-billing` BillingModule 内部注册 | 事实 | [app.module.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app.module.ts#L77-L79) |
-| **InboundWebhooksModule 用途** | 投递回执 V2 入口，不是计费入站 | 事实 | [bootstrap.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/bootstrap.ts#L123-L127) |
-| **Raw Body 保留** | 企业版下启用 `rawBody: true` + verify 回调 | 事实 | [bootstrap.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/bootstrap.ts#L70-L73) |
-| **constructEvent 调用** | ee-billing 内部实现，不可见 | 证据边界 | — |
-| **STRIPE_WEBHOOK_SECRET 使用** | 可见代码中无直接引用 | 证据边界 | — |
-| **事件去重是否入库** | ❌ 否，无 webhook_events 等表 | 事实 | libs/dal 全部 42 个 schema 排查 |
-| **Stripe 操作级幂等键** | ✅ 是，结构化 Key 构造规则可验证 | 事实 | [create-subscription.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-subscription.e2e-ee.ts#L115-L119) |
-| **Handler early exit 业务幂等** | ✅ 是，多个检查点提前返回 | 事实 | 各 Handler e2e 测试 |
-| **event.id 缓存去重** | 可见代码中无证据 | 证据边界 | — |
-| **本地计费重试队列** | ❌ 否，无 BillingWebhookQueue 等 | 事实 | libs/application-generic 全部队列排查 |
-| **BullMQ 计费重试 Job** | ❌ 否，无相关定义 | 事实 | 全局代码搜索 |
-| **Stripe 平台重试策略** | 可见代码中无配置，依赖 Stripe 默认行为 | 证据边界 | — |
-| **容错降级机制** | ✅ 是，Customer 创建/缓存失效/额度评估 均有 try/catch | 事实 | sync-external-organization、invalidate-cache、get-event-resource-limit |
-| **组织套餐字段** | `apiServiceLevel`、`isTrial`、`stripeCustomerId` | 事实 | [organization.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/libs/dal/src/repositories/organization/organization.schema.ts#L11-L19) |
-| **配额限流** | FREE 超额 402，付费超额不拦截，自托管跳过 | 事实 | [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts) |
+| 分析项 | 结论 | 性质 | 验证状态 | 证据 |
+|-------|------|------|---------|------|
+| **计费 webhook 入口位置** | 在 `@novu/ee-billing` BillingModule 内部注册 | 事实 | — | [app.module.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app.module.ts#L77-L79) |
+| **InboundWebhooksModule 用途** | 投递回执 V2 入口，不是计费入站 | 事实 | — | [bootstrap.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/bootstrap.ts#L123-L127) |
+| **Raw Body 保留** | 企业版下启用 `rawBody: true` + verify 回调 | 事实 | — | [bootstrap.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/bootstrap.ts#L70-L73) |
+| **constructEvent 调用** | ee-billing 内部实现，不可见 | 证据边界 | — | — |
+| **STRIPE_WEBHOOK_SECRET 使用** | 可见代码中无直接引用 | 证据边界 | — | — |
+| **事件去重是否入库** | ❌ 否，无 webhook_events 等表 | 事实 | — | libs/dal 全部 42 个 schema 排查 |
+| **Stripe 操作级幂等键** | ✅ 是，结构化 Key 构造规则可验证 | 事实 | ✅ | [create-subscription.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-subscription.e2e-ee.ts#L115-L119) |
+| **customer-subscription-deleted 套件** | `describe.skip`，全部 6 项用例未执行 | 事实 | ⚠️ skipped | [L100](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-deleted.e2e-ee.ts#L100) |
+| **级联取消关联订阅** | 设计意图存在，但未执行验证 | 设计意图（未验证） | ⚠️ skipped | — |
+| **取消后 FREE 降级** | 设计意图存在，但未执行验证 | 设计意图（未验证） | ⚠️ skipped | — |
+| **全局 IdempotencyInterceptor** | 不适用于计费 webhook（无 Header） | 事实 | ✅ | [L22-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/shared/framework/idempotency.interceptor.ts#L22-L27) |
+| **Handler early exit（org null）** | Checkout + Created 已验证，Deleted 未执行 | 事实 | ✅/⚠️ | 各 e2e 文件 |
+| **Handler early exit（apiServiceLevel 非法）** | CustomerSubscriptionCreated ✅ 已验证 | 事实 | ✅ | [L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296) |
+| **⟨metered 订阅跳过等级更新⟩** | ❌ **原结论错误**：UpdateServiceLevel 仍被调用（`called === true`） | 事实（修正后） | ✅ | [L198-L231](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L198-L231) |
+| **本地计费重试队列** | ❌ 否，无 BillingWebhookQueue 等 | 事实 | — | libs/application-generic 全部队列排查 |
+| **BullMQ 计费重试 Job** | ❌ 否，无相关定义 | 事实 | — | 全局代码搜索 |
+| **容错降级机制** | ✅ Customer 创建 / 缓存失效 / 额度评估 均有 try/catch | 事实 | ✅ | 三处独立代码 |
+| **组织套餐字段** | `apiServiceLevel`、`isTrial`、`stripeCustomerId` | 事实 | — | [organization.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/libs/dal/src/repositories/organization/organization.schema.ts#L11-L19) |
+| **配额限流** | FREE 超额 402，付费超额不拦截，自托管跳过 | 事实 | ✅ | [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts) |
 
 ---
 
@@ -414,12 +485,13 @@ const enterpriseQuotaThrottlerInterceptor =
 | [invalidate-cache.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/libs/application-generic/src/services/cache/invalidate-cache.service.ts#L12-L19) | 缓存失效 | 容错降级 |
 | [sync-external-organization.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/organization/usecases/create-organization/sync-external-organization/sync-external-organization.usecase.ts#L185-L202) | 组织创建 | Billing Customer 创建容错降级 |
 | [webhooks.controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/webhook/src/webhooks/webhooks.controller.ts#L16-L32) | 投递回执 V1 入口 | 对比用，与计费入站无关 |
-| **E2E 测试** | | |
-| [checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts) | Checkout 完成 Handler | early exit、级联取消、年付子订阅、缓存失效 |
-| [customer-subscription-created.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts) | 订阅创建 Handler | 套餐解析、early exit 条件、UpdateServiceLevel |
-| [customer-subscription-deleted.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-deleted.e2e-ee.ts) | 订阅取消 Handler | 级联取消、FREE 降级 |
-| [verify-customer.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/verify-customer.e2e-ee.ts) | 客户校验 | customer → organization 映射逻辑、异常场景 |
-| [create-subscription.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-subscription.e2e-ee.ts) | 订阅创建 | idempotencyKey 构造规则 |
-| [create-usage-records.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-usage-records.e2e-ee.ts) | 用量上报 | 定期用量同步逻辑 |
-| [get-event-resource-limit.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/get-event-resource-limit.e2e-ee.ts) | 额度评估 | 降级策略 |
-| [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts) | 配额限流 | 运行时限流行为 |
+| **E2E 测试（✅ 正常执行）** | | |
+| [checkout-session-completed.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/checkout-session-completed.e2e-ee.ts) | Checkout 完成 Handler | 5 项断言：early exit(org null)、取消旧订阅、默认支付方式、年付子订阅、缓存失效 |
+| [customer-subscription-created.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts) | 订阅创建 Handler | 5 项断言：early exit(org null)、licensed 更新等级、缓存失效、**metered 仍调用 UpdateServiceLevel（修正点）**、非法等级 early exit |
+| [verify-customer.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/verify-customer.e2e-ee.ts) | 客户校验 | 4 项断言：customer 不存在、customer deleted、组织不存在（返回 null）、正常映射 |
+| [create-subscription.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-subscription.e2e-ee.ts) | 订阅创建 | 幂等键构造规则、CreateSubscription → VerifyCustomer 调用链 |
+| [create-usage-records.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/create-usage-records.e2e-ee.ts) | 用量上报 | FREE 兜底创建、覆盖式上报 usage record |
+| [get-event-resource-limit.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/get-event-resource-limit.e2e-ee.ts) | 额度评估 | fallback 降级策略 |
+| [quota-throttler.guard.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/quota-throttler.guard.e2e-ee.ts) | 配额限流 | FREE 402、付费不拦截、自托管跳过、fallback 不限流 |
+| **E2E 测试（⚠️ 已跳过）** | | |
+| [customer-subscription-deleted.e2e-ee.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-deleted.e2e-ee.ts#L100) | 订阅取消 Handler | `describe.skip`，6 项用例**全部未执行**，不构成证据 |
