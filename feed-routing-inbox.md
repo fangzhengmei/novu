@@ -188,7 +188,7 @@ if (!command.feedId && existingTemplate._feedId) {
 | snoozed | ✅ | 用 `snoozedUntil` 字段判断 |
 | severity | ✅ | NONE 值含字段缺失 |
 | data | ✅ | 与 payload 类似但走 data 字段 |
-| contextKeys | ✅ | `buildContextExactMatchQuery`（`contextKeys !== undefined` 时启用） |
+| contextKeys | ✅（方法签名支持） | 但 usecase 层**未传递**（详见第 6 节） |
 | 时间范围 (createdAt) | ✅ | `getCount` 有参数，`findBySubscriberChannel` 未暴露 |
 
 ### 5.2 新接口 `/inbox/*` → paginate()
@@ -210,7 +210,7 @@ if (!command.feedId && existingTemplate._feedId) {
 | snoozed | ✅ | `{ $eq: null }` / `{ $exists: true, $ne: null }` |
 | severity | ✅ | NONE 值含字段缺失 |
 | data | ✅ | buildDataFilterQuery |
-| contextKeys | ✅ | `buildContextExactMatchQuery`（`contextKeys !== undefined` 时启用） |
+| contextKeys | ✅ | `buildContextExactMatchQuery`（usecase 层**已传递**） |
 | 时间范围 (createdAt) | ✅ | createdGte / createdLte |
 
 ### 5.3 功能矩阵对比
@@ -225,7 +225,8 @@ if (!command.feedId && existingTemplate._feedId) {
 | snoozed | ✅ | ✅ |
 | data 过滤 | ✅ | ✅ |
 | seen / read | ✅ | ✅ |
-| contextKeys | ✅（但 usecase 层未传递） | ✅（usecase 层已传递） |
+| contextKeys 方法支持 | ✅ | ✅ |
+| contextKeys 实际传递 | ❌（见第 6 节） | ✅（见第 6 节） |
 | 时间范围 | ✅（仅计数） | ✅（列表） |
 
 **一致性校验点：** snoozed=false 处理的两种写法结果集一致。
@@ -235,11 +236,15 @@ if (!command.feedId && existingTemplate._feedId) {
 
 ---
 
-## 6. 权限边界与上下文隔离
+## 6. 权限边界与上下文隔离（按代码顺序追踪）
 
 ### 6.1 认证方式
 
 两套接口均使用 subscriberJWT 认证。通过 `AuthGuard('subscriberJWT')` 验证 subscriber 身份。
+
+认证通过后，请求上下文中可获得 `subscriberSession`（即 AuthGuard 注入的 request.user），其中包含：
+- `_environmentId`、`_organizationId`、`subscriberId`：租户与用户边界
+- `contextKeys`: 订阅者会话的上下文键数组
 
 ### 6.2 contextKeys 隔离实现：buildContextExactMatchQuery
 
@@ -259,27 +264,160 @@ if (!command.feedId && existingTemplate._feedId) {
     → 精确集合匹配：键完全相同（与顺序无关）
 ```
 
-### 6.3 权限边界对比
+### 6.3 唯一的上下文过滤条件注入点：`if (contextKeys !== undefined)`
 
-| 权限维度 | `/widgets` | `/inbox` |
-|---------|----------|---------|
+两套查询路径的上下文过滤都通过同一个判断控制：
+
+```typescript
+if (contextKeys !== undefined) {
+  const contextQuery = this.buildContextExactMatchQuery(contextKeys);
+  // 旧接口 (getFilterQueryForMessage):
+  requestQuery.$and = [...(requestQuery.$and ?? []), contextQuery];
+  // 新接口 (paginate):
+  query.$and = [...(query.$and ?? []), contextQuery];
+}
+```
+
+**关键语义：** 当 `contextKeys === undefined` 时，不进入 if 分支，**不会向查询追加任何 `$and` 条件，即完全不做上下文过滤。** 这与"显式调用 buildContextExactMatchQuery(undefined) 落入分支 1 匹配无上下文消息"是两种完全不同的语义。
+
+### 6.4 旧 `/widgets` 接口：contextKeys 的完整传递链路
+
+按代码执行顺序追踪：
+
+**Step 1：Controller 层创建 Command**
+
+在 widgets.controller.ts 中创建 `GetNotificationsFeedCommand` / `GetFeedCountCommand` 时，传入的字段：
+- organizationId、subscriberId、environmentId、feedId、seen、read、limit、payload 等
+- **`contextKeys` 字段未被显式传入**
+
+**Step 2：Command 类定义**
+
+- `GetNotificationsFeedCommand` 继承 `EnvironmentWithSubscriber`
+- `GetFeedCountCommand` 继承 `EnvironmentWithSubscriber`
+- `EnvironmentWithSubscriber` 基类中 `contextKeys?: string[]` 是可选字段，默认 undefined
+- Command.create() 不会额外注入 contextKeys
+- 结果：`command.contextKeys === undefined`
+
+**Step 3：Usecase 层调用 messageRepository**
+
+`GetNotificationsFeed.execute()` 调用：
+```typescript
+this.messageRepository.findBySubscriberChannel(
+  command.environmentId,
+  subscriber._id,
+  ChannelTypeEnum.IN_APP,
+  { feedId: command.feedId, seen: ..., read: ..., payload },
+  { limit: ..., skip: ... }
+  // ← contextKeys 参数未传递
+);
+```
+
+`GetFeedCount.execute()` 调用：
+```typescript
+this.messageRepository.getCount(
+  command.environmentId,
+  subscriber._id,
+  ChannelTypeEnum.IN_APP,
+  { feedId: command.feedId, seen: ..., read: ... },
+  { limit: command.limit }
+  // ← contextKeys 参数未传递
+);
+```
+
+两个 usecase 均未传递 contextKeys 参数。
+
+**Step 4：Repository 方法参数默认值**
+
+- `findBySubscriberChannel` 方法签名不包含 contextKeys 参数，直接调用 `getFilterQueryForMessage` 时也不传递
+- `getCount` 方法签名有 `contextKeys?: string[]`，但调用方未传，因此参数值为 `undefined`
+
+**Step 5：getFilterQueryForMessage 中的判断**
+
+```typescript
+if (contextKeys !== undefined) {  // false，因为 contextKeys === undefined
+  // ← 不进入
+}
+```
+
+**最终结果：旧 `/widgets` 接口的所有读操作（列表、计数、feed count）都不会向 MongoDB 查询追加任何上下文过滤条件，即返回该 subscriber 在当前 environmentId 下的**全部** in-app 消息，不论其 contextKeys 值如何。**
+
+### 6.5 新 `/inbox` 接口：contextKeys 的完整传递链路
+
+按代码执行顺序追踪：
+
+**Step 1：Controller 层创建 Command**
+
+在 inbox.controller.ts 中创建各 Command 时：
+```typescript
+contextKeys: subscriberSession.contextKeys,
+// ← 从 JWT 会话中显式取出并传递
+```
+
+**Step 2：Command 类定义**
+
+`GetNotificationsCommand`、`NotificationsCountCommand` 等均继承 `EnvironmentWithSubscriber`，`contextKeys` 字段由 controller 显式赋值。
+
+**Step 3：Usecase 层调用 messageRepository**
+
+`GetNotifications.execute()`：
+```typescript
+this.messageRepository.paginate(
+  {
+    ...
+    contextKeys: command.contextKeys,  // ← 透传
+    ...
+  },
+  ...
+);
+```
+
+`NotificationsCount.execute()`：
+```typescript
+this.messageRepository.getCount(
+  ...
+  command.contextKeys  // ← 透传（getCount 的第 7 个参数）
+);
+```
+
+所有 inbox usecase（包括写操作 mark-as、snooze 等）均透传 `command.contextKeys`。
+
+**Step 4：Repository 层判断**
+
+- `paginate()`：`if (contextKeys !== undefined)` → 取决于 subscriberSession 中是否有值
+- `getCount()`：同上
+
+**最终结果：新 `/inbox` 接口的读操作会根据 subscriberSession.contextKeys 的值，有条件地追加上下文过滤条件。**
+
+### 6.6 权限边界对比（修正后）
+
+| 权限维度 | `/widgets` (旧) | `/inbox` (新) |
+|---------|----------------|---------------|
 | subscriberJWT 认证 | ✅ | ✅ |
 | environmentId 强制过滤 | ✅ | ✅ |
 | subscriberId 强制过滤 | ✅ | ✅ |
-| contextKeys 隔离（底层能力） | ✅ 方法支持 | ✅ 方法支持 |
-| contextKeys 隔离（usecase 传递） | ❌ 未传递 | ✅ 已传递 |
+| contextKeys 过滤（方法层能力） | ✅ 方法支持 | ✅ 方法支持 |
+| contextKeys 过滤（Controller 传递） | ❌ Command 创建时未注入 | ✅ 从 subscriberSession 显式赋值 |
+| contextKeys 过滤（Usecase 传递） | ❌ 调用 messageRepository 时未传 | ✅ 全部透传 |
+| contextKeys 过滤（最终效果） | ❌ **完全不做上下文过滤** | ✅ 按 session 上下文过滤 |
 
-**实际效果：** 旧 `/widgets` 接口虽然 `getFilterQueryForMessage` 方法支持 contextKeys 参数，但调用 usecase 未传递，所以执行时始终落入分支 1（`undefined` → 匹配 `$exists:false` + `[]`），即无法按上下文隔离。新 `/inbox` 接口从 session usecase 获取 contextKeys 并透传，能正确执行分支 2。
+**修正后的真实风险：** 旧 `/widgets` 接口的权限边界只到 subscriberId 级别，**不做任何 contextKeys 隔离**。这意味着在多上下文场景下，使用旧版 Widget Notification Center 的 subscriber 可以看到自己所有上下文的全部消息，可能造成跨上下文数据泄漏。
 
-### 6.4 contextKeys 与 feedId 在查询中的组合逻辑
+### 6.7 contextKeys 与 feedId 在查询中的组合逻辑
 
-由于旧接口两条分支互不在对方的判断逻辑中（feedId 在方法开头，contextKeys 在方法中段、通过 `$and` 追加），两者用 `$and` 组合时独立生效，不会互相干扰。
+由于两条过滤分支互不在对方的判断逻辑中（feedId 在方法开头，contextKeys 在方法中段、通过 `$and` 追加），两者用 `$and` 组合时独立生效，不会互相干扰。
 
-例如：`feedId=null` + `contextKeys=undefined` →
+旧 `/widgets` 接口的实际查询条件示例（`feedId=null` 但 `contextKeys=undefined` 未传）：
 ```
 AND (
+  _environmentId: "...",
+  _subscriberId: "...",
+  channel: "in_app",
+  deleted: { $exists: false },
   _feedId: { $eq: null },
-  $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
+  seen: { $in: [true, false] },
+  read: { $in: [true, false] },
+  archived: { $in: [true, false] }
+  // ← 无任何 contextKeys 条件
 )
 ```
 
@@ -297,20 +435,22 @@ AND (
 ### 7.2 `contextKeys` 字段兼容
 
 - Schema 层：`contextKeys` 默认 undefined（不写入）
-- 查询层：`contextKeys === undefined` 分支通过 `$or` 同时匹配"字段不存在"和"空数组"
-- 结论：新旧数据混合不会产生查询偏差
+- 查询层判断条件：`if (contextKeys !== undefined)`
+  - 当 contextKeys 被实际传递且值为 `undefined` 或 `[]` → 调用 `buildContextExactMatchQuery` → 分支 1 → `$or: [$exists:false, []]`
+  - 当 contextKeys 未被传递（旧 widgets 接口） → 判断不通过 → 不追加任何条件 → 无上下文过滤
+- 结论：对新旧消息数据本身兼容（字段不存在和空数组等价），但旧 widgets 接口因未传递参数，**完全跳过上下文过滤**，这不是迁移兼容设计，而是参数遗漏（详见第 6 节）。
 
 ### 7.3 `severity` 字段兼容
 
 - NONE 分支：`$or: [{ severity: { $exists: false } }, { severity: { $in: [...] } }]`
-- 与 `_feedId` 和 `contextKeys` 模式一致：字段缺失按"最低等级 None"处理
+- 与 `_feedId` 和 `contextKeys`（被传递时）模式一致：字段缺失按"最低等级 None"处理
 
 ### 7.4 `snoozedUntil` 字段兼容
 
 - snoozed=false 分支：`$or: [{ $exists: false }, { snoozedUntil: null }]`（旧接口）或 `{ $eq: null }`（新接口）
 - 语义等价，新旧消息一致
 
-**迁移兼容模式一致性结论：** 四个字段（`_feedId`, `contextKeys`, `severity`, `snoozedUntil`）的迁移兼容策略完全对齐——即字段不存在与显式空值在查询中等价。这是代码库中明确的统一设计模式。
+**迁移兼容模式一致性结论：** 四个字段（`_feedId`, `contextKeys`, `severity`, `snoozedUntil`）在**被传递且命中时**的迁移兼容策略完全对齐——即字段不存在与显式空值在查询中等价。这是代码库中明确的统一设计模式。`contextKeys` 的特殊之处在于旧接口根本没有传递该参数，导致完全跳过过滤。
 
 ---
 
@@ -342,15 +482,11 @@ intercept():
 | InboxController | 方法级装饰 | 仅 `PATCH /inbox/subscriptions/:subscriptionIdentifier/preferences/:workflowIdOrIdentifier`（订阅偏好更新写操作） |
 | InboxTopicController | 类级装饰 | 该控制器下所有端点 |
 
-### 8.4 清空后的查询行为（与第 6 节的衔接）
+### 8.4 清空后的行为（与第 6 节的衔接）
 
-当 `contextKeys` 被设为 `undefined` 后，在 `buildContextExactMatchQuery` 中落入分支 1：
+当拦截器将 `subscriberSession.contextKeys` 设为 `undefined` 后，后续 Controller 创建 Command 时 `contextKeys: subscriberSession.contextKeys` 即传入 `undefined`。该值一路透传到 Repository 层后，命中 `if (contextKeys !== undefined)` 的反条件——**不追加任何上下文过滤条件**。
 
-```
-$or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
-```
-
-效果：旧客户端仅能看到所有"无上下文"的消息和偏好数据，无法看到任何带上下文隔离的数据。这与旧客户端对上下文概念无知的状态一致。
+效果：旧客户端仅能在偏好更新的写操作上禁用上下文隔离，但在消息列表、计数等读操作上（这些端点未被拦截），如果 JWT 中本就有 contextKeys，仍然会按上下文过滤。读操作和写操作的上下文隔离行为在旧客户端场景下不完全一致。
 
 ### 8.5 防漏双层保障
 
@@ -373,7 +509,7 @@ $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
 | 风险点 | 说明 |
 |-------|------|
 | Feed 过滤缺失 | `/inbox` 新接口不支持 feed 过滤，历史上依赖 Feed 分组的客户端迁移到新接口时能力下降 |
-| contextKeys 未传递 | `/widgets` 旧接口底层方法支持 contextKeys，但 usecase 层未传递，在多上下文场景下可能泄漏跨上下文数据 |
+| contextKeys 完全未传递 | `/widgets` 旧接口从 Controller → Command → Usecase → Repository 全链路均未传递 contextKeys，在多上下文场景下会返回所有上下文的消息，存在跨上下文数据泄漏风险 |
 | payload vs data | 旧接口用 payload 过滤，新接口用 data 过滤，二者字段位置不同（payload vs data），迁移时需注意 |
 
 ### 9.3 移除 Feed 时存储形态不一致
@@ -385,6 +521,9 @@ $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
 ### 9.4 建议澄清
 
 1. 明确 Feed vs Notification Group 的官方定位文档：Feed 是**消息路由分组**，Category 是**工作流分类标签**
-2. 统一 `/widgets` 和 `/inbox` 能力：补齐 `/inbox` 的 feedId 过滤，补齐 `/widgets` 的 contextKeys 传递
+2. 统一 `/widgets` 和 `/inbox` 能力：
+   - 补齐 `/inbox` 的 feedId 过滤能力
+   - 补齐 `/widgets` 的 contextKeys 传递链路（Controller 创建 Command 时从 subscriberSession 注入 contextKeys，Usecase 调用 messageRepository 时透传）
 3. 统一移除 Feed 操作：模板层也改为 `$set: null` 而非 `$unset`，保持存储形态一致
 4. 在 API 文档中明确"默认 Feed"三种参数状态的语义：不传（全量）/ null（无 Feed）/ 指定（指定 Feed）
+5. 在 API 文档中明确 contextKeys 隔离的生效范围：旧 `/widgets` 接口**不提供**上下文隔离，新 `/inbox` 接口**提供**上下文隔离
