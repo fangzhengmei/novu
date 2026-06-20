@@ -218,20 +218,47 @@ export enum StripeBillingIntervalEnum {
 
 ---
 
-#### CustomerSubscriptionCreatedHandler [✅ 全部 5 项断言已验证]
+#### CustomerSubscriptionCreatedHandler [⚠️ 3 项可靠验证 / 2 项测试构造缺陷]
 
 触发事件：`customer.subscription.created`
 
-| 步骤 | 行为 | 断言 |
-|-----|------|------|
-| 1 | VerifyCustomer：customer → organization 映射 | 隐式 |
-| 2 | 组织不存在 → early exit | `updateServiceLevelStub.called === false` ([L168-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L168-L178)) |
-| 3 | **licensed 订阅**：提取 `apiServiceLevel` 并更新等级 | `updateServiceLevelStub` 参数 = `{organizationId, BUSINESS, isTrial:false}` ([L180-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L180-L189)) |
-| 4 | 缓存失效（licensed） | `invalidateByKey.called === true` ([L191-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L191-L196)) |
-| 5 | **metered 订阅**：**仍调用 UpdateServiceLevel**（❌ 原结论错误，已修正） | `updateServiceLevelStub.called === true` ([L198-L231](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L198-L231)) |
-| 6 | apiServiceLevel 为非法值（如 `'invalid'`）→ early exit | `updateServiceLevelStub.called === false` ([L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296)) |
+| 步骤 | 行为 | 断言可靠性 |
+|-----|------|-----------|
+| 1 | VerifyCustomer：customer → organization 映射 | — |
+| 2 | 组织不存在 → early exit | ✅ 可靠：verifyCustomerStub **被覆盖**为 `{organization: null}`，无干扰数据 ([L168-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L168-L178)) |
+| 3 | **licensed 订阅**：提取 `apiServiceLevel` 并更新等级 | ✅ 可靠：事件为 licensed BUSINESS，verifyCustomerMock 含匹配的 licensed 订阅，参数断言具体 ([L180-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L180-L189)) |
+| 4 | 缓存失效（licensed） | ✅ 可靠 ([L191-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L191-L196)) |
+| 5 | **metered 订阅**：UpdateServiceLevel 是否被调用 | ❌ **测试构造缺陷**：断言 `called === true` 不可靠（详见下方分析） |
+| 6 | apiServiceLevel 为非法值 → early exit | ✅ 可靠：verifyCustomerStub **被覆盖**为含 `'invalid'` 订阅，与事件一致 ([L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296)) |
 
-> ⚠️ **重要修正**：之前的分析断言"纯 metered 订阅跳过等级更新"是**错误的**。该用例标题写的是 "should exit early with known organization and metered subscription"，但实际断言是 `expect(updateServiceLevelStub.called).to.be.true`——明确要求 UpdateServiceLevel **被调用**。因此 **metered 订阅不会跳过等级更新**，Handler 会在该分支下调用 UpdateServiceLevel（具体参数未在此用例中断言）。
+> ⚠️ **测试构造缺陷分析（metered 用例 [L198-L231](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L198-L231)）**
+>
+> 该用例的断言 `expect(updateServiceLevelStub.called).to.be.true` **不能证明** metered 订阅会触发等级更新，原因如下：
+>
+> **数据流追踪**：
+> - 事件数据：1 个 metered item（`usage_type: 'metered'`，`apiServiceLevel: BUSINESS`）
+> - `verifyCustomerStub`：**未覆盖**，沿用 `beforeEach` 中设置的 `verifyCustomerMock`
+> - `verifyCustomerMock.subscriptions`（[L46-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L46-L127)）：含 2 个订阅，其中 `subscription_id` 有 **2 个 licensed BUSINESS** item
+>
+> **问题**：Handler 的 `handle()` 方法同时接收事件数据和 verifyCustomer 返回的 subscriptions。`called === true` 可能由 verifyCustomerMock 中的 licensed BUSINESS 订阅触发，而非事件中的 metered item。两种假设均无法排除：
+> - 假设 A：Handler 遍历 verifyCustomer.subscriptions，发现 licensed BUSINESS → 调用 UpdateServiceLevel（与事件 metered 无关）
+> - 假设 B：Handler 仅处理事件中的 metered item → 也调用 UpdateServiceLevel
+>
+> **对照证据**：`invalid` 用例（[L233-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/59-novu/apps/api/src/app/billing/e2e/customer-subscription-created.e2e-ee.ts#L233-L296)）**同时覆盖了 verifyCustomerStub**，将 subscriptions 中的 item 也改为 `apiServiceLevel: 'invalid'`，使得事件和 mock 数据一致，才能得出可靠的 `called === false` 结论。这反证了 metered 用例未覆盖 verifyCustomerStub 是一个构造缺陷。
+>
+> **结论**：纯 metered 订阅（无任何 licensed 订阅存在时）是否触发 UpdateServiceLevel，**当前无任何用例覆盖**，无法得出结论。
+
+> ⚠️ **测试覆盖缺口（CustomerSubscriptionCreatedHandler）**
+>
+> 以下分支在现有 5 个用例中均无覆盖：
+>
+> | 缺口场景 | 说明 |
+> |---------|------|
+> | 纯 metered 订阅（无 licensed） | verifyCustomerMock 始终含 licensed 订阅，无法隔离测试 |
+> | 多 subscription 场景 | 客户同时有多个有效订阅时 Handler 如何选择等级 |
+> | 套餐降级（BUSINESS → PRO） | 现有用例仅测试 FREE → BUSINESS 升级 |
+> | 平级切换（BUSINESS → BUSINESS） | 同等级切换时是否仍调用 UpdateServiceLevel |
+> | licensed 与 metered 混合订阅 | 年付场景下事件为 metered 但 verifyCustomer 含 licensed |
 
 ---
 
