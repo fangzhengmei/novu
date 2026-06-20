@@ -264,9 +264,11 @@ if (!command.feedId && existingTemplate._feedId) {
     → 精确集合匹配：键完全相同（与顺序无关）
 ```
 
-### 6.3 唯一的上下文过滤条件注入点：`if (contextKeys !== undefined)`
+### 6.3 两套上下文过滤注入机制
 
-两套查询路径的上下文过滤都通过同一个判断控制：
+代码中存在两套完全独立的 contextKeys 过滤注入机制，分别服务于不同的查询场景：
+
+**机制 A：批量查询手动注入（getFilterQueryForMessage / paginate）**
 
 ```typescript
 if (contextKeys !== undefined) {
@@ -278,7 +280,56 @@ if (contextKeys !== undefined) {
 }
 ```
 
-**关键语义：** 当 `contextKeys === undefined` 时，不进入 if 分支，**不会向查询追加任何 `$and` 条件，即完全不做上下文过滤。** 这与"显式调用 buildContextExactMatchQuery(undefined) 落入分支 1 匹配无上下文消息"是两种完全不同的语义。
+用于 `findBySubscriberChannel`、`getCount`、`paginate` 等批量查询方法。
+
+**机制 B：单条查询 transform 注入（findOne / findOneForInbox）**
+
+MessageRepository 重写了 `findOne` 和 `findOneForInbox` 方法，在调用 `super.findOne()` 之前先经过 `transformContextKeysQuery` 私有方法转换：
+
+```typescript
+async findOne(query, select?, options? = {}) {
+  const transformedQuery = this.transformContextKeysQuery(query);
+  return super.findOne(transformedQuery, select, options);
+}
+```
+
+**`transformContextKeysQuery` 的转换逻辑（三步判断）：**
+
+```
+步骤 1: if (!('contextKeys' in query))
+         → 直接返回原 query，不做任何处理
+
+步骤 2: if (contextKeys === undefined)
+         → 从 query 中移除 contextKeys 字段后返回
+         → （等价于"跳过上下文过滤"，但语义与步骤 1 不同：
+            调用方显式传了 undefined 表示"我知道这个特性但要禁用"）
+
+步骤 3: contextKeys 有值
+         → 调用 buildContextExactMatchQuery() 转换为精确集合匹配条件
+         → 合并到 query 中返回
+```
+
+**关键语义澄清（订正前序结论）：**
+
+- `contextKeys === undefined` 且是参数形式传入（机制 A）：`if (contextKeys !== undefined)` 不成立 → **不追加任何条件，完全不做上下文过滤**
+- `contextKeys` 字段不存在于 query 对象中（机制 B）：`'contextKeys' in query` 为 false → **不做任何转换，原 query 直接通过**
+- `contextKeys` 字段存在但值为 `undefined`（机制 B）：从 query 中移除该字段 → **同样不做上下文过滤**
+- 三种形态的最终效果一致：**不做上下文过滤**，但触发路径和设计意图不同
+
+### 6.3.1 哪些方法有 contextKeys 过滤，哪些没有
+
+| Repository 方法 | 注入机制 | contextKeys 过滤能力 |
+|----------------|---------|-------------------|
+| `findOne` | 机制 B（transformContextKeysQuery） | ✅ 有（需调用方在 query 中传 contextKeys 字段） |
+| `findOneForInbox` | 机制 B（transformContextKeysQuery） | ✅ 有 |
+| `findBySubscriberChannel` | 机制 A（getFilterQueryForMessage） | ✅ 有（需传入 contextKeys 参数） |
+| `getCount` | 机制 A（getFilterQueryForMessage） | ✅ 有（需传入 contextKeys 参数） |
+| `paginate` | 机制 A（paginate 内部） | ✅ 有（需传入 contextKeys 参数） |
+| `find` | 无（继承 BaseRepository） | ❌ 无，即使 query 带 contextKeys 字段也不会被转换 |
+| `update` | 无（继承 BaseRepository） | ❌ 无，不会做上下文过滤 |
+| `delete` | 无（继承 BaseRepository） | ❌ 无，不会做上下文过滤 |
+| `changeStatus` | 无（内部调用 this.update） | ❌ 无，不会做上下文过滤 |
+| `deleteMessagesWithFilters` | 自建逻辑（用 $in） | ⚠️ 有，但语义不同（见第 10.2 节） |
 
 ### 6.4 旧 `/widgets` 接口：contextKeys 的完整传递链路
 
@@ -388,19 +439,21 @@ this.messageRepository.getCount(
 
 **最终结果：新 `/inbox` 接口的读操作会根据 subscriberSession.contextKeys 的值，有条件地追加上下文过滤条件。**
 
-### 6.6 权限边界对比（修正后）
+### 6.6 权限边界对比（订正后）
 
 | 权限维度 | `/widgets` (旧) | `/inbox` (新) |
 |---------|----------------|---------------|
 | subscriberJWT 认证 | ✅ | ✅ |
 | environmentId 强制过滤 | ✅ | ✅ |
-| subscriberId 强制过滤 | ✅ | ✅ |
-| contextKeys 过滤（方法层能力） | ✅ 方法支持 | ✅ 方法支持 |
-| contextKeys 过滤（Controller 传递） | ❌ Command 创建时未注入 | ✅ 从 subscriberSession 显式赋值 |
-| contextKeys 过滤（Usecase 传递） | ❌ 调用 messageRepository 时未传 | ✅ 全部透传 |
-| contextKeys 过滤（最终效果） | ❌ **完全不做上下文过滤** | ✅ 按 session 上下文过滤 |
+| subscriberId 强制过滤 | ✅（读操作全部有；写操作见第 10.4 节边界） | ✅ |
+| 读操作 contextKeys 过滤 | ❌ 读操作全链路未传递 contextKeys | ✅ Controller→Command→Usecase→Repository 全链路透传 |
+| 写操作 contextKeys 过滤 | ❌ 写操作全链路未传递 contextKeys，且 update/delete 方法本身无过滤机制 | ✅ 写操作透传 contextKeys，且通过 findOneForInbox + 条件更新实现 |
+| 写操作防越权 | ⚠️ 依赖传入 subscriber._id，无二次校验 | ✅ 通过 findOneForInbox 先查询再更新，自带上下文隔离 |
 
-**修正后的真实风险：** 旧 `/widgets` 接口的权限边界只到 subscriberId 级别，**不做任何 contextKeys 隔离**。这意味着在多上下文场景下，使用旧版 Widget Notification Center 的 subscriber 可以看到自己所有上下文的全部消息，可能造成跨上下文数据泄漏。
+**订正后的核心风险：**
+1. 旧 `/widgets` 接口的**所有读写操作都不做 contextKeys 隔离**。读操作返回全部消息，写操作（删除、标记已读等）可作用于所有上下文的消息。
+2. 旧 `/widgets` 接口的 `update` / `delete` 等继承自 BaseRepository 的写方法**本身没有 contextKeys 过滤机制**，即使上游传入 contextKeys 也不会生效。
+3. `findOne` 虽然有 transform 机制（机制 B），但旧 widgets 调用方不在 query 中传 contextKeys 字段，因此同样不生效。
 
 ### 6.7 contextKeys 与 feedId 在查询中的组合逻辑
 
@@ -527,3 +580,152 @@ intercept():
 3. 统一移除 Feed 操作：模板层也改为 `$set: null` 而非 `$unset`，保持存储形态一致
 4. 在 API 文档中明确"默认 Feed"三种参数状态的语义：不传（全量）/ null（无 Feed）/ 指定（指定 Feed）
 5. 在 API 文档中明确 contextKeys 隔离的生效范围：旧 `/widgets` 接口**不提供**上下文隔离，新 `/inbox` 接口**提供**上下文隔离
+6. 统一 contextKeys 注入机制：将 `transformContextKeysQuery` 逻辑下沉到 BaseRepository，使 `find`、`update`、`delete` 等所有方法都自动支持 contextKeys 转换，消除两套机制的不一致
+7. 修正 `update-message-actions` 的两处 `findOne`：补充 `_subscriberId` 条件，防止越权读取他人消息
+8. 评估 `deleteMessagesWithFilters` 的 `$in` 语义是否符合预期，如应精确匹配则改为 `$all + $size` 与全局策略一致
+
+---
+
+## 10. 写路径与特殊方法深度分析
+
+### 10.1 旧 widgets 写路径中跨上下文写隔离如何被跳过
+
+旧 `/widgets` 接口存在多条写操作路径，全部跳过 contextKeys 隔离，跳过原因分为两层：
+
+**第一层：Usecase 层未传递 contextKeys**
+
+| 写操作 usecase | 调用的 Repository 方法 | query 中是否传 contextKeys |
+|---------------|----------------------|-------------------------|
+| `mark-message-as`（标记已读/已看） | `changeStatus()` → 内部调 `this.update()` | ❌ 未传 |
+| `remove-message`（单条删除） | `delete()` | ❌ 未传 |
+| `remove-all-messages`（清空 Feed） | `delete()` | ❌ 未传 |
+| `remove-messages-bulk`（批量删除） | `delete()` | ❌ 未传 |
+| `update-message-actions`（更新 CTA 动作状态） | `findOne()` + `update()` | ❌ 未传（两处都未传） |
+
+**第二层：Repository 写方法本身无过滤机制**
+
+即使上游传入了 contextKeys，以下方法也**不会**做上下文过滤：
+
+- `update()`：继承自 BaseRepository，不经过 `transformContextKeysQuery`
+- `delete()` / `remove()`：继承自 BaseRepository，不经过 `transformContextKeysQuery`
+- `changeStatus()`：MessageRepository 自定义方法，内部调 `this.update()`，无 contextKeys 处理
+- `find()`：继承自 BaseRepository，不经过 `transformContextKeysQuery`
+
+只有 `findOne` 和 `findOneForInbox` 经过 `transformContextKeysQuery`（机制 B），但调用方不在 query 中传 `contextKeys` 字段时，transform 也不会触发任何转换。
+
+**综合效果：** 旧 widgets 的所有写操作都不区分上下文，按 messageId 或 messageId 列表即可跨上下文修改/删除消息。
+
+### 10.2 `deleteMessagesWithFilters` 的 `$in` 重叠匹配与精确集合匹配语义差异
+
+`deleteMessagesWithFilters` 是一个独立的批量删除方法，其 contextKeys 处理方式与 `buildContextExactMatchQuery` 完全不同：
+
+```typescript
+// deleteMessagesWithFilters 内部：
+...(contextKeys && contextKeys?.length > 0 && { contextKeys: { $in: contextKeys } }),
+```
+
+**两种匹配语义对比：**
+
+| 维度 | `deleteMessagesWithFilters` 用 `$in` | `buildContextExactMatchQuery` 用 `$all + $size` |
+|-----|-----------------------------------|---------------------------------------------|
+| MongoDB 操作符 | `{ $in: [k1, k2] }` | `{ $all: [k1, k2], $size: 2 }` |
+| 语义 | 重叠匹配：消息的 contextKeys 数组**包含任意一个**查询键即命中 | 精确集合匹配：消息的 contextKeys 必须**包含所有**查询键且**数量相等**才命中 |
+| 查询键 `[a, b]` 匹配消息 `[a]` | ✅ 命中（a 在查询键中） | ❌ 不命中（size 不等） |
+| 查询键 `[a, b]` 匹配消息 `[a, b, c]` | ✅ 命中（a、b 都在查询键中） | ❌ 不命中（size 不等） |
+| 查询键 `[a, b]` 匹配消息 `[a, b]` | ✅ 命中 | ✅ 命中 |
+| 典型场景 | 批量操作：删除/操作所有"至少包含这些键"的消息 | 精确定位：找到某个具体上下文的消息 |
+
+**风险点：** 如果调用方期望"精确匹配某个上下文"却调用了 `deleteMessagesWithFilters`，会意外删除比预期更多的消息（所有重叠上下文的消息都会被删除）。目前代码中该方法仅被管理端（非 subscriber 端）调用，影响有限。
+
+### 10.3 `transformContextKeysQuery` 注入 `findOne` 的机制
+
+**注入位置：** MessageRepository 重写了基类的 `findOne` 方法，在调用 `super.findOne()` 之前执行转换。
+
+```typescript
+async findOne(query, select?, options? = {}) {
+  const transformedQuery = this.transformContextKeysQuery(query);
+  return super.findOne(transformedQuery, select, options);
+}
+```
+
+**转换函数 `transformContextKeysQuery` 的三步判断（精确流程）：**
+
+```
+输入：query 对象
+  ↓
+Step 1: 'contextKeys' in query ?
+  ├─ 否 → 直接返回原 query（无任何修改）
+  └─ 是 → 继续
+        ↓
+Step 2: 取出 contextKeys 值，从 query 中移除该字段
+  ├─ 值为 undefined → 返回移除后的 query（不做过滤）
+  └─ 值为其他 → 继续
+        ↓
+Step 3: 调用 buildContextExactMatchQuery(contextKeys)
+        与剩余 query 字段合并后返回
+```
+
+**与机制 A（批量查询手动注入）的异同：**
+
+| 维度 | 机制 A（getFilterQueryForMessage / paginate） | 机制 B（transformContextKeysQuery） |
+|-----|--------------------------------------------|-----------------------------------|
+| 触发方式 | 显式 if 判断 + 手动 `$and` 追加 | 重写方法 + query 对象属性检测 |
+| 传入形式 | 独立参数 `contextKeys?: string[]` | query 对象上的 `contextKeys` 字段 |
+| undefined 语义 | 不进入 if → 不追加条件 → 无过滤 | 从 query 中移除字段 → 无过滤 |
+| 不传 / 字段不存在 | 不进入 if → 无过滤 | 不进入转换 → 无过滤 |
+| 有值时的匹配语义 | 精确集合匹配（`$all + $size`） | 精确集合匹配（`$all + $size`） |
+| 最终效果 | 一致 | 一致 |
+
+两套机制最终效果等价，但触发路径不同——这是历史演进的痕迹，而非统一设计。
+
+### 10.4 `update-message-actions` 中 `findOne` 缺 `_subscriberId` 的边界差异
+
+`UpdateMessageActions.execute()` 中有两次 `findOne` 和一次 `update`，对 `_subscriberId` 的处理不一致：
+
+**第一次 findOne（查询消息是否存在）：**
+
+```typescript
+const foundMessage = await this.messageRepository.findOne({
+  _environmentId: command.environmentId,
+  _id: command.messageId,
+  // ← 缺少 _subscriberId
+});
+```
+
+**update（实际修改消息）：**
+
+```typescript
+const modificationResponse = await this.messageRepository.update(
+  {
+    _environmentId: command.environmentId,
+    _subscriberId: subscriber._id,  // ✅ 有 subscriberId 保护
+    _id: command.messageId,
+  },
+  { $set: updatePayload }
+);
+```
+
+**第二次 findOne（返回更新后的消息）：**
+
+```typescript
+return (await this.messageRepository.findOne({
+  _environmentId: command.environmentId,
+  _id: command.messageId,
+  // ← 缺少 _subscriberId
+})) as MessageEntity;
+```
+
+**边界差异分析：**
+
+| 操作 | _subscriberId 保护 | contextKeys 保护 | 越权风险 |
+|-----|------------------|----------------|---------|
+| 第一次 findOne | ❌ 无 | ❌ 无（query 中无 contextKeys 字段） | ⚠️ 中：可读取任意 subscriber 的消息内容 |
+| update | ✅ 有 | ❌ 无（update 方法本身无过滤） | ✅ 低：只能修改自己的消息 |
+| 第二次 findOne | ❌ 无 | ❌ 无 | ⚠️ 中：可读取修改后的消息 |
+
+**实际影响评估：**
+
+1. **信息泄漏风险**：攻击者如果猜到或获取到某个 messageId，可以通过该接口读取该消息的完整内容（包括 CTA、payload 等），即使消息不属于当前 subscriber。
+2. **写入安全**：实际的 update 操作有 `_subscriberId` 保护，无法修改他人消息。
+3. **contextKeys 维度**：两层都没有 contextKeys 保护（一层缺字段、一层方法不支持），但 `_subscriberId` 的保护级别更高。
+4. **与 widgets 其他接口的一致性**：其他写操作（remove-message 等）的 delete 调用都传了 `_subscriberId`，此接口第一次 findOne 遗漏属于个别情况。
