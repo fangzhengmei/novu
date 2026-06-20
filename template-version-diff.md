@@ -716,65 +716,229 @@ sourceSteps.map((sourceStep) => {
 
 ---
 
-## 七、发送链路中的模板版本选择
+## 七、发送链路中的模板版本选择（两层队列模型）
 
-完整发送链路: **Trigger API → ParseEventRequest → WorkflowQueue → RunJob → SendMessage → 各渠道 Provider**
+发送链路实际采用 **两层队列模型**，模板版本在两个阶段分别被查找和固化：
 
-### 7.1 Trigger 入口阶段
+```
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│                              API 进程（触发阶段）                                          │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                               │
+  Trigger API /events/trigger                                                                 │
+    │                                                                                         │
+    ▼                                                                                         │
+  ParseEventRequest.execute()                                                                 │
+    ├─► getNotificationTemplateByTriggerIdentifier()  ◄─── 第1次模板查找：按 (envId, triggerId)
+    │     └─► 找到后模板对象挂到 command.workflow 上                                          │
+    ├─► payloadSchema 校验（AJV + 默认值填充）                                               │
+    └─► dispatchEventToWorkflowQueue()                                                       │
+          └─► workflowQueueService.add(jobData)                                              │
+                └─► 入队 Workflow Queue (BullMQ/SQS)                                          │
+                     jobData 中不含完整模板，只有 identifier + payload + actor 等元数据         │
+                                                                                               │
+                                                                                               ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│                           Worker 进程（工作流队列消费阶段）                                  │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                               │
+  WorkflowWorker (消费 Workflow Queue)                                                        │
+    └─► triggerEventUsecase.execute()                                                         │
+          ├─► getAndUpdateWorkflowById()  ◄─── 第2次模板查找：从 DB 取完整模板
+          │     └─► 用 InMemoryLRUCacheService？❌ API 层用的是直接查询                       │
+          ├─► verifyPayload（再次校验）                                                       │
+          ├─► triggerMulticast / triggerBroadcast                                            │
+          │     └─► 拆分为订阅者，分批送入 SubscriberProcessQueue                              │
+          │                                                                                   │
+          ▼                                                                                   │
+  SubscriberProcessQueue → （消费后调用 CreateNotificationJobs）                               │
+    └─► CreateNotificationJobs.execute()                                                      │
+          ├─► 从 command.template 获取完整模板对象                                             │
+          ├─► createNotification()  ← notification._templateId = template._id                 │
+          ├─► filterActiveSteps()                                                             │
+          └─► buildJobFromStep()                                                              │
+                ├─► step: buildStepForJob(step, command) ← 模板内容嵌入 job.step               │
+                ├─► _templateId: notification._templateId    ← 模板 ID 固化                   │
+                └─► payload + overrides + ...                                                  │
+                                                                                               │
+          └─► StoreSubscriberJobs.execute()                                                   │
+                ├─► jobRepository.storeJobs(jobs)  ← 写入 MongoDB jobs 集合                    │
+                └─► addJob.execute()                                                          │
+                      └─► standardQueueService.add(job)  ← 入队 Standard Queue                 │
+                                                                                               │
+                                                                                               ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────┐
+│                          Worker 进程（标准队列消费阶段）                                    │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                               │
+  Standard Queue Worker → RunJob.execute()                                                    │
+    ├─► 从 DB 取 Job (jobRepository.findOne)                                                  │
+    ├─► 从 DB 取 Notification                                                                 │
+    ├─► getWorkflow()  ◄─── 第3次模板查找：用 LRU 缓存
+    │     └─► key = `${environmentId}:${templateId}`                                          │
+    │         TTL = 30 秒, max = 1000 条                                                      │
+    │                                                                                         │
+    └─► SendMessage.execute()                                                                 │
+          └─► 使用 job.step.template 快照渲染（不依赖 DB 实时版本）                              │
+                                                                                               │
+                                                                                               ▼
+                                                                         各渠道 Provider 发送
+```
 
-代码位置: [parse-event-request.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/events/usecases/parse-event-request/parse-event-request.usecase.ts#L89-L230)
+### 7.1 三层模板查找与版本固化时机
+
+| 阶段 | 位置 | 查找方式 | 缓存 | 版本固化效果 |
+|------|------|---------|------|-------------|
+| **第1次: API 入口** | `ParseEventRequest` | `getNotificationTemplateByTriggerIdentifier(envId, triggerId)` | 无 | 确认模板存在，仅用于 payload 校验；入队时**不携带完整模板** |
+| **第2次: Workflow Worker** | `TriggerEvent` → `getAndUpdateWorkflowById` | `notificationTemplateRepository.findById` | 无（直接查 DB） | 模板对象挂在 command 上，后续订阅者拆分和 Job 构建都用这份 |
+| **第3次: Standard Queue** | `RunJob.getWorkflow()` | `notificationTemplateRepository.findById` | LRU 缓存（30s TTL） | 用于偏好判断和步骤调度；SendMessage 实际用 `job.step.template` 快照 |
+
+**版本固化的真正发生点**：
 
 ```typescript
-// 按 trigger identifier + 当前 environmentId 查找模板
-const template = await this.getNotificationTemplateByTriggerIdentifier({
-  environmentId: command.environmentId,
-  triggerIdentifier: command.identifier,
-});
-
-if (!template) throw new UnprocessableEntityException('workflow_not_found');
-
-// 若模板启用了 payloadSchema 校验，则在此阶段验证变量合法性
-if (template.validatePayload && template.payloadSchema) {
-  const validatedPayload = this.validateAndApplyPayloadDefaults(
-    command.payload, template.payloadSchema
-  );
-  command.payload = validatedPayload;
+// CreateNotificationJobs.buildJobFromStep() [create-notification-jobs.usecase.ts L186-L212]
+private buildJobFromStep(step, command, notification): NotificationJob {
+  return {
+    identifier: command.identifier,
+    payload: command.payload,
+    step: this.buildStepForJob(step, command),  // ⭐ 模板内容嵌入 job.step
+    _templateId: notification._templateId,       // ⭐ 模板 ID 固化到 job 上
+    // ... 其他字段
+  };
 }
 ```
 
-**关键点**：
-- 模板查找严格依赖 `environmentId`，这确保了 Dev/Prod 环境天然隔离
-- `payloadSchema` 校验是**变量兼容**的第一道防线，使用 AJV 做 JSON Schema 校验并自动填充默认值
-- 找到模板后，模板的 `_id` 被写入 Job 数据，供后续链路使用
+- **`job._templateId`**：模板的环境内 ID，后续 RunJob 用此 ID 再查一次模板（带缓存）
+- **`job.step.template`**：模板内容快照，SendMessage 直接使用此快照渲染
+- **`notification._templateId`**：工作流级别的模板引用，保留触发时的版本
 
-### 7.2 Job 执行阶段（RunJob）
+### 7.2 LRU 内存缓存的换新与失效机制
 
-代码位置: [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts#L427-L453)
+代码位置:
+- 服务实现: [in-memory-lru-cache.service.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.service.ts)
+- 存储配置: [in-memory-lru-cache.store.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/services/in-memory-lru-cache/in-memory-lru-cache.store.ts)
+
+**缓存配置**（WORKFLOW 存储）:
 
 ```typescript
-private async getWorkflow(templateId, environmentId, organizationId, source?) {
-  // 带 LRU 缓存: key = `${environmentId}:${templateId}`
-  const workflow = await this.inMemoryLRUCacheService.get(
-    InMemoryLRUCacheStore.WORKFLOW,
-    `${environmentId}:${templateId}`,
-    async () => await this.notificationTemplateRepository.findById(templateId, environmentId)
-  );
-  if (!workflow) throw new NotFoundException(`Workflow ${templateId} not found`);
-  return workflow;
+// in-memory-lru-cache.store.ts L48-L52
+[InMemoryLRUCacheStore.WORKFLOW]: {
+  max: 1000,              // 最大缓存 1000 条
+  ttl: THIRTY_SECONDS_MS, // TTL = 30 秒
+  featureFlagComponent: 'workflow',
 }
 ```
 
-**关键点**：
-- 查找键是 `(environmentId, templateId)`，这是模板在**当前环境下的实际 ID**
-- 使用了内存 LRU 缓存，意味着刚 Promote/Publish 的新模板版本需要等缓存失效或主动失效
-- **若模板正在被渐进切换，此处缓存会导致旧版本继续被使用一段时间**
+**核心 API**：
 
-### 7.3 消息发送阶段（SendMessage）
+```typescript
+// 读取缓存，未命中则调用 fetchFn 并填充
+async get(storeName, key, fetchFn, opts): Promise<T>
+
+// 主动失效指定 key（同时失效所有变体）
+invalidate(storeName: InMemoryLRUCacheStore, key: string): void
+
+// 清空整个 store
+invalidateAll(storeName: InMemoryLRUCacheStore): void
+
+// 缓存变体 key（用于多版本并存）
+// key = `${baseKey}:v:${cacheVariant}`
+```
+
+**失效逻辑**（invalidate 方法）:
+
+```typescript
+// in-memory-lru-cache.service.ts L82-L93
+invalidate(storeName, key): void {
+  const store = STORES.get(storeName);
+  if (!store) return;
+
+  for (const cacheKey of store.cache.keys()) {
+    // 删除精确匹配的 key，以及所有带变体后缀的 key
+    // 形如 `${key}` 或 `${key}:v:${variant}`
+    if (cacheKey === key || cacheKey.startsWith(`${key}:v:`)) {
+      store.cache.delete(cacheKey);
+    }
+  }
+}
+```
+
+**换新机制总结**：
+1. **TTL 自动失效**：30 秒后缓存自动过期，下一次 get 会重新 fetch
+2. **主动失效**：通过 `invalidate(WORKFLOW, templateId)` 立即清除指定模板的缓存
+3. **缓存变体**：支持 `cacheVariant` 参数，可用于同一模板多版本并存场景（如渐进切换）
+4. **inflight 请求合并**：同一时间对同 key 的多次 get 会复用同一个 fetch Promise，避免缓存击穿
+5. **进程内隔离**：缓存是进程内的 Map，多实例部署时各实例独立失效
+
+**注意**：目前代码中 V2 Publish 后**没有主动调用 invalidate 清理缓存**，新模板版本发布后，最长可能需要等待 30 秒（TTL）才能在 RunJob 中生效。
+
+### 7.3 触发 API 到运行队列的数据流（版本视角）
+
+```
+Trigger Request
+    │  identifier = "onboarding-email"
+    │  payload = { name: "John" }
+    │  environmentId = "prod_env"
+    ▼
+┌─────────────────────────────────────────┐
+│ ParseEventRequest (API 进程)             │
+│  ├─ 按 triggerId + envId 查模板          │
+│  ├─ 找到 template = { _id: "prod_123", … } │
+│  └─ payloadSchema 校验通过                │
+│                                          │
+│  ⚠️  入队 Workflow Queue 时，jobData 中  │
+│     只有 identifier/payload/actor 等，    │
+│     没有完整模板对象！                     │
+│     Job 固化尚未发生                      │
+└─────────────────────────────────────────┘
+    │
+    ▼  Workflow Queue (BullMQ + SQS)
+    │
+┌─────────────────────────────────────────┐
+│ TriggerEvent (Worker 进程)               │
+│  ├─ getAndUpdateWorkflowById(prod_123?) │
+│  │   └─ 等等，这里用什么 ID 查？          │
+│  │                                      │
+│  └─ 实际: 用 identifier 再查一次模板      │ ← 第二次查找
+│         └─ 拿到完整 NotificationTemplate
+│                                          │
+│  triggerMulticast → 拆分订阅者           │
+│                                          │
+│  CreateNotificationJobs:                 │
+│    ├─ 用 command.template 构建 step      │
+│    ├─ 模板内容嵌入 job.step.template      │ ← ⭐ 内容固化
+│    └─ job._templateId = template._id     │ ← ⭐ ID 固化
+│                                          │
+│  StoreSubscriberJobs:                    │
+│    ├─ jobRepository.storeJobs(jobs)      │ ← 写入 MongoDB
+│    └─ standardQueueService.add(job)      │ ← 入队 Standard Queue
+└─────────────────────────────────────────┘
+    │
+    ▼  Standard Queue
+    │
+┌─────────────────────────────────────────┐
+│ RunJob (Worker 进程)                     │
+│  ├─ 从 DB 取 Job 实体                     │
+│  ├─ getWorkflow(job._templateId)         │ ← 第三次查找，带 LRU 缓存
+│  │   └─ 用于偏好判断、步骤元数据           │
+│  │                                      │
+│  └─ SendMessage                           │
+│       └─ 使用 job.step.template 渲染      │ ← 不查 DB，用快照
+└─────────────────────────────────────────┘
+```
+
+**关键事实核准**：
+- ParseEventRequest 的 `dispatchEventToWorkflowQueue` 入队时 **不包含完整模板**，只有 identifier + payload 等元数据
+- 模板版本的真正固化发生在 **CreateNotificationJobs** 阶段（Worker 进程内）
+- RunJob 中的 `getWorkflow()` 是**第三次**查找模板，用于偏好判断等辅助功能，而非获取发送内容
+- SendMessage 最终使用的是 `job.step.template` 快照，不依赖 DB 实时版本
+
+### 7.4 消息发送阶段（SendMessage）
 
 代码位置: [send-message.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts#L334-L340)
 
 ```typescript
-// 偏好评估时可能再次获取模板
+// 偏好评估时可能再次获取模板（优先使用 command 传入的 workflow，否则从 DB 查）
 const workflow = command.workflow ??
   (await this.getWorkflow({ _id: job._templateId, environmentId: job._environmentId }));
 ```
