@@ -704,6 +704,16 @@ sourceSteps.map((sourceStep) => {
 3. **版本固化时机**：Job 创建时 `job._templateId` 和 `job.step.template` 快照固化，**V2 Publish 之后的变更不会影响已入队的 Job**
 4. **LRU 缓存风险**：RunJob 的 `getWorkflow()` 有缓存，若 V2 Publish 是原地更新（同一 `_id` 覆盖内容），旧缓存需等失效
 
+**V2 工作流过滤前提对发送链路的影响**：
+
+| 环节 | 过滤条件 | 说明 |
+|------|---------|------|
+| V2 Diff / Publish | `origin=NOVU_CLOUD` AND `type=BRIDGE` | V2 发布链路只同步 Bridge 工作流 |
+| 发送链路 (Trigger) | 无过滤 | 触发时所有类型工作流都能触发，不管是 V1 传统工作流还是 V2 Bridge 工作流 |
+| V1 Change 创建 | 无过滤 | 所有工作流编辑都会产生 Change 记录 |
+
+**结论**：V2 的过滤前提仅作用于**发布管理链路（Diff/Publish），不影响发送链路。发送链路对所有工作流一视同仁，只要模板存在且 trigger identifier 匹配就能触发。
+
 ### 6.2 V1 vs V2 发布后发送链路的差异
 
 | 场景 | V1 Change Promote 后 | V2 Environment Publish 后 |
@@ -870,7 +880,53 @@ invalidate(storeName, key): void {
 4. **inflight 请求合并**：同一时间对同 key 的多次 get 会复用同一个 fetch Promise，避免缓存击穿
 5. **进程内隔离**：缓存是进程内的 Map，多实例部署时各实例独立失效
 
-**注意**：目前代码中 V2 Publish 后**没有主动调用 invalidate 清理缓存**，新模板版本发布后，最长可能需要等待 30 秒（TTL）才能在 RunJob 中生效。
+### 7.2.1 缓存失效的实际触发点（代码事实核准）
+
+**关键发现：V1 Promote 和 V2 Publish 后，均没有任何地方主动调用 `InMemoryLRUCacheService.invalidate(WORKFLOW, ...)`。**
+
+全代码库搜索结果（排除测试文件）：
+| 搜索模式 | 业务代码中匹配数 | 说明 |
+|---------|----------------|------|
+| `InMemoryLRUCacheStore.WORKFLOW.*invalidate` | 0 | 从未调用过 WORKFLOW 缓存的 invalidate |
+| `invalidate.*WORKFLOW` | 0 | 从未调用过 |
+| `ACTIVE_WORKFLOWS.*invalidate` | 0 | ACTIVE_WORKFLOWS 缓存也从未清理 |
+
+**当前仅有的缓存失效触发方式**：
+
+| 触发方式 | 是否被调用 | 调用位置 | 说明 |
+|---------|-----------|---------|------|
+| TTL 自然过期（30秒） | ✅ 自动 | LRUCache 内部 | 唯一的实际失效方式 |
+| `invalidate(WORKFLOW, key)` | ❌ 从未 | — | 业务代码从未调用 |
+| `invalidateAll(WORKFLOW)` | ❌ 从未 | — | 业务代码从未调用 |
+
+**V1 Promote 的缓存清理**：
+代码位置: [promote-notification-template-change.usecase.ts L307-L316](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/promote-notification-template-change/promote-notification-template-change.usecase.ts#L307-L316)
+
+```typescript
+private async invalidateBlueprints(command: PromoteTypeChangeCommand) {
+  if (command.organizationId === this.blueprintOrganizationId) {
+    // 只清理 Blueprint 组织的蓝图缓存
+    await this.invalidateCache.invalidateByKey({
+      key: buildGroupedBlueprintsKey(productionEnvironmentId),
+    });
+  }
+}
+```
+
+⚠️ **V1 Promote 只清理了蓝图缓存（`buildGroupedBlueprintsKey`），完全没有清理 WORKFLOW LRU 缓存。**
+
+**V2 Publish 的缓存清理**：
+代码位置: [publish-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/publish-environment/publish-environment.usecase.ts)
+以及: [sync-to-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts)
+
+✅ 全文件搜索确认：没有任何 `cache` / `invalidate` / `Cache` 相关调用。
+
+⚠️ **V2 Publish 完全没有任何缓存清理逻辑。**
+
+**结论：缓存失效完全依赖 TTL 自然过期**：
+- V1 Promote 后 → 最长 30 秒内 RunJob 可能读到旧版本
+- V2 Publish 后 → 最长 30 秒内 RunJob 可能读到旧版本
+- 多实例部署时各实例独立失效，窗口更大
 
 ### 7.3 触发 API 到运行队列的数据流（版本视角）
 
