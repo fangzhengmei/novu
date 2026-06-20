@@ -11,23 +11,29 @@
 | 字段 | 类型 | 作用 |
 |------|------|------|
 | `_id` | string | 当前环境下模板的唯一 ID |
-| `_parentId` | string? | **跨环境关联键**。Dev 环境模板被 Promote 到 Prod 后，Prod 环境副本的 `_parentId` 指向 Dev 环境的原始 `_id` |
+| `_parentId` | string? | **V1 跨环境关联键**。V1 Promote 时 Prod 环境副本的 `_parentId` 指向 Dev 原始 `_id` |
+| `workflowId` | string? | **V2 跨环境关联键**（external identifier）。V2 Sync 时通过此字段在环境间匹配同一工作流 |
 | `_environmentId` | string | 所属环境 ID，与 `_id` 共同构成复合主键逻辑 |
 | `steps` | NotificationStepEntity[] | 步骤数组，每个步骤含 `_templateId` 关联 MessageTemplate |
 | `active` | boolean | 模板是否激活（可被 trigger 触发） |
 | `draft` | boolean | 是否为草稿状态 |
 | `payloadSchema` | any | 触发时的 payload JSON Schema（用于变量校验） |
 | `validatePayload` | boolean | 是否启用 payload 校验 |
-| `status` | WorkflowStatusEnum? | 工作流状态（由 active + steps 计算得出） |
+| `origin` | ResourceOriginEnum? | 资源来源（NOVU_CLOUD 等），V2 仅同步 NOVU_CLOUD 来源 |
+| `type` | string? | 工作流类型（BRIDGE 等），V2 Diff 仅处理 BRIDGE 类型 |
 
-跨环境关联示意:
+跨环境关联键对比:
 
 ```
-Dev Environment:
-  NotificationTemplate { _id: "dev_tpl_123", _parentId: undefined, _environmentId: "dev_env" }
-     ↓ promote
-Production Environment:
-  NotificationTemplate { _id: "prod_tpl_456", _parentId: "dev_tpl_123", _environmentId: "prod_env" }
+V1 (_parentId 关联):                     V2 (workflowId 关联):
+Dev Environment                           Dev Environment
+  _id: dev_tpl_123                          _id: dev_tpl_123
+  _parentId: undefined                      workflowId: "onboarding-email"
+     ↓ promote                                 ↓ sync
+Production Environment                      Production Environment
+  _id: prod_tpl_456                          _id: prod_tpl_456
+  _parentId: dev_tpl_123                     workflowId: "onboarding-email"
+                                             _parentId: dev_tpl_123 (UpsertWorkflowUseCase 会设置)
 ```
 
 ### 1.2 MessageTemplateEntity —— 消息模板实体
@@ -39,19 +45,20 @@ Production Environment:
 | 字段 | 类型 | 作用 |
 |------|------|------|
 | `_id` | string | 当前环境消息模板 ID |
-| `_parentId` | string? | 跨环境关联键 |
+| `_parentId` | string? | V1 跨环境关联键 |
+| `stepId` | string? | **V2 步骤关联键**（external identifier），V2 通过 stepId 在环境间匹配同一步骤 |
 | `type` | StepTypeEnum | 渠道类型（EMAIL/SMS/IN_APP/PUSH/CHAT 等） |
 | `content` | string \| IEmailBlock[] | 模板内容 |
 | `variables` | ITemplateVariable[]? | 模板变量定义列表 |
 | `controls` | ControlSchemas? | Bridge 工作流的控制 Schema |
 | `subject`, `preheader`, `senderName` | string? | Email 专属字段 |
 
-### 1.3 ChangeEntity —— 变更记录实体（V1 版本管理核心）
+### 1.3 ChangeEntity —— 变更记录实体（仅 V1 使用）
 
 定义位置: [change.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/dal/src/repositories/change/change.entity.ts)
 Schema 定义: [change.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/dal/src/repositories/change/change.schema.ts)
 
-这是 **V1 版本管理**的核心数据结构，记录 Dev 环境中每次编辑产生的差异补丁:
+这是 **V1 版本管理**的核心数据结构，V2 体系**完全不读取或写入**此集合:
 
 | 字段 | 类型 | 作用 |
 |------|------|------|
@@ -66,37 +73,115 @@ Schema 定义: [change.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-n
 rdiffResult 补丁格式示例（来自 `recursive-diff` 库）:
 
 ```typescript
-// path: 变更路径数组，如 ["steps", "0", "template", "content"]
-// op: add / update / delete
-// val: 新值（仅 add/update）
 interface rdiffResult {
-  path: Array<string | number>;
+  path: Array<string | number>;  // 变更路径，如 ["steps", "0", "template", "content"]
   op: 'add' | 'update' | 'delete';
-  val?: any;
+  val?: any;                     // 新值（仅 add/update）
 }
 ```
 
 ---
 
-## 二、两套版本管理体系
+## 二、两套版本管理体系（完全独立、无相互调用）
 
-Novu 实际存在 **两套并行的版本管理体系**：
+### 2.1 体系概览与边界
 
-| 体系 | 适用场景 | 核心机制 | 主要 API |
-|------|---------|---------|---------|
-| **V1 ChangeEntity 模式** | 单工作流粒度的 Promote | 基于 `ChangeEntity` 的增量补丁 + `enabled` 标记 | `POST /changes/:changeId/apply`、`POST /changes/bulk/apply` |
-| **V2 Environments 模式** | 环境间全量同步（Publish） | 基于实体直接比对的同步策略（Workflow/Layout/Agent） | `POST /v2/environments/:targetId/diff`、`POST /v2/environments/:targetId/publish` |
+Novu 实际存在 **两套完全独立、互不调用** 的版本管理体系。以下事实来自代码核准：
 
-### 2.1 V1 与 V2 的关系
+| 维度 | **V1 ChangeEntity 模式** | **V2 Environments 模式** |
+|------|--------------------------|--------------------------|
+| **API 控制器** | [ChangesController](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/changes.controller.ts) 路由: `/changes/*` | [EnvironmentsController](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/environments.controller.ts) 路由: `/v2/environments/*` |
+| **核心入口** | ApplyChange / BulkApplyChange | PublishEnvironmentUseCase / DiffEnvironmentUseCase |
+| **版本数据载体** | ChangeEntity（`changes` MongoDB 集合） | 无中间存储，直接操作实体集合 |
+| **跨环境匹配键** | `_parentId`（MongoDB ObjectId 引用） | `workflowId` / `stepId`（business identifier） |
+| **Diff 计算时机** | 编辑保存时生成，持久化 | 查询 API 时实时计算，不存储 |
+| **同步单位** | 单条 Change（单实体单字段级） | 单资源整体（Workflow/Layout/Agent） |
+| **中间状态** | `enabled: false`（待发布） | 无，直接同步 |
+| **适用工作流** | 全部传统工作流 | `origin = NOVU_CLOUD` 且 `type = BRIDGE` 的工作流 |
+| **Dashboard 入口** | Changes 列表页 | PublishButton / PublishModal |
+| **是否互相调用** | —— | **否**，V2 完全不经过 V1 Change 体系 |
 
-- V1 是 **细粒度** 的变更管理（每次编辑一条 Change）
-- V2 是 **粗粒度** 的环境同步（按环境维度做整体 diff/publish）
-- V2 的 `publishEnvironments` 内部最终也会调用 V1 的 `ApplyChange` 逻辑（对于非 Bridge 工作流）
-- Dashboard 的 "Publish changes" 按钮使用 **V2 API**
+### 2.2 两套体系的独立调用链（关键：V2 不调用 V1）
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            V1 ChangeEntity 模式                                 │
+│  (传统工作流 / Single Workflow Promote / Changes 列表页)                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+  PUT /notification-templates/:id
+      │
+      ▼
+  UpdateWorkflowV0
+      ├─► getChangeId() —— 复用或生成 Change ID
+      ├─► UpdateMessageTemplate → CreateChange (MESSAGE_TEMPLATE, enabled=false)
+      └─► CreateChange (NOTIFICATION_TEMPLATE, enabled=false)
+                                     │
+                                     ▼
+                          POST /changes/:changeId/apply
+                                     │
+                                     ▼
+                          ApplyChange.execute()
+                              ├─► enabled = true (先标记)
+                              ├─► PromoteChangeToEnvironment
+                              │     ├─► 聚合 enabled=true 的 Change
+                              │     ├─► applyDiff({}, ...) → 还原目标状态
+                              │     └─► 按 type 分发:
+                              │           ├─► PromoteNotificationTemplateChange
+                              │           ├─► PromoteMessageTemplateChange
+                              │           ├─► PromoteLayoutChange
+                              │           ├─► PromoteNotificationGroupChange
+                              │           └─► ... 其他类型
+                              └─► 失败 → enabled = false (回滚标记)
+
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         V2 Environments 模式（完全独立）                         │
+│  (Bridge 工作流 / 环境级 Publish / Dashboard PublishButton)                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+  POST /v2/environments/:targetId/publish
+      │
+      ▼
+  PublishEnvironmentUseCase.execute()
+      │
+      └─► 按顺序执行三种 SyncStrategy:
+           │
+           ├─► 1. WorkflowSyncStrategy.execute()
+           │       └─► WorkflowSyncOperation.execute()   ← BaseSyncOperation
+           │             ├─► fetchSyncableResources (源 + 目标)
+           │             ├─► determineSyncDecisions (ComparatorAdapter)
+           │             ├─► syncResources:
+           │             │     └─► WorkflowSyncAdapter.syncResourceToTarget()
+           │             │           └─► SyncToEnvironmentUseCase.execute()
+           │             │                 ├─► getWorkflowUseCase (源环境)
+           │             │                 ├─► 先递归同步引用的 Layout → LayoutSyncToEnvironmentUseCase
+           │             │                 ├─► buildRequestDto (map steps, preferences)
+           │             │                 ├─► findWorkflowInTarget (通过 workflowId 匹配)
+           │             │                 ├─► UpsertWorkflowUseCase.execute() ← 核心写入
+           │             │                 ├─► syncStepResolver (if feature flag)
+           │             │                 └─► publishTranslationGroup (if enterprise)
+           │             └─► handleDeletedResources:
+           │                   └─► WorkflowDeleteAdapter.deleteResourceFromTarget()
+           │
+           ├─► 2. LayoutSyncStrategy.execute()
+           │       └─► LayoutSyncOperation.execute()
+           │             ├─► LayoutSyncAdapter → LayoutSyncToEnvironmentUseCase
+           │             └─► LayoutDeleteAdapter
+           │
+           └─► 3. AgentSyncStrategy.execute()
+                 └─► AgentSyncOperation.execute()
+                       ├─► AgentSyncAdapter → SyncAgentToEnvironment
+                       └─► AgentDeleteAdapter
+```
+
+**代码事实核准确认**:
+- [WorkflowSyncAdapter](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/sync-strategies/adapters/workflow-sync.adapter.ts) L9-L21: 直接注入 `SyncToEnvironmentUseCase`，无任何 ApplyChange 引用
+- [LayoutSyncAdapter](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/sync-strategies/adapters/layout-sync.adapter.ts) L10-L22: 直接注入 `LayoutSyncToEnvironmentUseCase`
+- [AgentSyncAdapter](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/sync-strategies/adapters/agent-sync.adapter.ts) L12-L25: 直接注入 `SyncAgentToEnvironment`
+- [PublishEnvironmentUseCase](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/publish-environment/publish-environment.usecase.ts) L57-L59: 直接注入三种 Strategy，无 V1 引用
 
 ---
 
-## 三、变更创建（V1 Change 生成流程）
+## 三、变更创建（仅 V1 Change 生成流程）
 
 ### 3.1 完整调用链
 
@@ -146,7 +231,7 @@ public async getChangeId(environmentId: string, entityType: ChangeEntityTypeEnum
 }
 ```
 
-**关键设计意图**:
+**设计意图**:
 - 同一实体在未发布前的多次编辑会**合并为同一条 Change**（通过复用 changeId 实现）
 - 避免产生大量细碎的变更记录，保证发布时的原子性
 
@@ -209,22 +294,22 @@ async execute(command: CreateChangeCommand) {
 - 这意味着 **Change.change 字段始终是相对于"最后一次发布"的全量增量**，而非相对于上一次编辑
 - 多次编辑合并时，新的 diff 会**覆盖**旧的 diff 字段（因为每次都是从 baseline 重新计算）
 
-### 3.4 sanitizeDiff 安全过滤
-
-```typescript
-function sanitizeDiff(diff: unknown): rdiffResult[] {
-  if (!Array.isArray(diff)) return [];
-  return diff.filter((item) => item && Array.isArray(item.path));
-}
-```
-
-过滤掉格式非法的 diff 项，防止恶意构造的补丁导致 `applyDiff` 出错。
-
 ---
 
-## 四、变更应用与撤销（V1 Apply / Rollback）
+## 四、变更应用与撤销（仅 V1 Apply / Rollback）
 
-### 4.1 ApplyChange 主流程
+### 4.1 ChangesController API 入口
+
+代码位置: [changes.controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/changes.controller.ts)
+
+| 路由 | 方法 | 用途 |
+|------|------|------|
+| `GET /changes/` | GetChanges | 分页获取变更列表（按 promoted 过滤） |
+| `GET /changes/count` | CountChanges | 获取未发布变更数量 |
+| `POST /changes/:changeId/apply` | ApplyChange | 应用单条变更 |
+| `POST /changes/bulk/apply` | BulkApplyChange | 批量应用变更 |
+
+### 4.2 ApplyChange 主流程
 
 代码位置: [apply-change.usecase.ts L15-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/apply-change/apply-change.usecase.ts#L15-L83)
 
@@ -256,14 +341,14 @@ async execute(command: ApplyChangeCommand): Promise<ChangeEntity[]> {
 }
 ```
 
-### 4.2 单条 Change 的应用与失败处理
+### 4.3 单条 Change 的应用与失败处理
 
 ```typescript
 async applyChange(change, command: ApplyChangeCommand): Promise<ChangeEntity> {
   if (!change) throw new NotFoundException();
 
   try {
-    // 步骤 1: 先将 Change 标记为 enabled=true
+    // 阶段 1: 先将 Change 标记为 enabled=true（状态标记）
     await this.changeRepository.update(
       {
         _id: change._id,
@@ -273,7 +358,7 @@ async applyChange(change, command: ApplyChangeCommand): Promise<ChangeEntity> {
       { enabled: true }
     );
 
-    // 步骤 2: 执行实际的 Promote 逻辑（将变更同步到目标环境）
+    // 阶段 2: 执行实际的 Promote 逻辑（将变更同步到目标环境）
     await this.promoteChangeToEnvironment.execute(
       PromoteChangeToEnvironmentCommand.create({
         itemId: change._entityId,
@@ -284,7 +369,7 @@ async applyChange(change, command: ApplyChangeCommand): Promise<ChangeEntity> {
       })
     );
   } catch (e) {
-    // ⚠️  失败回滚：将 enabled 重新置为 false
+    // ⚠️  失败回滚：将 enabled 重新置为 false（仅回滚标记，不回滚已 Promote 的实体）
     await this.changeRepository.update(
       {
         _id: change._id,
@@ -304,259 +389,330 @@ async applyChange(change, command: ApplyChangeCommand): Promise<ChangeEntity> {
 
 **失败处理机制的关键细节**:
 1. **两阶段提交模型**: 先标记 `enabled=true`（变更状态），再执行实际同步
-2. **自动回滚**: 若同步失败，**自动将 `enabled` 置回 false**，保证状态一致性
-3. **无部分成功**: 父变更 + 子变更串行执行，任何一步失败都会终止流程
-4. **已应用的子变更不会自动回滚**: 若父变更 Promote 失败，已成功的子变更仍保持 `enabled=true`，这是一个潜在的一致性风险
+2. **自动回滚仅限状态标记**: 若同步失败，**自动将 `enabled` 置回 false**，但不回滚已写入目标环境的实际数据
+3. **无部分成功自动补偿**: 父变更 + 子变更串行执行，若子变更 A 成功后子变更 B 失败，A 的目标环境实体变更**不会被自动回滚**
+4. **无分布式事务**: 两阶段之间没有数据库事务绑定，极端情况下可能出现状态不一致
 
-### 4.3 BulkApplyChange —— 批量应用
-
-代码位置: [bulk-apply-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/bulk-apply-change/bulk-apply-change.usecase.ts)
-
-```typescript
-async execute(command: BulkApplyChangeCommand): Promise<ChangeEntity[][]> {
-  const changes = await this.changeRepository.find(
-    { _id: { $in: command.changeIds }, ... },
-    '',
-    { sort: { createdAt: 1 } }
-  );
-
-  const results: ChangeEntity[][] = [];
-  for (const change of changes) {
-    // 逐条调用 ApplyChange，串行执行
-    const item = await this.applyChange.execute(
-      ApplyChangeCommand.create({ changeId: change._id, ... })
-    );
-    results.push(item);
-  }
-
-  return results;
-}
-```
-
-### 4.4 撤销（回滚）的实现方式
-
-当前代码中**没有显式的 "撤销/回滚" API**，但可以通过以下方式实现：
-
-**方式 A: 利用 enabled 标记**
-- 将已 enabled 的 Change 重新置为 `enabled=false`
-- 下次 Promote 时，该 Change 会被过滤掉（只聚合 enabled=true 的）
-- **但这不会自动撤销已经 Promote 到目标环境的实体**，需要重新 Promote 其他变更来覆盖
-
-**方式 B: 生成反向 Diff**
-- 对目标环境实体和源环境历史状态做 `getDiff`，生成反向补丁
-- 创建新的 Change 记录并 Promote
-
-**方式 C: 使用 V2 Environments API 重新发布**
-- 调用 `POST /v2/environments/:targetId/publish`，让源环境的最新状态覆盖目标环境
-
-### 4.5 PromoteChangeToEnvironment 的聚合逻辑
+### 4.4 PromoteChangeToEnvironment 的聚合与分发
 
 代码位置: [promote-change-to-environment.usecase.ts L40-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/promote-change-to-environment/promote-change-to-environment.usecase.ts#L40-L91)
 
 ```typescript
-// 从 ChangeRepository 拉取该实体的所有 Change 记录
-const changes = await this.changeRepository.getEntityChanges(
-  command.organizationId, command.type, command.itemId
-);
+async execute(command: PromoteChangeToEnvironmentCommand) {
+  // 1. 从源环境拉取该实体的所有 Change 记录
+  const changes = await this.changeRepository.getEntityChanges(command.organizationId, command.type, command.itemId);
 
-// 仅聚合已 enabled 的变更，按顺序 applyDiff
-const aggregatedItem = changes
-  .filter((change) => change.enabled)
-  .reduce((prev, change) => {
-    const sanitized = sanitizeDiff(change.change);
-    if (sanitized.length === 0) return prev;
-    return applyDiff(prev, sanitized);
-  }, {});
-```
+  // 2. 仅聚合已 enabled 的变更，按顺序 applyDiff 到空对象
+  const aggregatedItem = changes
+    .filter((change) => change.enabled)
+    .reduce((prev, change) => {
+      const sanitized = sanitizeDiff(change.change);
+      if (sanitized.length === 0) return prev;
+      return applyDiff(prev, sanitized);
+    }, {});
 
-关键要点:
-1. `applyDiff` 来自 `recursive-diff` 库，将补丁顺序应用到空对象 `{}` 上
-2. **Change 记录是增量补丁，但 Promote 时是全量覆盖** —— 聚合后得到的是最终状态
-3. 空对象 `{}` 作为起点意味着每个字段的首次出现必须是 `op: 'add'`，否则会丢失
-
----
-
-## 五、后台 Diff 展示（Dashboard V2 流程）
-
-### 5.1 完整调用链
-
-```
-Dashboard PublishButton 组件
-    │
-    ├─► useDiffEnvironments() Hook
-    │      │
-    │      └─► POST /v2/environments/:targetId/diff
-    │                 │
-    │                 ▼
-    │       DiffEnvironmentUseCase.execute()
-    │                 │
-    │                 ├─► WorkflowSyncStrategy.diff()
-    │                 │      └─► WorkflowDiffOperation.execute()
-    │                 │           ├─► 从 WorkflowDataContainer 加载两边环境的工作流
-    │                 │           ├─► 按 _parentId/triggers[0].identifier 配对
-    │                 │           └─► WorkflowComparatorAdapter.compareResources()
-    │                 │                 └─► 生成 IResourceDiffResult[]（含 changes 数组 + summary）
-    │                 ├─► LayoutSyncStrategy.diff()
-    │                 └─► AgentSyncStrategy.diff()
-    │
-    └─► 展示变更列表（PublishModal 组件）
-          ├─► 显示每个资源的变更类型（新增/修改/删除）
-          ├─► 显示变更数量统计（added/modified/deleted）
-          └─► 用户勾选后调用 usePublishEnvironments() 执行发布
-```
-
-### 5.2 PublishButton 组件逻辑
-
-代码位置: [publish-button.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/dashboard/src/components/header-navigation/publish-button.tsx)
-
-```typescript
-// 自动获取与目标环境的 diff
-const { data: diffData, isLoading: isDiffLoading } = useDiffEnvironments({
-  sourceEnvironmentId: currentEnvironment?._id,
-  targetEnvironmentId: targetEnvironment?._id,
-  enabled: !!targetEnvironment?._id && !!currentEnvironment?._id,
-});
-
-// 计算变更总数
-const changesCount = calculateChangesCount(diffData);
-
-// 发布时调用 V2 API
-const handlePublish = async (selectedResources?: ResourceToPublish[]) => {
-  const result = await publishMutation.mutateAsync({
-    sourceEnvironmentId: currentEnvironment._id,
-    targetEnvironmentId: state.selectedEnvironment._id,
-    resources: selectedResources,
+  // 3. 通过源环境的 _parentId 查找目标环境（假设源是 Dev，目标是 Prod）
+  const environment = await this.environmentRepository.findOne({
+    _parentId: command.environmentId,
   });
-};
-```
+  if (!environment) throw new NotFoundException(...);
 
-### 5.3 V2 Diff API 返回结构
+  // 4. 按类型分发给具体的 Promote 处理器
+  const typeCommand = PromoteTypeChangeCommand.create({
+    organizationId: command.organizationId,
+    environmentId: environment._id,  // 目标环境 ID
+    item: aggregatedItem,            // 聚合后的目标状态
+    userId: command.userId,
+  });
 
-定义位置: [environments.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/dashboard/src/api/environments.ts)
-
-```typescript
-interface IResourceDiffResult {
-  resourceType: string;                     // 'workflow' | 'layout' | 'step' | 'agent'
-  sourceResource?: IResourceInfo | null;    // 源环境资源信息
-  targetResource?: IResourceInfo | null;    // 目标环境资源信息
-  changes: any[];                           // 具体的变更补丁数组
-  summary: IDiffSummary;                    // { added, modified, deleted, unchanged }
-  dependencies?: IResourceDependency[];     // 依赖关系（如 workflow 依赖的 layout）
-}
-
-interface IEnvironmentDiffResponse {
-  sourceEnvironmentId: string;
-  targetEnvironmentId: string;
-  resources: IResourceDiffResult[];
-  summary: {
-    totalEntities: number;
-    totalChanges: number;
-    hasChanges: boolean;
-  };
+  switch (command.type) {
+    case ChangeEntityTypeEnum.NOTIFICATION_TEMPLATE:
+      await this.promoteNotificationTemplateChange.execute(typeCommand);
+    case ChangeEntityTypeEnum.MESSAGE_TEMPLATE:
+      await this.promoteMessageTemplateChange.execute(typeCommand);
+    case ChangeEntityTypeEnum.LAYOUT:
+    case ChangeEntityTypeEnum.DEFAULT_LAYOUT:
+      await this.promoteLayoutChange.execute(typeCommand);
+    case ChangeEntityTypeEnum.NOTIFICATION_GROUP:
+      await this.promoteNotificationGroupChange.execute(typeCommand);
+    // ... FEED / TRANSLATION / TRANSLATION_GROUP
+  }
 }
 ```
 
-### 5.4 V2 Diff 与 V1 Change 的区别
+### 4.5 撤销（回滚）的实现方式
 
-| 维度 | V1 Change | V2 Diff |
-|------|-----------|---------|
-| 计算时机 | 编辑时实时计算（保存即生成） | 查询时按需计算（调用 API 时才比对） |
-| 存储方式 | 持久化到 MongoDB `changes` 集合 | 不存储，每次调用实时计算 |
-| 粒度 | 单实体单字段级增量 | 资源级（工作流/布局/代理）整体比对 |
-| 格式 | `rdiffResult[]` 递归补丁 | 自定义 `IResourceDiffResult` 结构 |
-| 用途 | 增量发布（按变更发布） | 展示变更预览 + 全量/部分发布 |
+当前代码中**没有显式的 "撤销/回滚" API**，可通过以下方式实现：
 
-### 5.5 WorkflowDiffOperation 的比对逻辑
+**方式 A: enabled 标记撤销（最常用）**
+- 将已 enabled 的 Change 重新置为 `enabled=false`
+- 下次聚合时该 Change 会被过滤掉
+- **但这不会自动撤销已经 Promote 到目标环境的实体数据**，需要通过新的反向 Change 覆盖
 
-代码位置: [workflow-diff.operation.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/sync-strategies/operations/workflow-diff.operation.ts)
+**方式 B: 生成反向 Diff**
+- 对目标环境实体和源环境历史状态做 `getDiff`，生成反向补丁
+- 创建新的 Change 记录并 Apply/Promote
 
-核心流程:
-1. 从 `WorkflowDataContainer` 预加载源/目标环境的所有 Bridge 工作流
-2. 按 `triggers[0].identifier`（即 workflowId）配对源/目标工作流
-3. 调用 `WorkflowComparatorAdapter.compareResources()` 做详细比对
-4. 处理新增（源有目标无）、修改（两边都有）、删除（源无目标有）三种情况
-5. 分析依赖关系（如 workflow 依赖的 layout 是否在目标环境存在）
+**方式 C: 使用 V2 Environments API 重新同步**
+- 调用 `POST /v2/environments/:targetId/publish`，V2 会将源环境的最新整体状态重新写入目标环境（整体覆盖，粒度更粗）
 
 ---
 
-## 六、通知模板 Promote 的特殊逻辑（V1 核心）
+## 五、V2 环境发布链路详解（完全独立）
 
-代码位置: [promote-notification-template-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/promote-notification-template-change/promote-notification-template-change.usecase.ts)
+### 5.1 DiffEnvironmentUseCase —— 后台 Diff 展示计算
 
-### 6.1 MessageTemplate ID 映射
+代码位置: [diff-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/diff-environment/diff-environment.usecase.ts)
 
-```typescript
-const mapNewStepItem = (step: NotificationStepEntity) => {
-  // 通过 _parentId 查找目标环境中对应的消息模板
-  const oldMessage = messages.find((message) => message._parentId === step._templateId);
+**完整流程**:
 
-  if (!oldMessage) {
-    missingMessages.push(step._templateId);
-    return undefined;  // 静默过滤缺失的步骤
-  }
-
-  // 将 Dev 环境的 _templateId 替换为 Prod 环境的 _id
-  if (step?._templateId && oldMessage._id) {
-    step._templateId = oldMessage._id;
-  }
-
-  return step;
-};
+```
+POST /v2/environments/:targetId/diff
+    │
+    ▼
+DiffEnvironmentUseCase.execute()
+    │
+    ├─► validateEnvironments() —— 校验源/目标环境合法性
+    │
+    ├─► 预加载数据（性能优化）
+    │     └─► WorkflowDataContainer.loadWorkflowsWithControlValues()
+    │           └─► 从 notification-template.repository.findWithTemplates()
+    │                 加载条件:
+    │                   - _environmentId: { $in: [sourceId, targetId] }
+    │                   - origin: NOVU_CLOUD
+    │                   - type: BRIDGE
+    │
+    ├─► 并行执行三种 Strategy.diff():
+    │     │
+    │     ├─► WorkflowSyncStrategy.diff()
+    │     │     └─► WorkflowDiffOperation.execute()
+    │     │           ├─► 从 WorkflowDataContainer 获取两边环境工作流
+    │     │           ├─► 通过 triggers[0].identifier (即 workflowId) 配对源/目标
+    │     │           ├─► WorkflowComparatorAdapter.compareResources()
+    │     │           │     └─► 生成 IResourceDiffResult (含 changes + summary)
+    │     │           └─► 处理新增/修改/删除三种情况
+    │     │
+    │     ├─► LayoutSyncStrategy.diff()
+    │     │     └─► LayoutDiffOperation → LayoutComparatorAdapter
+    │     │
+    │     └─► AgentSyncStrategy.diff()
+    │           └─► AgentDiffOperation → AgentComparatorAdapter
+    │
+    ├─► DependencyAnalyzerService.analyzeDependencies()
+    │     └─► 分析资源间依赖（如 workflow → layout），补充到结果
+    │
+    └─► 计算 summary: { totalEntities, totalChanges, hasChanges }
 ```
 
-### 6.2 NotificationGroup 依赖处理
+**与 V1 Change 的关系**：V2 Diff **完全不读取 Change 集合**，直接比对实体实际状态。若存在 V1 未 enabled 的 Change（Dev 环境实体已被修改但 Change 未发布），V2 Diff **会把这些修改也纳入比对**——因为它看的是 Dev 环境实体的最新状态，而不是 Change 的 enabled 标记。
+
+### 5.2 PublishEnvironmentUseCase —— 环境同步执行入口
+
+代码位置: [publish-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/publish-environment/publish-environment.usecase.ts)
 
 ```typescript
-let notificationGroup = await this.notificationGroupRepository.findOne({
-  _environmentId: command.environmentId,
-  _organizationId: command.organizationId,
-  _parentId: newItem._notificationGroupId,
-});
-
-// 若通知组在目标环境不存在，先递归 Promote 通知组的所有变更
-if (!notificationGroup) {
-  const changes = await this.changeRepository.getEntityChanges(
-    command.organizationId,
-    ChangeEntityTypeEnum.NOTIFICATION_GROUP,
-    newItem._notificationGroupId
-  );
-
-  for (const change of changes) {
-    await this.applyChange.execute(ApplyChangeCommand.create({ changeId: change._id, ... }));
-  }
-
-  // 重新查找
-  notificationGroup = await this.notificationGroupRepository.findOne({ ... });
+async execute(command: PublishEnvironmentCommand): Promise<IPublishResult> {
+  // 1. 环境校验 + 确定 sourceEnvironmentId（默认 Dev）
+  // 2. 构造 ISyncContext
+  // 3. 按固定顺序串行执行三种 Strategy:
+  const strategies = [this.workflowSyncStrategy, this.layoutSyncStrategy, this.agentSyncStrategy];
+  const results = await this.executeSync(strategies, syncContext);
+  // 4. 汇总 summary
 }
 ```
 
-### 6.3 创建 vs 更新分支
+**注意**：当前代码中 `executeSync` 方法虽然有注释提到 `use transactions for atomicity`，但实际实现中**并未开启 MongoDB 事务**，各资源同步之间是独立的，没有全局事务保证。
+
+### 5.3 BaseSyncOperation —— 同步决策通用框架
+
+代码位置: [base-sync.operation.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/sync-strategies/base/operations/base-sync.operation.ts)
+
+这是所有资源类型同步的通用基类，流程如下:
+
+```
+BaseSyncOperation.execute(context)
+    │
+    ├─► fetchSyncableResources(sourceEnv) —— 获取源环境需同步的资源
+    │
+    ├─► filterResourcesForSelectiveSync() —— 如果指定了 resources，按 resourceType+resourceId 过滤
+    │
+    ├─► syncResources(context, sourceResources, resultBuilder)
+    │     │
+    │     ├─► fetchSyncableResources(targetEnv)
+    │     ├─► createResourceMap(targetResources) —— Map<identifier, resource>
+    │     │
+    │     ├─► determineSyncDecisions() （分批次，每批 5 个并发）
+    │     │     │
+    │     │     └─► shouldSyncResource(resource, targetResource?)
+    │     │           │
+    │     │           ├─► if (!targetResource) → { sync: true, action: CREATED }
+    │     │           │
+    │     │           └─► ComparatorAdapter.compareResources(resource, targetResource)
+    │     │                 ├─► resourceChanges !== null
+    │     │                 ├─► otherDiffs.length > 0
+    │     │                 └─► { sync: true, action: UPDATED } 或
+    │     │                     { sync: false, reason: NO_CHANGES }
+    │     │
+    │     └─► 按决策串行执行:
+    │           │
+    │           ├─► sync=true  → SyncAdapter.syncResourceToTarget() → resultBuilder.addSuccess()
+    │           ├─► sync=false → resultBuilder.addSkipped(reason)
+    │           └─► 异常 → resultBuilder.addFailure() → throw
+    │
+    └─► handleDeletedResources(context, sourceResources, resultBuilder)
+          │
+          ├─► fetchSyncableResources(targetEnv)
+          ├─► createResourceMap(sourceResources)
+          └─► 对每个在目标环境但不在源环境中的资源:
+                DeleteAdapter.deleteResourceFromTarget()
+```
+
+### 5.4 WorkflowSyncAdapter → SyncToEnvironmentUseCase
+
+代码位置: [sync-to-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts)
+
+这是 V2 工作流同步的**核心执行单元**，完全独立于 V1 体系:
 
 ```typescript
-if (!item) {
-  // 目标环境不存在对应模板 → 创建新副本
-  if (newItem.deleted) return;  // 源已删除则无需创建
+async execute(command: SyncToEnvironmentCommand): Promise<WorkflowResponseDto> {
+  // 1. 校验: 不能同步到同一环境；目标环境必须存在
+  // 2. getWorkflowUseCase() —— 从源环境加载完整工作流（含 steps、controlValues）
+  // 3. isSyncable() 校验: 仅 NOVU_CLOUD 来源可同步
+  // 4. getWorkflowPreferences() —— 加载 USER_WORKFLOW + WORKFLOW_RESOURCE 偏好
+  // 5. findWorkflowInTargetEnvironment() —— 按 workflowId (external ID) 在目标环境查找
+  //       ↑ 这是 V2 与 V1 的关键区别：V2 用 workflowId 匹配，V1 用 _parentId 匹配
+  // 6. buildRequestDto() —— 根据是创建还是更新，映射为 UpsertWorkflowDataCommand
+  //
+  // 7. ⭐ 先递归同步依赖的 Layout（Email 步骤引用的 layoutId）
+  const layoutsToSyncPromises = layoutsToSync.map((layoutId) =>
+    this.layoutSyncToEnvironmentUseCase.execute(...)
+  );
+  await Promise.all(layoutsToSyncPromises);
+  //
+  // 8. 同步 Layout 的翻译（仅企业版）
+  //
+  // 9. ⭐ UpsertWorkflowUseCase.execute() —— 核心写入：创建或更新目标环境的工作流
+  const upsertedWorkflow = await this.upsertWorkflowUseCase.execute(
+    UpsertWorkflowCommand.create({
+      preserveWorkflowId: true,           // 保持 workflowId 不变
+      user: { ...user, environmentId: targetEnvId },  // 切换用户上下文到目标环境
+      workflowIdOrInternalId: targetWorkflow?._id,   // 目标环境内部 ID（更新时用）
+      workflowDto,
+      session: command.session,
+    })
+  );
+  // 10. syncStepResolver() —— 如果 feature flag 开启，同步步骤解析器
+  // 11. publishTranslationGroup() —— 同步工作流翻译（仅企业版）
+  // 12. updatePublishFields() —— 更新源工作流的发布元信息（lastPublishedAt 等）
+  // 13. sendWebhookMessage() —— 发送 WORKFLOW_PUBLISHED webhook（可选）
 
-  const newNotificationTemplate: Partial<NotificationTemplateEntity> = {
-    name: newItem.name,
-    active: newItem.active,
-    steps,
-    _parentId: command.item._id,  // 设置跨环境关联
-    ...
+  return upsertedWorkflow;
+}
+```
+
+**V2 同步步骤 ID 映射逻辑** (mapStepsToCreateOrUpdateDto):
+
+```typescript
+sourceSteps.map((sourceStep) => {
+  // 在目标环境步骤中，通过 stepId (external identifier) 匹配找到对应的内部 _id
+  const targetStepInternalId = targetEnvSteps?.find(
+    (targetStep) => targetStep.stepId === sourceStep.stepId
+  )?._id;
+
+  return {
+    ...(targetStepInternalId && { _id: targetStepInternalId }),
+    stepId: sourceStep.stepId,  // 保持 stepId 不变
+    name: sourceStep.name ?? '',
+    type: sourceStep.type,
+    controlValues: sourceStep.controls?.values ?? {},
   };
-
-  const createdTemplate = await this.notificationTemplateRepository.create(newNotificationTemplate);
-  await this.updateWorkflowPreferences(createdTemplate._id, command, ...);
-
-  return createdTemplate;
-} else {
-  // 目标环境已存在 → 全量更新
-  await this.notificationTemplateRepository.update(
-    { _id: item._id, _environmentId: command.environmentId },
-    { $set: { name: newItem.name, active: newItem.active, steps, ... } }
-  );
-}
+});
 ```
+
+**与 V1 PromoteNotificationTemplateChange 的对比**:
+
+| 维度 | V1 PromoteNotificationTemplateChange | V2 SyncToEnvironmentUseCase |
+|------|--------------------------------------|------------------------------|
+| 工作流匹配 | 通过 `_parentId` 查找目标环境副本 | 通过 `workflowId` (external) 查找目标环境副本 |
+| 步骤匹配 | 通过 `_parentId` 查找目标环境 MessageTemplate | 通过 `stepId` (external) 查找目标环境步骤，用 `_id` 写入 Upsert 命令 |
+| 依赖处理 | PromoteNotificationGroup（递归 Apply NotificationGroup Change） | 同步引用的 Layout（调用 LayoutSyncToEnvironmentUseCase） |
+| 偏好处理 | 手动同步 UserWorkflowPreferences + WorkflowResourcePreferences | 偏好作为 UpsertWorkflowCommand 的一部分由 UpsertWorkflowUseCase 统一处理 |
+| 控制值同步 | 不涉及（Change 模式增量覆盖） | 通过 WorkflowDataContainer 预加载，在 UpsertWorkflowUseCase 中处理 |
+| 翻译同步 | TRANSLATION Change 单独发布 | 企业版内置 publishTranslationGroup() |
+| Webhook 通知 | 无 | 发送 WORKFLOW_PUBLISHED webhook 事件 |
+| 事务 | 无 | 无（虽有 session 参数但未绑定完整事务） |
+
+---
+
+## 六、后台 Diff 展示与发送链路的关系
+
+### 6.1 展示与发送的数据流关系
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                       后台展示层（Dashboard）                                             │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                    │
+  PublishButton 组件                                                                               │
+    ├─► useDiffEnvironments() Hook                                                                 │
+    │     └─► POST /v2/environments/:targetId/diff                                                 │
+    │           └─► DiffEnvironmentUseCase                                                        │
+    │                 └─► 直接比对源/目标环境实体（不经过 Change）                                   │
+    │                                                                                               │
+    └─► 确认发布 → usePublishEnvironments()                                                        │
+          └─► POST /v2/environments/:targetId/publish                                              │
+                └─► PublishEnvironmentUseCase                                                     │
+                      └─► WorkflowSyncStrategy → SyncToEnvironmentUseCase                          │
+                            └─► UpsertWorkflowUseCase → 写入 Prod 环境 NotificationTemplate       │
+                                                                                                    │
+                                                                                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              发送链路（Worker）                                                 │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                                                                    │
+  Trigger API /events/trigger                                                                       │
+    │                                                                                               │
+    ▼                                                                                               │
+  ParseEventRequest                                                                                 │
+    ├─► getNotificationTemplateByTriggerIdentifier()                                               │
+    │     └─► 按 (envId=prod, triggerIdentifier) 查找 Prod 环境 NotificationTemplate               │
+    │           ↑ 这个就是 V2 刚刚写入的目标环境实体！                                               │
+    │                                                                                               │
+    ├─► payloadSchema 校验（AJV + 默认值填充）                                                     │
+    │                                                                                               │
+    └─► 创建 Notification + Jobs                                                                   │
+          ├─► job._templateId = Prod 环境模板的 _id  ← **版本在此刻固化**                          │
+          └─► job.step.template = 嵌入模板内容快照                                                  │
+                                                                                                    │
+    ▼                                                                                               │
+  Workflow Queue (BullMQ)                                                                           │
+    │                                                                                               │
+    ▼                                                                                               │
+  RunJob                                                                                            │
+    ├─► getWorkflow(envId, templateId)                                                             │
+    │     └─► InMemoryLRUCacheStore.WORKFLOW —— key = `${envId}:${templateId}`                     │
+    │                                                                                               │
+    ▼                                                                                               │
+  SendMessage                                                                                       │
+    └─► 使用 job.step.template 快照内容渲染（不依赖 DB 实时版本）                                   │
+```
+
+**关键耦合点**:
+
+1. **V2 Publish → Prod 环境实体写入**：SyncToEnvironmentUseCase 通过 UpsertWorkflowUseCase 直接在目标环境写入 NotificationTemplate，这是发送链路的数据源
+2. **triggerIdentifier 匹配**：ParseEventRequest 通过 `triggers[0].identifier`（即 workflowId）查找模板，V2 同步时 `preserveWorkflowId: true` 保证匹配成功
+3. **版本固化时机**：Job 创建时 `job._templateId` 和 `job.step.template` 快照固化，**V2 Publish 之后的变更不会影响已入队的 Job**
+4. **LRU 缓存风险**：RunJob 的 `getWorkflow()` 有缓存，若 V2 Publish 是原地更新（同一 `_id` 覆盖内容），旧缓存需等失效
+
+### 6.2 V1 vs V2 发布后发送链路的差异
+
+| 场景 | V1 Change Promote 后 | V2 Environment Publish 后 |
+|------|----------------------|--------------------------|
+| 工作流匹配方式 | `_parentId` 关联，查找目标环境副本 | `workflowId` 匹配，查找目标环境副本 |
+| trigger 能否立即找到 | ✅ 可以（目标环境副本 triggerIdentifier 不变） | ✅ 可以（`preserveWorkflowId: true` 保持不变） |
+| 步骤内容映射 | V1 需重新映射 `step._templateId`（用 `_parentId` 找目标 MessageTemplate） | V2 的 UpsertWorkflowUseCase 通过 `stepId` 匹配并复用目标 MessageTemplate `_id` |
+| LRU 缓存影响 | 是，若 `_id` 不变需失效缓存 | 是，同上 |
+| 已入队 Job 受影响 | 否，Job 快照已固化 | 否，Job 快照已固化 |
 
 ---
 
@@ -610,7 +766,7 @@ private async getWorkflow(templateId, environmentId, organizationId, source?) {
 
 **关键点**：
 - 查找键是 `(environmentId, templateId)`，这是模板在**当前环境下的实际 ID**
-- 使用了内存 LRU 缓存，意味着刚 Promote 的新模板版本需要等缓存失效或主动失效（见 `InvalidateCacheService`）
+- 使用了内存 LRU 缓存，意味着刚 Promote/Publish 的新模板版本需要等缓存失效或主动失效
 - **若模板正在被渐进切换，此处缓存会导致旧版本继续被使用一段时间**
 
 ### 7.3 消息发送阶段（SendMessage）
@@ -624,35 +780,6 @@ const workflow = command.workflow ??
 ```
 
 此阶段主要用模板做 **偏好判断（Subscriber Preference）**，不直接读取内容。实际模板内容（subject、content 等）已在 Job 创建时嵌入 `job.step.template`。
-
-### 7.4 链路总结
-
-```
-Trigger Request
-    │
-    ▼
-ParseEventRequest  ──►  按 (envId, triggerIdentifier) 查 Template ──► 校验 payloadSchema
-    │
-    ▼
-Create Notification + Jobs  ──►  job._templateId = 模板当前环境 _id
-    │                                 job.step.template = 嵌入模板内容快照
-    ▼
-Workflow Queue (BullMQ)
-    │
-    ▼
-RunJob  ──►  getWorkflow(envId, templateId) 带 LRU 缓存
-    │         └──► 用于偏好判断、步骤调度
-    ▼
-SendMessage  ──►  使用 job.step.template 的快照内容渲染
-    │
-    ▼
-各渠道 Provider (SendGrid/Twilio/APNs 等)
-```
-
-**模板版本与发送链路的耦合点**:
-1. `job._templateId` 在 Job 创建时就已固化，**Job 生命周期内不会改变模板版本**
-2. 因此，正在队列中等待的 Job 不会受后续模板更新/Promote 影响
-3. 新模板版本只影响 **Job 创建之后** 触发的新通知
 
 ---
 
@@ -696,11 +823,14 @@ if (template.validatePayload && template.payloadSchema) {
 Novu 当前采用 **双环境（Dev → Prod）硬切换** 模型，而非逐步流量迁移的灰度模型：
 
 ```
-Dev Environment  ──────promote/apply──────►  Production Environment
-     │                                            │
-     ▼                                            ▼
-  编辑产生 Change                           所有 trigger 使用
-  （enabled=false 未应用）                  最新 Promote 版本
+                    V1 Change Promote
+Dev Environment  ───────────────────────────►  Production Environment
+     │                                               │
+     │  V2 Environment Publish                      │
+     └──────────────────────────────────────────────►│
+                                                     ▼
+                                              所有 trigger 使用
+                                              最新 Promote/Publish 版本
 ```
 
 **现状限制**:
@@ -717,7 +847,7 @@ Dev Environment  ──────promote/apply──────►  Productio
 | **版本绑定 Job** | 无需改动 | 当前 `job._templateId` 已天然具备 Job 级版本绑定语义 |
 | **缓存失效** | `RunJob.getWorkflow` 的 LRU Cache | 渐进切换期间需关闭缓存或加版本号做 key，避免旧版本缓存命中 |
 | **多版本存储** | `NotificationTemplateEntity` | 新增 `version` 或 `variant` 字段，同一 trigger identifier 下可存在多个版本 |
-| **回滚原子性** | `PromoteChangeToEnvironment` | 当前是全量聚合 applyDiff，回滚需生成反向 Change 并重新 Promote |
+| **回滚原子性** | V1: `ApplyChange` / V2: `SyncToEnvironmentUseCase` | V1 需解决部分成功回滚问题；V2 天然是整体覆盖，回滚即重新发布源环境的旧版本 |
 
 ### 9.3 渐进切换与发送链路的时序关系
 
@@ -747,101 +877,57 @@ Dev Environment  ──────promote/apply──────►  Productio
 
 ## 十、各概念的关系矩阵与完整关系图
 
-### 10.1 关系矩阵
+### 10.1 关系矩阵（按代码事实核准）
 
-| 概念 | 核心机制 | 影响发送链路 | 影响后台展示 | 涉及主要文件 |
-|------|---------|-------------|-------------|-------------|
-| **Diff (V1)** | `recursive-diff` 的 rdiffResult 补丁，存于 `ChangeEntity.change`，编辑时相对于 baseline 计算 | 间接影响：聚合后成为新版本模板内容 | 间接：通过 V2 Diff API 展示 | [create-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/usecases/create-change/create-change.usecase.ts) |
-| **Diff (V2)** | 调用 API 时实时比对源/目标环境实体，生成 `IResourceDiffResult` | 无直接影响（仅展示用） | 直接：Dashboard PublishModal 展示变更列表 | [diff-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/diff-environment/diff-environment.usecase.ts) |
-| **变更创建** | `UpdateWorkflowV0` → `UpdateMessageTemplate` → `CreateChange`，多次编辑合并为同一条 Change | 无（仅创建待发布变更） | 展示为 Changes 列表中的待发布项 | [update-workflow.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/usecases/update-workflow-v0/update-workflow.usecase.ts) |
-| **变更应用** | `ApplyChange` 先置 enabled=true 再 Promote，失败自动回滚 enabled=false | 直接影响：Promote 后目标环境 trigger 使用新版本 | 展示为 Changes 列表中 enabled 状态变为 true | [apply-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/apply-change/apply-change.usecase.ts) |
-| **回滚** | 将 Change.enabled 置 false 或生成反向 Diff 重新 Promote | 影响后续新 trigger 使用的模板版本（已入队 Job 不受影响） | 展示为 Changes 列表中 enabled 状态切换 | 无独立 API，通过 ApplyChange + enabled 标记实现 |
-| **变量兼容** | `payloadSchema` JSON Schema + AJV 默认值填充 + 模板引擎兜底 | Trigger 入口校验失败直接拒绝；运行时渲染缺变量为空字符串 | Dashboard 编辑器提供 Schema 定义 UI | [parse-event-request.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/events/usecases/parse-event-request/parse-event-request.usecase.ts) |
-| **影子发布** | 当前未原生实现，需双版本并行触发并对比 | 需在 SendMessage 层面增加"仅记录不真实发送"分支 | 需新增影子发布结果对比页面 | 需新建 |
-| **渐进切换** | 当前未原生实现，需按流量比例路由 templateId | ParseEventRequest 中选择版本 → 写入 Job._templateId → 后续链路天然跟随 | 需新增版本流量配置 UI + 指标看板 | 需新建 |
-| **发送链路** | Trigger → ParseEvent → Queue → RunJob → SendMessage → Provider | **版本选择的实际发生处**，是所有版本策略的落点 | 展示 Activity Feed / Execution Details 中的执行结果 | [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts), [send-message.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts) |
+| 概念 | 核心机制 | 影响发送链路 | 影响后台展示 | V1 体系 | V2 体系 | 涉及主要文件 |
+|------|---------|-------------|-------------|----------|----------|-------------|
+| **Diff (V1)** | `recursive-diff` 的 rdiffResult 补丁，存于 `ChangeEntity.change`，编辑时相对于 baseline 计算 | 间接影响：V1 Promote 聚合后成为新版本模板内容 | 间接：仅通过 V1 Changes 列表展示（非 Dashboard PublishModal） | ✅ 核心 | ❌ 不涉及 | [create-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/usecases/create-change/create-change.usecase.ts) |
+| **Diff (V2)** | 调用 API 时实时比对源/目标环境实体，生成 `IResourceDiffResult`，不存储 | 无直接影响（仅展示用） | ✅ 直接：Dashboard PublishModal 展示变更列表 | ❌ 不读取 | ✅ 核心 | [diff-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/diff-environment/diff-environment.usecase.ts) |
+| **变更创建** | `UpdateWorkflowV0` → `UpdateMessageTemplate` → `CreateChange`，多次编辑合并为同一条 Change | 无（仅创建待发布变更，V2 不受影响） | 展示为 Changes 列表中的待发布项 | ✅ 核心 | ❌ 不涉及 | [update-workflow.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/libs/application-generic/src/usecases/update-workflow-v0/update-workflow.usecase.ts) |
+| **变更应用 (V1)** | `ApplyChange` 先置 enabled=true 再 Promote，失败自动回滚 enabled=false | 直接影响：V1 Promote 后目标环境 trigger 使用新版本 | V1 Changes 列表 enabled 状态变 true | ✅ 核心 | ❌ 不涉及 | [apply-change.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/apply-change/apply-change.usecase.ts) |
+| **环境发布 (V2)** | 各 SyncStrategy → BaseSyncOperation → 各自 SyncAdapter → Upsert 用例 | 直接影响：V2 Publish 写入 Prod 环境，后续 trigger 用新版本 | V2 Publish 按钮/Modal，展示 success/failure/skipped | ❌ 不涉及 | ✅ 核心 | [publish-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/environments-v2/usecases/publish-environment/publish-environment.usecase.ts) |
+| **工作流同步 (V2)** | `SyncToEnvironmentUseCase` → `UpsertWorkflowUseCase`，按 workflowId/stepId 匹配 | V2 发布的实际执行者，写入 Prod 环境实体 | 作为 V2 Publish 的子流程无独立展示 | ❌ 不涉及 | ✅ 核心 | [sync-to-environment.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/workflows-v2/usecases/sync-to-environment/sync-to-environment.usecase.ts) |
+| **回滚** | V1: 将 Change.enabled 置 false + 重新发布反向 Change<br>V2: 重新调用 V2 Publish（源环境回退到旧状态后整体覆盖） | 影响后续新 trigger 使用的模板版本（已入队 Job 不受影响） | V1: Changes 列表 enabled 状态切换<br>V2: 重新展示 Diff 结果 | V1 部分 | V2 部分 | 无独立 API |
+| **变量兼容** | `payloadSchema` JSON Schema + AJV 默认值填充 + 模板引擎兜底 | Trigger 入口校验失败直接拒绝；运行时渲染缺变量为空字符串 | Dashboard 编辑器提供 Schema 定义 UI | ✅ 共用 | ✅ 共用 | [parse-event-request.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/events/usecases/parse-event-request/parse-event-request.usecase.ts) |
+| **影子发布** | 当前未原生实现，需双版本并行触发并对比 | 需在 SendMessage 层面增加"仅记录不真实发送"分支 | 需新增影子发布结果对比页面 | 需新建 | 需新建 | 需新建 |
+| **渐进切换** | 当前未原生实现，需按流量比例路由 templateId | ParseEventRequest 中选择版本 → 写入 Job._templateId → 后续链路天然跟随 | 需新增版本流量配置 UI + 指标看板 | 需新建 | 需新建 | 需新建 |
+| **发送链路** | Trigger → ParseEvent → Queue → RunJob → SendMessage → Provider | **版本选择的实际发生处**，所有发布策略的最终落点 | 展示 Activity Feed / Execution Details 中的执行结果 | ✅ 共用 | ✅ 共用 | [run-job.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/worker/src/app/workflow/usecases/run-job/run-job.usecase.ts) |
 
-### 10.2 完整关系图
+### 10.2 V1 Change 的使用边界总结
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                     DEV ENVIRONMENT                                        │
-└────────────────────────────────────────────────────────────────────────────────────────────┘
-                                            │
-┌───────────────────────────────────────────┼────────────────────────────────────────────────┐
-│  Dashboard 编辑模板                        │                                                │
-│    │                                       │                                                │
-│    ▼                                       │                                                │
-│  UpdateWorkflowV0.execute()                │                                                │
-│    ├─► 更新 NotificationTemplate           │                                                │
-│    ├─► 遍历 steps → UpdateMessageTemplate  │                                                │
-│    │     └─► getChangeId()                 │                                                │
-│    │          └─► 复用或生成 Change ID     │                                                │
-│    └─► CreateChange.execute()              │                                                │
-│         ├─► 聚合 enabled=true 的 Change    │                                                │
-│         ├─► getDiff(baseline, newState)   │                                                │
-│         └─► 保存 Change (enabled=false)    │                                                │
-│                                            │                                                │
-│  Dashboard Publish 按钮                     │                                                │
-│    │                                       │                                                │
-│    ├─► useDiffEnvironments()               │                                                │
-│    │    └─► POST /v2/environments/diff      │                                                │
-│    │         └─► DiffEnvironmentUseCase    │                                                │
-│    │              ├─► WorkflowSyncStrategy │                                                │
-│    │              ├─► LayoutSyncStrategy   │                                                │
-│    │              └─► AgentSyncStrategy    │                                                │
-│    │                                          │                                            │
-│    └─► 确认发布 → usePublishEnvironments()   │                                            │
-│         └─► POST /v2/environments/publish    │                                            │
-│              └─► PublishEnvironmentUseCase   │                                            │
-│                   └─► 各 SyncStrategy.execute │                                            │
-│                        └─► ApplyChange.execute() ───────────┐                               │
-│                             ├─► enabled=true                │                               │
-│                             ├─► PromoteChangeToEnvironment  │                               │
-│                             │    └─► 聚合 Change → applyDiff │                               │
-│                             └─► 失败 → enabled=false (回滚)  │                               │
-└──────────────────────────────────────────────────────────────┼───────────────────────────────┘
-                                                               │
-                                                               │ 跨环境 Promote
-                                                               │
-┌──────────────────────────────────────────────────────────────┼───────────────────────────────┐
-│                          PRODUCTION ENVIRONMENT              │                               │
-└──────────────────────────────────────────────────────────────┼───────────────────────────────┘
-                                                               │
-                                                               ▼
-                                                 NotificationTemplate (Prod)
-                                                 ├─► _id = prod_tpl_456
-                                                 ├─► _parentId = dev_tpl_123
-                                                 └─► steps[]._templateId 已映射为 Prod 环境 ID
-                                                               │
-┌──────────────────────────────────────────────────────────────┼───────────────────────────────┐
-│  发送链路                                                     │                               │
-│    │                                                         │                               │
-│    ▼                                                         │                               │
-│  Trigger API /events/trigger                                 │                               │
-│    │                                                         │                               │
-│    ▼                                                         │                               │
-│  ParseEventRequest                                            │                               │
-│    ├─► getNotificationTemplateByTriggerIdentifier() ◄────────┘                               │
-│    │     └─► 按 (envId=prod, triggerIdentifier) 查找                                         │
-│    ├─► payloadSchema 校验 (AJV)                                                              │
-│    └─► 创建 Notification + Jobs                                                              │
-│         ├─► job._templateId = prod_tpl_456 (固化)                                            │
-│         └─► job.step.template = 嵌入模板内容快照                                              │
-│                                                                                               │
-│    ▼                                                                                          │
-│  Workflow Queue (BullMQ)                                                                      │
-│    │                                                                                          │
-│    ▼                                                                                          │
-│  RunJob                                                                                       │
-│    ├─► getWorkflow(envId, templateId) 带 LRU 缓存                                             │
-│    └─► 调度步骤执行                                                                           │
-│                                                                                               │
-│    ▼                                                                                          │
-│  SendMessage                                                                                  │
-│    ├─► 使用 job.step.template 快照渲染                                                        │
-│    └─► 调用各渠道 Provider                                                                    │
-└───────────────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        V1 ChangeEntity 使用范围                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+  ✅  以下流程使用 V1 Change:
+    ├─► UpdateWorkflowV0 / UpdateMessageTemplate —— 保存时创建 Change
+    ├─► CreateChange —— 生成 rdiffResult 补丁并写入 changes 集合
+    ├─► GetChanges / CountChanges —— Changes 列表页展示未发布/已发布变更
+    ├─► ApplyChange / BulkApplyChange —— POST /changes/*/apply API
+    ├─► PromoteChangeToEnvironment —— 聚合 enabled=true 的 Change 并分发
+    ├─► PromoteNotificationTemplateChange / PromoteMessageTemplateChange
+    ├─► PromoteLayoutChange / PromoteNotificationGroupChange
+    ├─► PromoteFeedChange / PromoteTranslationChange / PromoteTranslationGroupChange
+    └─► UpdateChange —— 修改 Change 元信息（V1 流程内部使用）
+
+  ❌  以下流程完全不使用 V1 Change:
+    ├─► DiffEnvironmentUseCase —— V2 Diff API（直接比对实体）
+    ├─► PublishEnvironmentUseCase —— V2 Publish API
+    ├─► WorkflowSyncStrategy / LayoutSyncStrategy / AgentSyncStrategy
+    ├─► WorkflowSyncAdapter / LayoutSyncAdapter / AgentSyncAdapter
+    ├─► SyncToEnvironmentUseCase —— V2 工作流同步核心
+    ├─► LayoutSyncToEnvironmentUseCase
+    ├─► SyncAgentToEnvironment
+    ├─► UpsertWorkflowUseCase
+    ├─► ParseEventRequest —— 发送链路入口
+    ├─► RunJob —— 发送链路执行
+    └─► Dashboard PublishButton / PublishModal —— 仅调用 V2 API
+
+  ⚠️  半隔离场景:
+    └─► 若某工作流被 V1 修改并创建了 Change (enabled=false)，但未 V1 Apply:
+          V2 Diff 会直接比对 Dev 实体的最新状态（包含未发布修改）
+          V2 Publish 会直接将包含未发布修改的 Dev 实体写入 Prod
+          V1 的 Change.enabled 标记不会阻止 V2 同步
 ```
 
 ---
@@ -853,7 +939,7 @@ Dev Environment  ──────promote/apply──────►  Productio
 `RunJob.getWorkflow()` 使用了 `InMemoryLRUCacheStore.WORKFLOW`，缓存 key 为 `${environmentId}:${templateId}`。
 
 - 若模板内容原地更新（同一 templateId），旧缓存会导致短时间内使用旧版本
-- Promote 操作应配合 `InvalidateCacheService` 清理缓存
+- V2 Publish 操作应配合 `InvalidateCacheService` 清理缓存
 - **渐进切换场景下必须禁用此缓存或加版本号后缀**
 
 ### 11.2 Job 快照与模板内容不一致
@@ -864,29 +950,50 @@ Job 创建时会将模板内容嵌入 `job.step.template`，后续 SendMessage �
 - 这保证了**单条通知的原子性**（不会出现步骤 1 用旧版本、步骤 2 用新版本）
 - 但也意味着**无法对已入队通知紧急切换模板版本**
 
-### 11.3 跨环境 _parentId 断裂风险
+### 11.3 V1 _parentId 断裂风险（V1 特有）
 
-Promote 流程依赖 `_parentId` 做 Dev/Prod 消息模板 ID 映射。若 Dev 环境中新增了步骤但未先 Promote 消息模板子变更，`missingMessages` 日志会记录缺失，该步骤会被静默过滤。
+V1 Promote 流程依赖 `_parentId` 做 Dev/Prod 消息模板 ID 映射。若 Dev 环境中新增了步骤但未先 Promote 消息模板子变更，`missingMessages` 日志会记录缺失，该步骤会被静默过滤。
 
 - 关键代码: [promote-notification-template-change.usecase.ts L80-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/56-novu/apps/api/src/app/change/usecases/promote-notification-template-change/promote-notification-template-change.usecase.ts#L80-L132)
 - 风险: Prod 环境模板步骤数 < Dev 环境，且不会报错中断
+- **V2 无此风险**，因 V2 UpsertWorkflowUseCase 按 stepId 匹配并重新创建/更新步骤
 
 ### 11.4 payloadSchema 版本漂移
 
-若 Dev 环境更新了 `payloadSchema` 但未 Promote，Prod 环境仍用旧 Schema 校验。
+若 Dev 环境更新了 `payloadSchema` 但未发布（V1 Change 未 enabled / V2 未 Publish），Prod 环境仍用旧 Schema 校验。
 
 - Trigger API 在哪个环境调用，就用哪个环境的模板 Schema
 - 这是**环境隔离的设计初衷**，但需要 CI/CD 流程确保 Schema 变更与业务调用方升级同步
 
-### 11.5 ApplyChange 部分成功风险
+### 11.5 V1 ApplyChange 部分成功风险
 
-父变更 + 子变更串行执行，若子变更 A 成功、子变更 B 失败：
-- A 保持 `enabled=true`，B 被自动置回 `enabled=false`
-- 已 Promote 到目标环境的 A 变更不会被自动回滚
+父变更 + 子变更串行执行，若子变更 A 成功后子变更 B 失败：
+- A 的 Change.enabled 保持 true，B 被自动置回 false
+- 已 Promote 到目标环境的 A 变更**不会被自动回滚**
 - 需人工判断是否需要重新发布或做补偿操作
 
-### 11.6 V1 与 V2 混用的一致性风险
+### 11.6 V1 / V2 混用一致性风险（最关键）
 
-- V1 Change 是**编辑时**生成，V2 Diff 是**查询时**计算
-- 若存在 V1 未 enabled 的 Change，V2 Diff 会忽略这些变更（直接比对实体当前状态）
-- 建议统一使用 V2 流程进行环境同步，避免状态不一致
+```
+场景: 某工作流在 Dev 环境被修改
+  ├─► 产生 V1 Change (enabled=false)
+  ├─► 用户未调用 V1 Apply（Change 仍是未发布状态）
+  ├─► 用户在 Dashboard 点击 V2 Publish
+  │     └─► V2 直接比对 Dev 实体最新状态 vs Prod 实体
+  │           会把 Dev 上的修改（包括未 V1 发布的修改）全部同步到 Prod
+  │
+  └─► 结果:
+        ✅ Prod 环境已更新为最新
+        ❌ V1 Change.enabled 仍为 false（V2 不修改 Change 集合）
+        ❌ V1 Changes 列表页仍显示"待发布变更"，但内容实际上已在 Prod 生效
+```
+
+**建议**：对于 BRIDGE / NOVU_CLOUD 工作流，统一使用 V2 Environments API 进行发布管理，避免 V1/V2 混用导致的状态不一致。
+
+### 11.7 V2 Publish 无全局事务
+
+- V2 Publish 内部各 Strategy 串行执行，每个资源的同步独立
+- 若 Workflow A 同步成功、Workflow B 同步失败：
+  - Workflow A 的 Prod 变更**不会被回滚**
+  - Publish API 会抛出异常，调用方需自行处理部分成功场景
+- SyncToEnvironmentUseCase 虽有 `session` 参数（MongoDB ClientSession），但未在整个 Publish 链路中绑定事务
