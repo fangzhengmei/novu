@@ -1,455 +1,390 @@
 # Feed/Category 路由分组与 Inbox 过滤边界分析
 
+---
+
 ## 1. 路由分组概览
 
-Novu 存在两个面向 subscriber（通知中心）目前存在两套并行的 API 路由体系，加上 Feed 管理路由形成三角边界：
+Novu 面向 subscriber（通知中心）目前存在两套并行的 API 路由体系，加上 Feed 管理路由形成三角边界：
 
-| 路由前缀 | 控制器 | 职责定位 | Feed 过滤能力 |
-|---------|------|---------|------------|
-| `/widgets` | [widgets.controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/api/src/app/widgets/widgets.controller.ts) | 旧版 Notification Center | 中心 | 支持 `feedIdentifier` 过滤 |
-| `/inbox` | [inbox.controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/api/src/app/inbox/inbox.controller.ts) | 新版 Inbox API | **不支持** Feed 过滤，支持 tags/severity/data/archived/snoozed |
-| `/feeds` | [feeds.controller.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/api/src/app/feeds/feeds.controller.ts) | Feed CRUD 管理 | N/A |
+| 路由前缀 | 控制器职责 | 定位 | Feed 过滤能力 |
+|---------|----------|------|------------|
+| `/widgets` | 旧版 Notification Center | Widget | 支持 `feedIdentifier` 过滤 |
+| `/inbox` | 新版 Inbox API | Inbox | 不支持 Feed 过滤，支持 tags/severity/data/archived/snoozed |
+| `/feeds` | Feed CRUD 管理 | 管理端 | N/A |
 
 ---
 
 ## 2. Feed 与 Category（Notification Group）概念辨析
 
-### 2.1 Feed 实体定义
+### 2.1 Feed 实体
 
-Feed 实体定义在 [feed.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/feed/feed.entity.ts)：
+Feed 是消息级的物理分组，核心字段：
+- `_id`: MongoDB ObjectId，内部引用
+- `identifier`: 业务标识符，对外通过 `feedIdentifier` 查询参数传入
+- `name`: 展示名称
+- `_environmentId` / `_organizationId`: 租户边界
 
-```typescript
-export class FeedEntity {
-  _id: string;
-  name: string;
-  identifier: string;  // 业务标识符，与 name 相同
-  _environmentId: EnvironmentId;
-  _organizationId: OrganizationId;
-}
-```
+### 2.2 Notification Group 实体
 
-Feed 通过 `identifier` 字段对外暴露，用于查询时通过 `feedIdentifier 查询参数传入。
+Notification Group（即 category 概念）是工作流级的逻辑分类：
+- `_id`: MongoDB ObjectId
+- `name`: 分类名称
+- `_parentId`: 可选的父级分类（支持层级）
+- `_environmentId` / `_organizationId`: 租户边界
 
-### 2.2 Notification Group 实体定义
+### 2.3 关键区别
 
-Notification Group（即 category 概念）定义在 [notification-group.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/notification-group/notification-group/notification-group.entity.ts)：
-
-```typescript
-export class NotificationGroupEntity {
-  _id: string;
-  name: string;
-  _environmentId: EnvironmentId;
-  _organizationId: OrganizationId;
-  _parentId?: string;
-}
-```
-
-### 2.3 关键区别：
-
-| 维度 | Feed | Notification Group (Category)
+| 维度 | Feed | Notification Group (Category) |
 |-----|------|---------------------------|
-| 作用层级 | 消息/消息模板 (MessageTemplate) 级 | 工作流模板 (NotificationTemplate/Workflow) 级
-| 关联字段 | `_feedId`（Message/MessageTemplate 级 | `_notificationGroupId`（工作流模板级）
-| 面向对象 | 消息的物理分组 | 工作流的逻辑分类
-| 过滤方式 | feedIdentifier 查询参数 | 内部管理不参与消息过滤
-| 是否参与消息路由 | ✅ 是（消息入库时写入 `_feedId` | ❌ 否（仅用于工作流组织）
+| 作用层级 | 消息 / 消息模板 (MessageTemplate) 级 | 工作流模板 (Workflow/NotificationTemplate) 级 |
+| 关联字段 | `_feedId` (Message/MessageTemplate 上) | `_notificationGroupId` (工作流模板上) |
+| 面向对象 | 消息的物理分组 | 工作流的逻辑分类 |
+| 参与消息路由 | 是（入库时写入 `_feedId`） | 否（仅用于工作流组织，不参与查询） |
+| 对外过滤方式 | feedIdentifier 查询参数 | 不参与消息过滤 |
 
 ---
 
-## 3. 默认 Feed 机制
+## 3. 默认 Feed 查询匹配逻辑（按代码顺序）
 
-### 3.1 没有显式的 "默认 Feed"常量
+### 3.1 唯一的 Feed 查询入口：getFilterQueryForMessage
 
-系统中 **不存在** `DEFAULT_FEED` 常量。默认行为通过查询参数的缺失/null 分支实现。
+所有旧版 `/widgets` 相关的消息查询（列表、计数、Feed Count）最终都调用同一个方法 `getFilterQueryForMessage`。该方法对 `feedId` 参数的处理是唯一的权威逻辑。
 
-### 3.2 过滤逻辑在 [message.repository.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/message/message.repository.ts#L182-L199) 的 `getFilterQueryForMessage` 方法：
+代码分支顺序如下：
 
-```typescript
-// feedId === null 时：
-if (query.feedId === null) {
-  requestQuery._feedId = { $eq: null };  // 查询 _feedId 为空的消息
-}
+```
+分支 1: query.feedId === null
+    → requestQuery._feedId = { $eq: null }
 
-// feedId 存在时：
-if (query.feedId) {
-  const feeds = await this.feedRepository.find(
-    { _environmentId: environmentId, identifier: { $in: query.feedId }, '_id');
-  requestQuery._feedId = { $in: feeds.map((feed) => feed._id) };
-}
+分支 2: query.feedId (truthy)
+    → SELECT _id FROM Feed WHERE identifier IN (...)
+    → requestQuery._feedId = { $in: [feed._id ...] }
 
-// feedId 为 undefined 时：
-// 不添加任何 _feedId 过滤（查询所有 Feed
+分支 3: query.feedId === undefined
+    → 不添加任何 _feedId 条件
 ```
 
-### 3.3 三种查询语义边界
+### 3.2 MongoDB `{ $eq: null }` 的匹配语义
 
-| feedId 参数值 | MongoDB 查询条件 | 含义
-|-----------|--------------|------
-| `undefined` (不传) | 无 `_feedId` 条件 | 返回所有 Feed，包括有 feed 的消息
-| `null` | `_feedId: { $eq: null }` 仅查询未分配任何 Feed 的消息
-| `string[]` | `_feedId: { $in: [...] }` 仅查询指定 Feed 的消息
+**这是全文档结论一致性的基础。** MongoDB 中 `{ field: { $eq: null } }` 同时匹配：
+
+1. 字段不存在（`$exists: false`）
+2. 字段值为 BSON Null（Type 10）
+
+该语义与 MQL 简写 `{ field: null }` 完全等价。此结论由 snoozed 查询的两个不同写法印证：
+- `getFilterQueryForMessage` 中用 `$or: [{ $exists: false }, { snoozedUntil: null }]`
+- `paginate` 中用 `snoozedUntil: { $eq: null }`
+两者在 MongoDB 层结果集完全相同。
+
+### 3.3 三种查询参数值对应的实际语义
+
+| feedId 参数值 | 产生的 MongoDB 查询条件 | 匹配的 `_feedId` 状态 | 含义 |
+|-----------|---------------------|--------------------|------|
+| `undefined`（不传） | 无 `_feedId` 条件 | 任意（有值 / null / 缺失） | 返回所有消息，不区分 Feed |
+| `null` | `_feedId: { $eq: null }` | 字段缺失 **或** 值为 null | 返回所有未分配任何 Feed 的消息 |
+| `string[]` | `_feedId: { $in: [feed._ids] }` | 等于某指定 Feed 的 ObjectId | 仅返回指定 Feed 的消息 |
+
+### 3.4 调用方参数传递对照
+
+| 上层 usecase / 接口 | feedId 来源 | 传入值 | 命中分支 |
+|-------------------|-----------|--------|---------|
+| `/widgets/notifications/feed` 无 feedIdentifier | 未传 → feedsQuery = undefined | undefined | 分支 3（全部） |
+| `/widgets/notifications/feed` 带 feedIdentifier | query.feedIdentifier → 数组 | string[] | 分支 2（指定 Feed） |
+| `/widgets/feed/count` 无 feedIdentifier | 同上 | undefined | 分支 3（全部） |
+| `/widgets/feed/count` 带 feedIdentifier | 同上 | string[] | 分支 2（指定 Feed） |
+| `/widgets/notifications` 旧端点 | dto.feedIdentifier? 未传 | undefined | 分支 3（全部） |
+| `/inbox/*` 新端点 | paginate() **无 feedId 参数** | N/A（永远分支 3 语义） | 全部 |
+
+关键结论：**新版 `/inbox` API 所在的 `paginate()` 方法根本没有 `feedId` 参数，也不会在查询中添加任何 `_feedId` 条件。因此 `/inbox` 接口天然等同于旧 API 中 feedId 未传的语义——即全部消息。**
 
 ---
 
-## 4. 通知入库逻辑
+## 4. 通知入库逻辑（写入链路）
 
-### 4.1 消息创建链路
+### 4.1 消息入库的唯一 Feed 赋值点
 
-消息入库的核心链路在 [send-message-in-app.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts#L218-L241)：
+In-App 消息发送 usecase 中，创建消息时 `_feedId` 直接复制自步骤模板：
 
 ```typescript
-// 创建消息时，_feedId 直接从 step.template._feedId 传递：
 message = await this.messageRepository.create({
   _notificationId: command.notificationId,
-  _feedId: step.template._feedId,  // ← 来自消息模板
+  _feedId: step.template._feedId,  // ← 来自 MessageTemplate._feedId
   channel: ChannelTypeEnum.IN_APP,
   // ...其他字段
 });
 ```
 
-### 4.2 Feed 来源追溯
+不存在任何二次计算或默认值兜底逻辑。`_feedId` 的值完全由步骤模板决定。
 
-`_feedId` 的来源层级链路：
+### 4.2 模板层 Feed 的写入链路
 
-```
-Feed (DB: 工作流步骤模板 (Workflow Step MessageTemplate._feedId
-  └── MessageTemplate._feedId (消息模板
-      └── Message._feedId (最终存储
-```
+模板的 `_feedId` 字段写入存在三处关键路径：
 
-### 4.3 Feed 变更同步
-
-当更新消息模板的 `_feedId` 变更时，会同步更新历史消息，在 [update-message-template.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/application-generic/src/usecases/message-template/update-message-template/update-message-template.usecase.ts#L134-L140)：
-
+**路径 A — 创建消息模板：**
 ```typescript
-if (command.feedId || (!command.feedId && existingTemplate._feedId) {
-  await this.messageRepository.updateFeedByMessageTemplateId(
-    command.environmentId,
-    command.templateId,
-    command.feedId
-  );
+_feedId: command.feedId ? command.feedId : null,
+```
+- `command.feedId` 有效 → 写入指定 ObjectId
+- 其他任何 falsy 值（undefined/null/空串）→ 显式写入 **`null`**
+
+**路径 B — 设置/变更 Feed（更新消息模板）：**
+```typescript
+if (command.feedId) {
+  updatePayload._feedId = command.feedId;  // $set 新值
 }
 ```
+
+**路径 C — 移除 Feed（更新消息模板）：**
+```typescript
+if (!command.feedId && existingTemplate._feedId) {
+  unsetPayload._feedId = '';  // $unset → 删除字段
+}
+```
+
+### 4.3 写入值的最终数据库状态对照表
+
+| 操作场景 | 模板层 `MessageTemplate._feedId` | 关联消息层 `Message._feedId` |
+|---------|--------------------------------|---------------------------|
+| Feed 机制引入前创建 | 字段缺失 | 字段缺失 |
+| 新模板不指定 Feed | 值为 `null` | 值为 `null`（随发送时复制） |
+| 新模板指定 Feed | 值为 ObjectId | 值为 ObjectId（随发送时复制） |
+| 更新模板：设置 Feed | `$set` → 新 ObjectId | `updateFeedByMessageTemplateId` → `$set` 新 ObjectId |
+| 更新模板：移除 Feed | `$unset` → **字段被删除** | `updateFeedByMessageTemplateId` → `$set: undefined` → **值为 null** |
+
+### 4.4 写入状态与查询分支的一致性验证
+
+将写入状态与查询分支 1（`{ $eq: null }`）匹配情况对照：
+
+| 写入状态 | `{ $eq: null }` 是否命中 | 说明 |
+|---------|------------------------|------|
+| 字段缺失（旧模板/旧消息） | ✅ 是 | 分支 1 全部覆盖 |
+| 值为 `null`（新模板未指定） | ✅ 是 | 分支 1 全部覆盖 |
+| 值为 ObjectId（指定了 Feed） | ❌ 否 | 必须分支 2 的 `$in` 才能命中 |
+| 字段被删除（模板层移除后） | ✅ 是 | 分支 1 覆盖 |
+
+**一致性结论：** 虽然模板层和消息层在"移除 Feed"场景下分别使用了 `$unset` 和 `$set null`，导致底层存储形态不同（字段缺失 vs 值为 null），但查询端统一使用 `{ $eq: null }`，两种形态均被正确覆盖，不会产生结果集偏差。
 
 ---
 
 ## 5. 两套查询接口差异分析
 
-### 5.1 `/widgets/notifications/feed 旧接口
-
-[get-notifications-feed.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/api/src/app/widgets/usecases/get-notifications-feed/get-notifications-feed.usecase.ts#L52-L61)
+### 5.1 旧接口 `/widgets/*` → getFilterQueryForMessage → find / getCount
 
 调用链：
-- `messageRepository.findBySubscriberChannel()
-- **支持** `feedId` 过滤
-- 支持 `seen`/`read` 状态过滤
-- 支持 `payload` 过滤
-- **不支持** tags/severity/archived/snoozed/data 过滤
+- `findBySubscriberChannel()` → 列表
+- `getCount()` → 计数
+- 两者共用 `getFilterQueryForMessage()`
 
-### 5.2 `/inbox/notifications 新接口
+能力矩阵：
 
-[get-notifications.usecase.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/apps/api/src/app/inbox/usecases/get-notifications/get-notifications.usecase.ts#L57-L78)
+| 过滤维度 | 支持情况 | 备注 |
+|---------|---------|------|
+| feedId | ✅ | 三态分支（见第 3 节） |
+| seen | ✅ | 默认 `$in: [true, false]` |
+| read | ✅ | 默认 `$in: [true, false]` |
+| payload | ✅ | 扁平展开后 AND 匹配 |
+| tags / tagGroups | ✅ | OR 组 AND 逻辑 |
+| archived | ✅ | 默认 `$in: [true, false]` |
+| snoozed | ✅ | 用 `snoozedUntil` 字段判断 |
+| severity | ✅ | NONE 值含字段缺失 |
+| data | ✅ | 与 payload 类似但走 data 字段 |
+| contextKeys | ✅ | `buildContextExactMatchQuery`（`contextKeys !== undefined` 时启用） |
+| 时间范围 (createdAt) | ✅ | `getCount` 有参数，`findBySubscriberChannel` 未暴露 |
+
+### 5.2 新接口 `/inbox/*` → paginate()
 
 调用链：
-- `messageRepository.paginate()`
-- **不支持** `feedId` 过滤
-- 支持 `tags`/`severity`/`archived`/`snoozed`/`data` 过滤
-- 支持 `createdGte`/`createdLte` 时间范围
-- 支持 contextKeys 上下文隔离
+- `paginate()` → 游标分页
+- 该方法内部**完全独立**构建查询，不经过 `getFilterQueryForMessage`
+
+能力矩阵：
+
+| 过滤维度 | 支持情况 | 备注 |
+|---------|---------|------|
+| feedId | ❌ | paginate 参数无 feedId，也未构建相关条件 |
+| seen | ✅ | 默认 `$in: [true, false]` |
+| read | ✅ | 默认 `$in: [true, false]` |
+| payload | ❌ | 未实现 |
+| tags / tagGroups | ✅ | 同旧接口 mergeTagsMongoFragment |
+| archived | ✅ | 默认 `$in: [true, false]` |
+| snoozed | ✅ | `{ $eq: null }` / `{ $exists: true, $ne: null }` |
+| severity | ✅ | NONE 值含字段缺失 |
+| data | ✅ | buildDataFilterQuery |
+| contextKeys | ✅ | `buildContextExactMatchQuery`（`contextKeys !== undefined` 时启用） |
+| 时间范围 (createdAt) | ✅ | createdGte / createdLte |
 
 ### 5.3 功能矩阵对比
 
-| 过滤维度 | `/widgets` (旧) | `/inbox` (新)
-|---------|------------------|---------------|
-| feedId | ✅ 支持 | ❌ 不支持
-| tags | ❌ 不支持 | ✅ 支持
-| severity | ❌ 不支持 | ✅ 支持
-| archived | ❌ 不支持 | ✅ 支持
-| snoozed | ❌ 不支持 | ✅ 支持
-| data | ❌ 不支持 | ✅ 支持
-| seen/read | ✅ 支持 | ✅ 支持
-| payload | ✅ 支持 | ❌ 不支持（用 data 替代)
-| contextKeys | ❌ 不支持 | ✅ 支持
-| 时间范围 | ❌ 支持 | ✅ 支持
+| 过滤维度 | `/widgets` (旧) | `/inbox` (新) |
+|---------|----------------|---------------|
+| feedId | ✅ 三态分支 | ❌ 完全不支持 |
+| payload 过滤 | ✅ | ❌ |
+| tags | ✅ | ✅ |
+| severity | ✅ | ✅ |
+| archived | ✅ | ✅ |
+| snoozed | ✅ | ✅ |
+| data 过滤 | ✅ | ✅ |
+| seen / read | ✅ | ✅ |
+| contextKeys | ✅（但 usecase 层未传递） | ✅（usecase 层已传递） |
+| 时间范围 | ✅（仅计数） | ✅（列表） |
+
+**一致性校验点：** snoozed=false 处理的两种写法结果集一致。
+- 旧接口：`$or: [{ snoozedUntil: { $exists: false } }, { snoozedUntil: null }]`
+- 新接口：`snoozedUntil: { $eq: null }`
+- 根据 MongoDB 语义，两者完全等价。
 
 ---
 
-## 6. 权限边界
+## 6. 权限边界与上下文隔离
 
-### 6.1 认证方式认证
+### 6.1 认证方式
 
-两套接口都使用 `AuthGuard('subscriberJWT 认证
-- 两者都基于 subscriberJWT 认证
+两套接口均使用 subscriberJWT 认证。通过 `AuthGuard('subscriberJWT')` 验证 subscriber 身份。
 
-### 6.2 上下文隔离 (contextKeys)
+### 6.2 contextKeys 隔离实现：buildContextExactMatchQuery
 
-上下文隔离机制在 [base-repository.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/base-repository.ts#L74-L111) 实现 `buildContextExactMatchQuery()`：
+代码分支如下：
 
-```typescript
-// contextKeys === undefined 或 [] 时：
-return {
-  $or: [
-    { contextKeys: { $exists: false } },  // 兼容旧数据（无 contextKeys 字段
-    { contextKeys: [] }                    // 新数据（空数组）
-  ]
-};
+```
+分支 1: contextKeys === undefined OR contextKeys.length === 0
+    → {
+        $or: [
+          { contextKeys: { $exists: false } },  // 兼容旧数据（无字段）
+          { contextKeys: [] }                   // 新数据（显式空数组）
+        ]
+      }
 
-// contextKeys 有值时：
-return {
-  contextKeys: { $all: sortedKeys, $size: sortedKeys.length }
-};
+分支 2: contextKeys 长度 > 0
+    → { contextKeys: { $all: sortedKeys, $size: sortedKeys.length } }
+    → 精确集合匹配：键完全相同（与顺序无关）
 ```
 
 ### 6.3 权限边界对比
 
-| 权限维度 | `/widgets` | `/inbox`
-|---------|----------|---------
-| subscriberJWT 认证 | ✅ | ✅
-| contextKeys 上下文隔离 | ❌ 未使用 | ✅ 全面使用
-| environmentId 强制过滤 | ✅ | ✅
-| subscriberId 强制过滤 | ✅ | ✅
+| 权限维度 | `/widgets` | `/inbox` |
+|---------|----------|---------|
+| subscriberJWT 认证 | ✅ | ✅ |
+| environmentId 强制过滤 | ✅ | ✅ |
+| subscriberId 强制过滤 | ✅ | ✅ |
+| contextKeys 隔离（底层能力） | ✅ 方法支持 | ✅ 方法支持 |
+| contextKeys 隔离（usecase 传递） | ❌ 未传递 | ✅ 已传递 |
 
-关键问题：`/widgets` 接口未传递 contextKeys，可能导致跨上下文数据泄露。
+**实际效果：** 旧 `/widgets` 接口虽然 `getFilterQueryForMessage` 方法支持 contextKeys 参数，但调用 usecase 未传递，所以执行时始终落入分支 1（`undefined` → 匹配 `$exists:false` + `[]`），即无法按上下文隔离。新 `/inbox` 接口从 session usecase 获取 contextKeys 并透传，能正确执行分支 2。
+
+### 6.4 contextKeys 与 feedId 在查询中的组合逻辑
+
+由于旧接口两条分支互不在对方的判断逻辑中（feedId 在方法开头，contextKeys 在方法中段、通过 `$and` 追加），两者用 `$and` 组合时独立生效，不会互相干扰。
+
+例如：`feedId=null` + `contextKeys=undefined` →
+```
+AND (
+  _feedId: { $eq: null },
+  $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
+)
+```
 
 ---
 
-## 7. 迁移兼容逻辑
+## 7. 迁移兼容逻辑汇总
 
-### 7.1 Feed 字段兼容
+### 7.1 `_feedId` 字段兼容
 
-`message.entity.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/message/message.entity.ts#L111)：
+- Schema 层：`_feedId` 为可选属性，默认 undefined（不写入）
+- 创建层：新模板未指定 Feed 时显式写入 `null`
+- 查询层：`{ $eq: null }` 同时匹配"字段缺失"和"值为 null"
+- 结论：新旧数据混合不会产生查询偏差
 
-```typescript
-_feedId?: string;  // 可选字段，兼容历史消息可能为 undefined
-```
+### 7.2 `contextKeys` 字段兼容
 
-### 7.2 contextKeys 兼容
+- Schema 层：`contextKeys` 默认 undefined（不写入）
+- 查询层：`contextKeys === undefined` 分支通过 `$or` 同时匹配"字段不存在"和"空数组"
+- 结论：新旧数据混合不会产生查询偏差
 
-`message.schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/58-novu/libs/dal/src/repositories/message/message.schema.ts#L153-L156)：
+### 7.3 `severity` 字段兼容
 
-```typescript
-contextKeys: {
-  type: [Schema.Types.String],
-  default: undefined,  // 默认 undefined，兼容旧数据无此字段
-}
-```
+- NONE 分支：`$or: [{ severity: { $exists: false } }, { severity: { $in: [...] } }]`
+- 与 `_feedId` 和 `contextKeys` 模式一致：字段缺失按"最低等级 None"处理
 
-### 7.3 数据迁移策略
+### 7.4 `snoozedUntil` 字段兼容
 
-1. **Feed 迁移策略：
-- Feed 引入前创建的消息 `_feedId` 为 `null/undefined
-- 查询时 feedId===null 专门查询这批历史未分配 Feed 的消息
+- snoozed=false 分支：`$or: [{ $exists: false }, { snoozedUntil: null }]`（旧接口）或 `{ $eq: null }`（新接口）
+- 语义等价，新旧消息一致
 
-2. **contextKeys 迁移策略：
-- contextKeys 引入前创建的消息 `contextKeys` 字段不存在
-- 查询时 contextKeys===undefined 时使用 `$or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]` 同时匹配两种形态
+**迁移兼容模式一致性结论：** 四个字段（`_feedId`, `contextKeys`, `severity`, `snoozedUntil`）的迁移兼容策略完全对齐——即字段不存在与显式空值在查询中等价。这是代码库中明确的统一设计模式。
 
 ---
 
-## 8. 边界模糊点汇总
+## 8. 旧 Inbox 客户端清空 ContextKeys 的兼容分支
 
-### 8.1 Feed/Category 边界混淆问题：
-1. **Feed vs Notification Group (Category) 是两个独立概念但命名上容易混淆
-2. `/widgets` 支持 Feed 过滤但不支持 contextKeys，反之亦然
-3. 新老接口功能不对等导致功能重叠但功能矩阵
+### 8.1 背景
 
-### 8.2 风险点：
-- 两套接口功能不统一
-- `/widgets` 缺少 contextKeys 可能导致跨上下文风险
-- `/inbox` 缺少 Feed 过滤导致无法按 Feed 分组查询
-- 默认 Feed 语义不明确（undefined vs null 语义差异
+从 `@novu/js` v3.13.0 起，Inbox SDK 在创建订阅标识符时自动携带 `:ctx_` 前缀以支持上下文隔离。旧版本客户端不生成此前缀，如果服务端仍然按 JWT 中的 contextKeys 创建订阅标识符，新旧客户端的标识符不一致，导致偏好查找失败。
 
-### 8.3 建议澄清：
-1. 统一 `/widgets` 和 `/inbox` 功能对齐
-2. 明确默认 Feed 的官方语义定义
-3. 统一 Feed 过滤和 Category 概念边界
-4. 补齐 `/inbox` 的 Feed 过滤能力
-5. 补齐 `/widgets` 的 contextKeys 隔离
+### 8.2 拦截器核心逻辑
 
----
+```
+shouldDisableContextForOldClient(clientVersion):
+  1. 解析 "Novu-Client-Version" 头（格式 @novu/js@x.y.z）
+  2. 无版本头 → 旧客户端 → 禁用（返回 true）
+  3. < 3.13.0 → 旧客户端 → 禁用（返回 true）
+  4. ≥ 3.13.0 → 新客户端 → 保留（返回 false）
 
-## 9. 消息模板创建时默认 Feed 的写入值
-
-### 9.1 创建路径：显式 `null`
-
-消息模板创建逻辑在 `CreateMessageTemplate.execute()` 中：
-
-```typescript
-_feedId: command.feedId ? command.feedId : null,
+intercept():
+  1. 若 contextKeys 本就为空 → 直接放行
+  2. 若是旧客户端 → subscriberSession.contextKeys = undefined
+  3. 否则 → 保留原值
 ```
 
-关键行为：当 `command.feedId` 为 `undefined`、空字符串、`null` 或其他 falsy 值时，一律写入 **`null`**。不存在"不写入"的中间态。
+### 8.3 拦截范围
 
-### 9.2 写入值的三态分析
-
-| `command.feedId` 值 | 写入 `_feedId` | MongoDB 实际存储 |
-|---------------------|---------------|-----------------|
-| `"660a1b..."` (有效 ObjectId) | `"660a1b..."` | ObjectId 引用 |
-| `undefined` (不传) | `null` | `null` |
-| `null` | `null` | `null` |
-| `""` (空字符串) | `null` | `null` |
-
-这意味着：**新创建的 In-App 消息模板，如果不指定 feed，其 `_feedId` 一定是 `null`，而非字段缺失。**
-
-### 9.3 与历史数据的语义差异
-
-| 数据来源 | `_feedId` 存储值 | 查询 `feedId === null` 是否命中 |
-|---------|-----------------|-------------------------------|
-| Feed 引入前创建的旧消息 | 字段不存在（`$exists: false`） | ❌ 不命中 |
-| 新创建（未指定 Feed） | `null` | ✅ 命中 |
-| 新创建后移除 Feed（见第 10 节） | `null` | ✅ 命中 |
-
-`getFilterQueryForMessage` 中 `query.feedId === null` 分支使用 `{ $eq: null }`，此条件同时匹配字段缺失和值为 `null` 的文档，因此实际上新旧数据均被覆盖。
-
-### 9.4 widgets 控制器中的 `feedIdentifier` 传递
-
-在 `widgets.controller.ts` 的 `getNotificationsFeed` 方法中：
-
-```typescript
-let feedsQuery: string[] | undefined;
-if (query.feedIdentifier) {
-  feedsQuery = Array.isArray(query.feedIdentifier) ? query.feedIdentifier : [query.feedIdentifier];
-}
-```
-
-当客户端不传 `feedIdentifier` 时，`feedsQuery` 为 `undefined`，直接传入 `getNotificationsFeedCommand.feedId = undefined`。此值最终到达 `getFilterQueryForMessage` 的 `query.feedId` 参数，由于既非 `null` 也非 truthy，不触发任何 `_feedId` 条件，即 **返回所有 Feed 的消息**。
-
----
-
-## 10. 移除 Feed 后模板与历史消息同步的不同点
-
-### 10.1 更新模板的两条路径
-
-`UpdateMessageTemplate.execute()` 对 Feed 变更的处理分两种场景：
-
-**场景 A — 设置 Feed（`command.feedId` 有值）：**
-
-```typescript
-if (command.feedId) {
-  updatePayload._feedId = command.feedId;  // $set 操作
-}
-```
-
-MongoDB 操作：`{ $set: { _feedId: "660a1b..." } }` — 将字段设为新 ObjectId。
-
-**场景 B — 移除 Feed（`command.feedId` 为 falsy，但模板原 `_feedId` 存在）：**
-
-```typescript
-if (!command.feedId && existingTemplate._feedId) {
-  unsetPayload._feedId = '';  // $unset 操作
-}
-```
-
-MongoDB 操作：`{ $unset: { _feedId: '' } }` — **删除字段**，而非设为 `null`。
-
-### 10.2 关键差异：模板层 vs 消息层的 Feed 同步
-
-无论场景 A 还是 B，同步到历史消息时调用的是同一个方法：
-
-```typescript
-if (command.feedId || (!command.feedId && existingTemplate._feedId)) {
-  await this.messageRepository.updateFeedByMessageTemplateId(
-    command.environmentId,
-    command.templateId,
-    command.feedId   // 场景 B 时为 undefined
-  );
-}
-```
-
-`updateFeedByMessageTemplateId` 的实现：
-
-```typescript
-async updateFeedByMessageTemplateId(environmentId: string, messageId: string, feedId?: string | null) {
-  return this.update(
-    { _environmentId: environmentId, _messageTemplateId: messageId },
-    { $set: { _feedId: feedId } }   // 始终用 $set
-  );
-}
-```
-
-### 10.3 不同点汇总
-
-| 操作 | 模板层 (MessageTemplate) | 消息层 (Message) |
-|------|------------------------|-----------------|
-| 设置 Feed | `$set: { _feedId: ObjectId }` | `$set: { _feedId: ObjectId }` |
-| 移除 Feed | `$unset: { _feedId: '' }` (字段被删除) | `$set: { _feedId: undefined }` (字段设为 null) |
-| 移除后的存储状态 | `_feedId` 字段不存在 | `_feedId` 值为 `null` |
-
-这种不一致会导致：
-
-- 模板文档中 `_feedId` 字段不存在（`$exists: false`）
-- 关联消息文档中 `_feedId` 值为 `null`
-- 两者在语义上等价（均表示"未分配 Feed"），但在 MongoDB 查询中行为不同：`{ _feedId: null }` 同时匹配字段缺失和值为 null，而 `{ _feedId: { $eq: null } }` 也同时匹配两者
-- **实际查询不会出错**，因为 `getFilterQueryForMessage` 使用 `$eq: null`，但底层存储形态不一致，未来若引入严格等值匹配（如索引查询）可能产生差异
-
----
-
-## 11. 旧 Inbox 客户端清空 ContextKeys 的兼容分支
-
-### 11.1 问题背景
-
-从 `@novu/js` v3.13.0 起，Inbox SDK 在创建订阅标识符时会自动携带 `:ctx_` 前缀以支持上下文隔离。旧版本客户端不会生成此前缀，但 JWT 中可能已包含 `contextKeys`。如果服务端仍然按 contextKeys 创建订阅，则新旧客户端生成的标识符不一致，导致偏好查找失败。
-
-### 11.2 兼容拦截器实现
-
-`ContextCompatibilityInterceptor` 定义在 `inbox/interceptors/context-compatibility.interceptor.ts`：
-
-```typescript
-function shouldDisableContextForOldClient(clientVersion?: string): boolean {
-  const version = parseClientVersion(clientVersion);
-  if (!version) {
-    return true;  // 无版本头 = 旧客户端，禁用 context
-  }
-  return !isContextAwareVersion(version);  // < 3.13.0 也禁用
-}
-
-intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
-  const subscriberSession = request.user;
-  if (!subscriberSession?.contextKeys || subscriberSession.contextKeys.length === 0) {
-    return next.handle();  // 本身无 contextKeys，无需处理
-  }
-  if (shouldDisableContextForOldClient(clientVersion)) {
-    subscriberSession.contextKeys = undefined;  // 清空 contextKeys
-  }
-  return next.handle();
-}
-```
-
-### 11.3 拦截范围
-
-| 控制器 | 拦截方式 | 拦截粒度 |
+| 控制器 | 拦截方式 | 应用粒度 |
 |-------|---------|---------|
-| `InboxController` | 方法级 `@UseInterceptors(ContextCompatibilityInterceptor)` | 仅 `PATCH /inbox/subscriptions/:subscriptionIdentifier/preferences/:workflowIdOrIdentifier` |
-| `InboxTopicController` | 类级 `@UseInterceptors(ContextCompatibilityInterceptor)` | 该控制器下所有端点 |
+| InboxController | 方法级装饰 | 仅 `PATCH /inbox/subscriptions/:subscriptionIdentifier/preferences/:workflowIdOrIdentifier`（订阅偏好更新写操作） |
+| InboxTopicController | 类级装饰 | 该控制器下所有端点 |
 
-`InboxController` 中仅有一个端点（订阅偏好更新）应用了此拦截器，其余端点（通知列表、计数、标记等）未拦截，因为这些端点本身需要 contextKeys 来正确过滤数据。
+### 8.4 清空后的查询行为（与第 6 节的衔接）
 
-### 11.4 兼容分支的三种情况
+当 `contextKeys` 被设为 `undefined` 后，在 `buildContextExactMatchQuery` 中落入分支 1：
 
-| 客户端状态 | `Novu-Client-Version` 头 | `contextKeys` 处理 | 行为 |
-|-----------|--------------------------|-------------------|------|
-| 新客户端 (≥ 3.13.0) | `@novu/js@3.13.0` | 保持原值 | 正常上下文隔离 |
-| 旧客户端 (< 3.13.0) | `@novu/js@3.0.0` | 设为 `undefined` | 退回无上下文模式 |
-| 无版本头 | 不传 | 设为 `undefined` | 退回无上下文模式 |
-
-### 11.5 清空 contextKeys 后的查询行为
-
-当 `contextKeys` 被设为 `undefined` 后，在 `buildContextExactMatchQuery` 中：
-
-```typescript
-if (contextKeys === undefined || contextKeys.length === 0) {
-  return {
-    $or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }],
-  };
-}
+```
+$or: [{ contextKeys: { $exists: false } }, { contextKeys: [] }]
 ```
 
-这意味着旧客户端会看到所有"无上下文"的消息和偏好数据，不会看到带上下文隔离的数据。这对旧客户端是安全的，因为旧客户端本身不理解上下文概念。
+效果：旧客户端仅能看到所有"无上下文"的消息和偏好数据，无法看到任何带上下文隔离的数据。这与旧客户端对上下文概念无知的状态一致。
 
-### 11.6 潜在风险
+### 8.5 防漏双层保障
 
-1. **写操作遗漏**：拦截器仅覆盖订阅偏好的写操作端点。如果旧客户端通过其他写路径（如 `PATCH /inbox/preferences`）修改偏好，这些路径未拦截，可能导致在新上下文下写入旧格式的偏好数据。
+1. **Session 创建层（第一道防线）**：`session.usecase` 的 `resolveContexts` 仅在请求体有 `context` 字段时才解析。旧客户端不会发送此字段 → JWT 中 `contextKeys` 为空数组 → 拦截器不触发。
+2. **拦截器（第二道防线）**：即使某些路径下旧客户端的 JWT 包含了 contextKeys，拦截器也会在偏好更新端点将其清空，避免在旧格式的订阅标识符下写入带上下文的偏好数据。
 
-2. **读操作不拦截**：`GET /inbox/notifications` 等读操作不应用此拦截器。如果 JWT 中包含 contextKeys，旧客户端仍然只能看到该上下文的数据——但这与旧客户端预期一致（旧客户端获取的 JWT 本身就不应包含 contextKeys，因为 session 创建时旧客户端不会传递 context 参数）。
+---
 
-3. **Session 创建的防线**：在 `session.usecase.ts` 中，`resolveContexts` 方法仅在客户端请求体包含 `context` 字段时才解析上下文。旧客户端不会发送此字段，因此其 JWT 中 `contextKeys` 为空数组，拦截器不会触发清空逻辑——这构成了第一道防线。
+## 9. 边界模糊点与建议
+
+### 9.1 Feed / Category 概念边界
+
+| 风险点 | 说明 |
+|-------|------|
+| 命名歧义 | Feed 和 Notification Group（Category）都含"分组/分类"含义，容易在 API 文档和业务沟通中混淆 |
+| 对外过滤差异 | Feed 参与消息查询过滤，Category 不参与，但在管理端界面中二者呈现方式相似 |
+
+### 9.2 两套接口功能不对等
+
+| 风险点 | 说明 |
+|-------|------|
+| Feed 过滤缺失 | `/inbox` 新接口不支持 feed 过滤，历史上依赖 Feed 分组的客户端迁移到新接口时能力下降 |
+| contextKeys 未传递 | `/widgets` 旧接口底层方法支持 contextKeys，但 usecase 层未传递，在多上下文场景下可能泄漏跨上下文数据 |
+| payload vs data | 旧接口用 payload 过滤，新接口用 data 过滤，二者字段位置不同（payload vs data），迁移时需注意 |
+
+### 9.3 移除 Feed 时存储形态不一致
+
+虽然查询结果一致，但模板层用 `$unset` 删除字段、消息层用 `$set: undefined` 写 null 的不一致可能引发：
+- 数据一致性审计时误判
+- 未来引入严格索引或类型校验时产生差异
+
+### 9.4 建议澄清
+
+1. 明确 Feed vs Notification Group 的官方定位文档：Feed 是**消息路由分组**，Category 是**工作流分类标签**
+2. 统一 `/widgets` 和 `/inbox` 能力：补齐 `/inbox` 的 feedId 过滤，补齐 `/widgets` 的 contextKeys 传递
+3. 统一移除 Feed 操作：模板层也改为 `$set: null` 而非 `$unset`，保持存储形态一致
+4. 在 API 文档中明确"默认 Feed"三种参数状态的语义：不传（全量）/ null（无 Feed）/ 指定（指定 Feed）
