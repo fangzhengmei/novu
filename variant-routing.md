@@ -178,24 +178,38 @@ return { messageTemplate: command.step.template };
 
 ### 3.3 变量归一化：NormalizeVariables
 
-[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts) 在条件评估前准备所有必要数据：
+[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts) 在条件评估前准备所有必要数据。
+
+> **重要**：`NormalizeVariables` 的触发实际是否真的执行"按需加载"，取决于其**调用方是否已经在 `command.variables` 中传入了 subscriber/tenant 等数据**。在不同的使用场景下，行为完全不同（详见第 8 章）。
 
 ```typescript
 async execute(command) {
-  // 合并 step 及其所有 variants 的 filters，统一判断需要哪些变量
+  // 内部自行合并 Step 自身 + 所有 Variants 的 filters
+  // 注意：这里使用的是 command.step（含 command.step.variants 隐式的所有 filters 合并）
+  //       command.filters 参数在此方法中完全未被使用！
   const combinedFilters = [command.step, ...(command.step?.variants || [])]
     .flatMap(variant => variant?.filters ?? []);
 
-  // 按需从 DB 加载 subscriber（仅当存在 subscriber / isOnline / isOnlineInLast / previousStep 类型 filter）
+  // 合并后的 filters 传给 fetchSubscriberIfMissing / fetchTenantIfMissing
+  // 注：仅当 combinedFilters 中存在 on=SUBSCRIBER / on=TENANT 的子条件，
+  //     且 command.variables.subscriber/tenant 未提供时，才实际查 DB
   filterVariables.subscriber = await this.fetchSubscriberIfMissing(command, combinedFilters);
-
-  // 按需从 DB 加载 tenant（仅当存在 tenant 类型 filter）
   filterVariables.tenant = await this.fetchTenantIfMissing(command, combinedFilters);
 
-  // payload 直接取自 job 或 command
+  // payload / step / actor / context 直接从 command.variables 取
   filterVariables.payload = command.variables?.payload ?? command.job?.payload;
+  filterVariables.step    = command.variables?.step    ?? undefined;
+  filterVariables.actor   = command.variables?.actor   ?? undefined;
+  filterVariables.context = command.variables?.context ?? undefined;
 }
 ```
+
+**关键设计**：`combinedFilters` 的构建完全依赖 `command.step + command.step.variants`，**不使用 `command.filters` 参数**。这意味着：
+
+- **触发范围是 Step + 所有 Variants 全部 filters 的并集**——只要 Step 或**任意一个** Variant 中存在 `on=SUBSCRIBER` 条件，就会触发 subscriber 的按需加载（在未提前提供 `variables.subscriber` 的场景下）
+- **与当前正在评估的 Variant 无关**：例如 Step 有 A、B 两个 Variant，A 的 filters 有 subscriber 条件，B 没有。即使当前只评估 B，由于 combinedFilters 包含 A 的 filters，subscriber 仍会被按需加载（在 Digest/Delay 场景）
+
+`fetchSubscriberIfMissing` 中**只检查 `on === FilterPartTypeEnum.SUBSCRIBER`**，不包含 IS_ONLINE / IS_ONLINE_IN_LAST / PREVIOUS_STEP。
 
 归一化产生的 `IFilterVariables` 结构（[filter-processing-details.ts](libs/application-generic/src/utils/filter-processing-details.ts#L5-L17)）：
 
@@ -508,25 +522,6 @@ private async getWebhookResponse(child, variables, command) {
 - `child.webhookUrl`：外部服务地址
 - HMAC 算法：`createHash(decryptApiKey(environment.apiKeys[0].key), environmentId)`（[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L290-L307)）
 
-### 6.4 引用型过滤在 NormalizeVariables 中的按需加载
-
-[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L45-L93)
-
-```typescript
-// 仅当 filters 中存在 subscriber / isOnline / isOnlineInLast / previousStep 等
-// 依赖 subscriber 的 filter 类型时，才从 DB 加载 subscriber
-const subscriberFilterExist = filters?.find(filter => {
-  return filter?.children?.find(item =>
-    item?.on === FilterPartTypeEnum.SUBSCRIBER
-    || item?.on === FilterPartTypeEnum.IS_ONLINE
-    || item?.on === FilterPartTypeEnum.IS_ONLINE_IN_LAST
-    || item?.on === FilterPartTypeEnum.PREVIOUS_STEP
-  );
-});
-```
-
-注意：**previousStep 虽然不直接使用 subscriber 对象做属性比较，但为了确保 subscriberId → subscriber._id 的映射链完整，它也被归入了 subscriber 相关 filter 的触发条件**。实际 previousStep 的比较是通过 `jobRepository` + `messageRepository` 的单独查询完成的。
-
 ---
 
 ## 7. 否定条件（`isNegated`）分析：已定义但未实现
@@ -587,120 +582,247 @@ return filter.isNegated ? !result : result;
 
 ---
 
-## 8. 数据加载关系总览
+## 8. 数据加载关系总览：三个调用方 × 六种 filter 类型
 
-Variant 路由中 6 种 filter 类型的数据获取方式各不相同。核心问题在于：**谁负责加载数据，数据从哪来，各加载路径之间是否共享缓存？**
+Variant 路由中的数据加载并非由 `NormalizeVariables` 单一模块决定，而是由**调用方预先传递的上下文**与 NormalizeVariables 自身的"按需加载"逻辑共同决定。`NormalizeVariables.execute()` 共有 **3 个调用方**，它们传入的 `variables`、`job`、`step` 参数截然不同，导致"是否触发预加载"的实际行为在各场景下完全不同。
 
-### 8.1 六种 filter 类型的数据获取路径
+### 8.1 NormalizeVariables 的三个调用方
 
-| filter.on | 触发 NormalizeVariables 预加载? | 实际数据获取方式 | 共享缓存? |
-|---|---|---|---|
-| `subscriber` | **是**（`fetchSubscriberIfMissing` 仅检查 `on === SUBSCRIBER`） | NormalizeVariables → `subscriberRepository.findOne` → 写入 `variables.subscriber` | — |
-| `tenant` | **是**（`fetchTenantIfMissing` 仅检查 `on === TENANT`） | NormalizeVariables → `tenantRepository.findOne` → 写入 `variables.tenant` | — |
-| `payload` | **否**（直接从 job 取） | `command.variables.payload ?? command.job.payload` → 写入 `variables.payload` | — |
-| `isOnline` / `isOnlineInLast` | **否** | ConditionsFilter 自身的 `getSubscriberBySubscriberId`（L468-486）独立查询 | 与 NormalizeVariables 共享相同 Redis key（`buildSubscriberKey`），二次查询命中缓存 |
-| `previousStep` | **否** | ConditionsFilter → `jobRepository.findOne` + `messageRepository.findOne`，**完全不依赖 subscriber 对象** | 无 |
-| `webhook` | **否**（自身不查 subscriber） | ConditionsFilter → `safeOutboundJsonRequest` POST 外部 URL；`buildPayload` 中**间接复用** `variables.subscriber` | `buildPayload` 优先使用已预加载的 `variables.subscriber`，不存在则单独查询 |
+| 调用方 | 用途 | `command.variables` 是否含 subscriber? | `command.job` 提供? | `command.step` 提供? |
+|---|---|---|---|---|
+| **SelectVariant** (Variant 路由，每个 Channel 中调用) | 遍历 Step 的 variants，逐一用 filters 匹配 | ✅ **是**（来自 `command.filterData` → `compileContext`，由 `SendMessage.buildVariables()` **无条件**预加载）| ✅ 是 | ✅ 是 |
+| **AddJob.executeDeferredJob** (Digest/Delay 延迟步骤的重判定) | 延迟到期后重新评估 Step filters，判断是否真的执行 | ❌ **否**（不传 `variables` 参数） | ✅ 是 | ✅ 是 |
+| **SelectIntegration** (集成条件路由) | 匹配 Integration 的条件，选择具体 provider | ❌ **否**（只传 `{ tenant }`） | ❌ 否 | ❌ 否 |
 
-### 8.2 关键差异：NormalizeVariables 不感知 isOnline / previousStep
+这三个场景下 `fetchSubscriberIfMissing` 的行为完全不同：
 
-[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L53-L55) 的 `fetchSubscriberIfMissing` 仅检查 `item?.on === FilterPartTypeEnum.SUBSCRIBER`：
+```
+调用方 SelectVariant
+  └─ command.variables.subscriber 已存在 → if (command.variables?.subscriber) 命中
+  └─ 直接 return command.variables.subscriber
+      按需加载判断逻辑（subscriberFilterExist）被完全短路！→ 永远不看 combinedFilters
 
-```typescript
-const subscriberFilterExist = filters?.find((filter) => {
-  return filter?.children?.find((item) => item?.on === FilterPartTypeEnum.SUBSCRIBER);
-  // 注意：这里不检查 IS_ONLINE / IS_ONLINE_IN_LAST / PREVIOUS_STEP
-});
+调用方 AddJob.executeDeferredJob
+  └─ command.variables.subscriber 未提供 → 进入按需加载判断
+  └─ combinedFilters = [command.step + variants] → flatMap filters
+  └─ fetchSubscriberIfMissing(combinedFilters)
+      └─ 仅当 combinedFilters 中存在 on=SUBSCRIBER 时才查 DB（不包含 IS_ONLINE/previousStep）
+  └─ command.job 已提供 → 若存在 subscriber filter 则查 subscriberRepository.findOne
+
+调用方 SelectIntegration
+  └─ command.variables.subscriber 未提供 → 进入按需加载判断
+  └─ combinedFilters = [undefined + undefined] → []（step/variants 都没传）
+  └─ fetchSubscriberIfMissing([]) → subscriberFilterExist = false
+  └─ 或即使 subscriberFilterExist=true，command.job 也未提供 → if (… && command.job) 短路
+  └─ → 永远不查 subscriber！（SelectIntegration 只匹配 tenant 和 payload 条件）
 ```
 
-这意味着：
-- 如果一个 Step 的 filters 中**只有** `isOnline` 条件而没有 `subscriber` 条件，NormalizeVariables **不会**预加载 subscriber
-- `processIsOnline` 必须自己查询 subscriber
-- `processPreviousStep` 完全不使用 subscriber，直接查 Job + Message
+### 8.2 Variant 路由的**真正数据源头**：SendMessage.buildVariables()
 
-### 8.3 两处 getSubscriberBySubscriberId 的关系
+对于 Variant 路由这个用户真正关心的场景，**所有数据加载在进入 `NormalizeVariables` 之前就已经完成了**。`SendMessage.execute()` 的第一步就是调用 `buildVariables` 无条件预加载所有数据：
 
-代码中存在两个同名方法，分别属于不同类，但共享 Redis 缓存：
-
-| 位置 | 类 | 用途 |
-|---|---|---|
-| [normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L95-L113) | `NormalizeVariables` | 预加载 subscriber 到 `variables.subscriber` |
-| [conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L468-L486) | `ConditionsFilter` | `processIsOnline` 内部独立查询 subscriber |
-
-两者都使用 `@CachedResponse({ builder: buildSubscriberKey })` 装饰器，缓存 key 格式均为 `{entity:subscriber:e=<environmentId>:s=<subscriberId>}`。因此如果 NormalizeVariables 先执行了查询，ConditionsFilter 的第二次查询会命中 Redis 缓存而非 MongoDB。
-
-### 8.4 webhook 对预加载结果的间接依赖
-
-[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L309-L341) 的 `buildPayload` 方法：
+[send-message.usecase.ts](apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts#L423-L472)
 
 ```typescript
-private async buildPayload(variables, command) {
-  if (variables.subscriber) {
-    payload.subscriber = variables.subscriber;      // ← 复用预加载结果
-  } else {
-    payload.subscriber = await this.subscriberRepository.findBySubscriberId(
-      command.environmentId,
-      command.job.subscriberId
-    );                                              // ← 单独查询，无缓存
-  }
+private async buildVariables(command: SendMessageCommand) {
+  // 无条件并行加载：subscriber + actor + tenant + context + envVars
+  const [subscriber, actor, tenant, context, envVars, environmentEntity] = await Promise.all([
+    this.getSubscriberBySubscriberId({ subscriberId, _environmentId }),  // ← 不论 filters 是什么都执行
+    command.job.actorId && this.getSubscriberBySubscriberId({ actorId, _environmentId }),
+    this.handleTenantExecution(command.job),                              // ← 不论 filters 是什么都执行
+    this.resolveContext(command),
+    this.getEnvironmentVariables(command),
+    this.environmentRepository.findByIdAndOrganization(...),
+  ]);
+
+  return {
+    compileContext: { subscriber, payload: command.payload, step: {...}, tenant, actor, context, env },
+    environment,
+  };
 }
 ```
 
-注意：这里的 fallback 查询调用的是 `subscriberRepository.findBySubscriberId`（无 `@CachedResponse`），与前面两处 `getSubscriberBySubscriberId`（有缓存）**不同**。如果 NormalizeVariables 未预加载 subscriber 且 webhook filter 存在，buildPayload 会直接查 MongoDB，绕过 Redis 缓存。
+这意味着：
 
-### 8.5 数据流向图
+| 评估阶段 | 执行位置 | 数据来源 | subscriber 是否已加载？ |
+|---|---|---|---|
+| **Step 级条件** | `evaluateStepCondition()` → `ConditionsFilter.filter(..., variables)` | `buildVariables` 产出的 `compileContext` | ✅ 无条件已加载 |
+| **Variant 级条件** | `processVariants()` → `SelectVariant` → `NormalizeVariables` → `ConditionsFilter` | 上游 `compileContext` → `filterData` → `command.variables.subscriber` | ✅ 无条件已加载（NormalizeVariables 直接复用）|
+| **Digest 重判定** | `AddJob.executeDeferredJob()` → `NormalizeVariables` | `NormalizeVariables` 按需加载 | ❌ 需按需判断 |
+| **集成路由** | `SelectIntegration` → `NormalizeVariables` | 只加载 tenant | ❌ 永远不加载 |
+
+### 8.3 六种 filter 类型的数据获取路径（Variant 路由场景）
+
+| filter.on | 由谁加载数据？ | 实际获取方式 | 共享缓存? |
+|---|---|---|---|
+| `subscriber` | **SendMessage.buildVariables**（无条件） | `buildVariables.getSubscriberBySubscriberId` → `@CachedResponse` → 写入 `compileContext.subscriber` → NormalizeVariables 直接复用 | @CachedResponse(Redis) |
+| `tenant` | **SendMessage.buildVariables**（无条件） | `buildVariables.handleTenantExecution` → `tenantRepository` → 写入 `compileContext.tenant` → NormalizeVariables 直接复用 | 无 |
+| `payload` | SendMessage.buildVariables | `command.payload`（来自 Trigger）→ `compileContext.payload` | — |
+| `isOnline` / `isOnlineInLast` | **ConditionsFilter.processIsOnline** 自身独立 | `ConditionsFilter.getSubscriberBySubscriberId`（L468-486）→ `@CachedResponse` | 与 buildVariables 共享同一 Redis key（`buildSubscriberKey`），二次查询命中缓存 |
+| `previousStep` | **ConditionsFilter.processPreviousStep** 自身独立 | `jobRepository.findOne({ transactionId, 'step.uuid' })` + `messageRepository.findOne({ _jobId })` → **完全不依赖 subscriber 对象** | 无 |
+| `webhook` | ConditionsFilter 自身 | `safeOutboundJsonRequest` POST 外部 URL；`buildPayload` 优先复用 `variables.subscriber`（来自 buildVariables，已有），否则单独查 `subscriberRepository.findBySubscriberId`（无缓存） | buildPayload 的 subscriber 复用（有值），fallback 无缓存 |
+
+### 8.4 `fetchSubscriberIfMissing` 的真实触发条件
+
+[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L45-L67)
+
+```typescript
+private async fetchSubscriberIfMissing(command, filters) {
+  // 第一层：调用方已提供 subscriber → 立即返回，不做任何判断
+  if (command.variables?.subscriber) {
+    return command.variables.subscriber;
+  }
+
+  // 第二层：检查 filters 中是否存在 on=SUBSCRIBER 的子条件
+  // 注意：只检查 FilterPartTypeEnum.SUBSCRIBER
+  //       不包含 IS_ONLINE / IS_ONLINE_IN_LAST / PREVIOUS_STEP
+  const subscriberFilterExist = filters?.find((filter) =>
+    filter?.children?.find((item) => item?.on === FilterPartTypeEnum.SUBSCRIBER)
+  );
+
+  // 第三层：既需要存在 subscriber filter，又需要 command.job 存在
+  // SelectIntegration 场景下 job 未提供，因此即使有 subscriber filter 也会被短路
+  if (subscriberFilterExist && command.job) {
+    return await this.getSubscriberBySubscriberId({
+      subscriberId: command.job.subscriberId,
+      _environmentId: command.environmentId,
+    });
+  }
+  return undefined;
+}
+```
+
+**三层判断的结论**：
+
+| 场景 | 第一层命中? | 第二层命中? | 第三层 job? | 最终行为 |
+|---|---|---|---|---|
+| Variant 路由 (SelectVariant) | ✅ 是 | — | — | 返回 buildVariables 预加载的 subscriber |
+| Digest 重判定 (AddJob) | ❌ 否 | 取决于 Step filters 是否有 on=subscriber | ✅ 是 | 有 subscriber filter → 查 DB；无 → undefined |
+| 集成路由 (SelectIntegration) | ❌ 否 | 取决于 integration.conditions | ❌ 否 | 永远 undefined |
+
+另外注意：`fetchTenantIfMissing`（[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L69-L93)）有相同的三层结构，但检查 `on === TENANT`。
+
+### 8.5 四处 getSubscriberBySubscriberId / findBySubscriberId 的关系
+
+代码中存在 **4 个查询 subscriber 的入口**，其中 3 个有 `@CachedResponse`（Redis 缓存），1 个没有：
+
+| 位置 | 所属类 / 方法 | 是否有缓存? | 被谁调用? |
+|---|---|---|---|
+| [send-message.usecase.ts](apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts#L428-L431) | `SendMessage.buildVariables` 内部 | ✅ @CachedResponse(同 key) | Variant 路由场景的**首次无条件查询** |
+| [normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L95-L113) | `NormalizeVariables.getSubscriberBySubscriberId` | ✅ @CachedResponse(同 key) | Digest 重判定场景的按需查询；Variant 路由中被第一层短路跳过 |
+| [conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L468-L486) | `ConditionsFilter.getSubscriberBySubscriberId` | ✅ @CachedResponse(同 key) | `processIsOnline` 自身独立查询 |
+| [conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L326-L330) | `ConditionsFilter.buildPayload` 内部（`subscriberRepository.findBySubscriberId`） | ❌ 直接查 DB，无缓存 | webhook filter 的 fallback 路径（当 `variables.subscriber` 未提供时） |
+
+前三者都使用相同的 `@CachedResponse({ builder: buildSubscriberKey })` 装饰器，缓存 key 格式：
 
 ```
-NormalizeVariables.execute()
-  ├─ fetchSubscriberIfMissing()     ← 仅 on=SUBSCRIBER 触发
-  │    └─ getSubscriberBySubscriberId() → @CachedResponse → subscriberRepository.findOne()
-  │         └─ variables.subscriber = SubscriberEntity
-  │
-  ├─ fetchTenantIfMissing()         ← 仅 on=TENANT 触发
-  │    └─ tenantRepository.findOne()
-  │         └─ variables.tenant = TenantEntity
-  │
-  ├─ variables.payload = command.variables.payload ?? command.job.payload
-  ├─ variables.step / actor / context = command.variables.*
-  └─ 返回 IFilterVariables
+{entity:subscriber:e=<environmentId>:s=<subscriberId>}
+```
 
-ConditionsFilter.filter(variables)
-  ├─ processFilter(on=SUBSCRIBER/TENANT/PAYLOAD)
-  │    └─ processFilterEquality(variables, child)     ← 消费 variables.*
+因此在 Variant 路由场景下：
+- SendMessage.buildVariables 查了一次 → 写 Redis
+- NormalizeVariables.fetchSubscriberIfMissing 第一层短路，不走查询
+- processIsOnline 触发 `ConditionsFilter.getSubscriberBySubscriberId` → **命中 Redis 缓存**
+
+### 8.6 完整数据流向图
+
+```
+Trigger Event → Worker 消费 Job
   │
-  ├─ processFilter(on=WEBHOOK)
-  │    ├─ buildPayload(variables)                     ← 优先用 variables.subscriber
-  │    │    └─ fallback: subscriberRepository.findBySubscriberId()  ← 无缓存！
-  │    └─ safeOutboundJsonRequest() → processFilterEquality({ webhook: res })
+  ▼
+SendMessage.execute()
   │
-  ├─ processFilter(on=IS_ONLINE / IS_ONLINE_IN_LAST)
-  │    └─ processIsOnline()
-  │         └─ this.getSubscriberBySubscriberId()     ← ConditionsFilter 自身方法，@CachedResponse
-  │              └─ subscriber.isOnline / lastOnlineAt
+  ├─ buildVariables()                      ← 无条件预加载（Variant 路由真正的数据源）
+  │    ├─ Promise.all([
+  │    │    getSubscriberBySubscriberId() → @CachedResponse → SubscriberEntity
+  │    │    getSubscriberBySubscriberId(actorId)
+  │    │    handleTenantExecution() → TenantEntity
+  │    │    resolveContext()
+  │    │    getEnvironmentVariables()
+  │    │  ])
+  │    └─ compileContext = { subscriber, tenant, payload, actor, context, step, env }
   │
-  └─ processFilter(on=PREVIOUS_STEP)
-       └─ processPreviousStep()
-            ├─ jobRepository.findOne({ transactionId, 'step.uuid' })
-            └─ messageRepository.findOne({ _jobId })
-                 └─ message.seen / read
+  ├─ evaluateStepCondition(compileContext)
+  │    └─ ConditionsFilter.filter(variables=compileContext)  ← subscriber 已存在
+  │         ├─ subscriber/payload/tenant → processFilterEquality
+  │         ├─ isOnline → processIsOnline → 独立查询（命中 Redis 缓存）
+  │         ├─ previousStep → processPreviousStep → JobRepo + MessageRepo
+  │         └─ webhook → buildPayload（复用 subscriber） + POST 外部 URL
+  │
+  ▼  Step 通过
+SendMessageXxxChannel (Email/SMS/InApp/...)
+  │
+  └─ processVariants() → SelectVariant
+       │
+       ├─ NormalizeVariables.execute(filters=variant.filters, step, job, variables=compileContext)
+       │    ├─ fetchSubscriberIfMissing(command, combinedFilters)
+       │    │    └─ command.variables.subscriber 已存在 → 直接 return （短路！不看 combinedFilters）
+       │    ├─ fetchTenantIfMissing → 同理短路
+       │    └─ variables.payload / step / actor / context = command.variables.*
+       │
+       └─ ConditionsFilter.filter(variables, variant.filters)
+            ├─ subscriber → 复用 buildVariables 的结果
+            ├─ isOnline → 独立查询（命中 Redis）
+            ├─ previousStep → JobRepo + MessageRepo
+            └─ webhook → 复用 subscriber + POST 外部 URL
 ```
 
 ---
 
 ## 9. 订阅者属性预加载（Subscriber Preload）数据来源
 
-### 9.1 触发条件：按需加载
+### 9.1 实际触发路径：两层加载机制
+
+根据 8.2 节的分析，Variant 路由场景下 subscriber 的**真正加载入口是 `SendMessage.buildVariables()`**，而 `NormalizeVariables.fetchSubscriberIfMissing` 只是一个**兜底**的按需加载机制（主要为 Digest/Delay 等非 Variant 路由场景服务）。
+
+#### 第一层：SendMessage.buildVariables（无条件加载）
+
+[send-message.usecase.ts](apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts#L423-L472)
+
+在 SendMessage 执行的第一步就**无条件地**通过 `Promise.all` 并行加载 subscriber、actor、tenant、context、env vars，**完全不考虑 filters 的内容**：
+
+```typescript
+@Instrument()
+private async buildVariables(command: SendMessageCommand) {
+  const [subscriber, actor, tenant, context, envVars, environmentEntity] = await Promise.all([
+    this.getSubscriberBySubscriberId({
+      subscriberId: command.subscriberId,
+      _environmentId: command.environmentId,
+    }),
+    command.job.actorId && this.getSubscriberBySubscriberId({ ... }),   // actor 同样无条件查询
+    this.handleTenantExecution(command.job),
+    this.resolveContext(command),
+    // ...
+  ]);
+
+  if (!subscriber) throw new PlatformException('Subscriber not found');
+
+  const compileContext: ICompileContext = {
+    subscriber,          // ← 所有后续环节（Step级 + Variant级）共享
+    payload: command.payload,
+    step: { digest, events, total_count },
+    ...(tenant && { tenant }),
+    ...(actor && { actor }),
+    ...(context && { context }),
+    env,
+  };
+  return { compileContext, environment: environmentEntity };
+}
+```
+
+#### 第二层：NormalizeVariables.fetchSubscriberIfMissing（按需加载，兜底）
 
 [normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L45-L67)
 
 ```typescript
 private async fetchSubscriberIfMissing(command, filters) {
-  // 优先使用已传入的 subscriber（上层调用方已预加载）
+  // 优先使用调用方已传入的 subscriber（Variant 路由中 compileContext 已含 subscriber）
   if (command.variables?.subscriber) {
     return command.variables.subscriber;
   }
 
-  // 仅当 filters 中存在 on=SUBSCRIBER 类型条件时才加载
+  // 仅当 filters 中存在 on=SUBSCRIBER 类型条件时才查 DB
+  // 注意：不检查 IS_ONLINE / IS_ONLINE_IN_LAST / PREVIOUS_STEP
   const subscriberFilterExist = filters?.find((filter) =>
     filter?.children?.find((item) => item?.on === FilterPartTypeEnum.SUBSCRIBER)
   );
@@ -715,7 +837,9 @@ private async fetchSubscriberIfMissing(command, filters) {
 }
 ```
 
-**注意**：`isOnline` / `isOnlineInLast` 虽然需要读取 subscriber 的 `isOnline` / `lastOnlineAt` 字段，但它们**不经过此处的预加载判断**——`processIsOnline` 会在 ConditionsFilter 内部独立查询 subscriber（见第 10.4 节）。`previousStep` 完全不依赖 subscriber 对象（见第 11 章）。
+**注意（已修正旧结论）**：`fetchSubscriberIfMissing` **只检查 `on === FilterPartTypeEnum.SUBSCRIBER`**，不包含 `isOnline` / `isOnlineInLast` / `previousStep` —— 后三者的 subscriber 查询在 ConditionsFilter 内部独立完成（`processIsOnline` 走独立查询，`processPreviousStep` 根本不用 subscriber）。
+
+`combinedFilters` 由 `[command.step, ...command.step?.variants].flatMap(v => v?.filters ?? [])` 构成，即 Step 自身 + 所有 Variants 的 filters 合并。这意味着只要**任意一个** Variant 中含有 `on=SUBSCRIBER` 的条件，Digest 重判定场景就会触发 subscriber 查询。
 
 ### 9.2 查询方法与缓存
 
@@ -906,10 +1030,23 @@ private async processIsOnline(filter, command, details) {
 }
 ```
 
-**关键细节**：`processIsOnline` 调用的是 ConditionsFilter **自身的** `getSubscriberBySubscriberId`（L468-486），而非 NormalizeVariables 中的同名方法。两者是完全独立的方法，但都使用 `@CachedResponse({ builder: buildSubscriberKey })` 装饰器，共享同一个 Redis 缓存 key（`{entity:subscriber:e=<env>:s=<subscriberId>}`）。因此：
+**关键细节**：`processIsOnline` 调用的是 ConditionsFilter **自身的** `getSubscriberBySubscriberId`（L468-486），而非 NormalizeVariables 中的同名方法。两者是完全独立的方法，但都使用 `@CachedResponse({ builder: buildSubscriberKey })` 装饰器，共享同一个 Redis 缓存 key（`{entity:subscriber:e=<env>:s=<subscriberId>}`）。
 
-- 如果同一次评估中**同时存在** `subscriber` filter 和 `isOnline` filter，subscriber 会被查询两次：第一次由 NormalizeVariables 预加载（写 Redis），第二次由 ConditionsFilter 独立查询（命中 Redis 缓存）
-- 如果**只有** `isOnline` filter 没有 `subscriber` filter，NormalizeVariables 不会预加载，ConditionsFilter 直接查 MongoDB（但结果会写入 Redis 缓存）
+#### Variant 路由场景（有 buildVariables 无条件预加载）
+
+由于 `SendMessage.buildVariables()` 会**无条件地**先查一次 subscriber 并写入 Redis（见 8.2 节），因此**无论 filters 是什么**，`processIsOnline` 的独立查询都会命中 Redis 缓存，不会额外查 MongoDB：
+
+| 场景 | BuildVariables（首次） | `processIsOnline`（第二次） |
+|---|---|---|
+| 同时有 subscriber filter + isOnline filter | 查 MongoDB → 写 Redis | 命中 Redis 缓存 |
+| 只有 isOnline filter，没有 subscriber filter | 查 MongoDB → 写 Redis（无条件，不看 filters）| 命中 Redis 缓存 |
+
+#### Digest 重判定场景（AddJob.executeDeferredJob，无 buildVariables）
+
+此场景没有 BuildVariables 的预加载，走真正的按需加载（见 8.4 节三层判断）：
+
+- 如果 **同时**存在 subscriber filter + isOnline filter：`fetchSubscriberIfMissing` 命中 subscriber filter → 查 MongoDB 写 Redis → processIsOnline 命中 Redis
+- 如果 **只有** isOnline filter，没有 subscriber filter：`fetchSubscriberIfMissing` **不查**（只检查 `on === SUBSCRIBER`，不识别 IS_ONLINE）→ processIsOnline 的独立查询成为**首次** MongoDB 查询，写 Redis
 
 ### 10.5 数据一致性说明
 
@@ -1155,7 +1292,10 @@ Variant 路由时       │  Worker: processPreviousStep()     │
 | [select-variant.command.ts](libs/application-generic/src/usecases/select-variant/select-variant.command.ts) | SelectVariant 的入参定义（filterData / step / job） |
 | [conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts) | 条件判断引擎：OR 组间 / AND-OR 组内 / 6 种 filter 类型（含 previousStep / isOnline / webhook 引用型过滤） |
 | [conditions-filter.command.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.command.ts) | ConditionsFilter 的入参定义 |
-| [normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts) | 变量归一化：按需加载 subscriber / tenant |
+| [normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts) | 变量归一化：combinedFilters 合并 Step+Variants 的 filters，三层判断按需加载 subscriber / tenant |
+| [normalize-variables.command.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.command.ts) | NormalizeVariablesCommand：filters/job/step/variables 四个入参（注意 filters 参数在 execute 中未使用） |
+| [add-job.usecase.ts](apps/worker/src/app/workflow/usecases/add-job/add-job.usecase.ts) | Digest/Delay 延迟步骤的 Digest 重判定场景（executeDeferredJob 调用 NormalizeVariables 触发真正的按需加载） |
+| [select-integration.usecase.ts](libs/application-generic/src/usecases/select-integration/select-integration.usecase.ts) | 集成条件路由（NormalizeVariables 的第三个调用方，不传 job/step，永远不加载 subscriber） |
 | [filter.ts](libs/application-generic/src/utils/filter.ts) | processFilterEquality：值比较 + 运算符分派 |
 | [filter-processing-details.ts](libs/application-generic/src/utils/filter-processing-details.ts) | IFilterVariables 接口 + 条件评估详情记录 |
 | [message.filter.ts](libs/application-generic/src/value-objects/message.filter.ts) | 应用层 MessageFilter VO（含 `isNegated` 字段声明） |
