@@ -170,7 +170,7 @@ translatedSubject: 'Order Update - 12345'
 
 ---
 
-### 路径 C：Email 纯文本 Body — 翻译先、Liquid 变量替换后
+### 路径 C：Email 纯文本 Body — 翻译服务内 Liquid + Renderer 本地 Liquid（双重 Liquid Pass）
 
 **代码**：[email-output-renderer.usecase.ts#L572-L614](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L572-L614)
 
@@ -178,40 +178,48 @@ translatedSubject: 'Order Update - 12345'
 private async processTextTranslations({ text, variables, ... }): Promise<string> {
   const unescapedVariables = this.deepUnescapeTranslationStrings(variables);
 
-  // Step 1: 翻译替换（可能翻译文本中包含 Liquid 变量）
+  // Step 1: 翻译 + 第一遍 Liquid（@novu/ee-translation 内部，默认配置）
   const translatedText = translationContext
     ? await this.processStringWithContext({ context: translationContext, content: text, variables: unescapedVariables })
     : await this.processStringTranslations({ content: text, variables: unescapedVariables, ... });
 
-  // Step 2: 变量替换（Liquid）
+  // Step 2: 第二遍 Liquid（Renderer 本地 this.liquidEngine，自定义 outputEscape）
   const unescapedTranslatedText = this.unescapeJsonString(translatedText);
   return await this.liquidEngine.parseAndRender(unescapedTranslatedText, unescapedVariables);
 }
 ```
 
-**完整流程**：
+**完整流程（两遍 Liquid Pass）**：
 
 ```
 body: '<p>{{t.greeting}} {{subscriber.firstName}}! {{t.personalized}}</p>'
 
 翻译:
-  t.greeting      → 'Hello'
-  t.personalized  → 'Your order {{payload.orderId}} is on the way'
+  t.greeting     → 'Hello'
+  t.personalized → 'Your order {{payload.orderId}} is on the way'
 
-  ↓ deepUnescapeTranslationStrings(variables)
-  ↓ Step 1: @novu/ee-translation 翻译替换
-translatedText: '<p>Hello {{subscriber.firstName}}! Your order {{payload.orderId}} is on the way</p>'
+  ↓ deepUnescapeTranslationStrings(variables)  — 变量字符串中的 \" 取消转义
+  ↓ Step 1: @novu/ee-translation 翻译替换 + 翻译服务内部 Liquid
+  ├─ {{t.greeting}}     → 'Hello'
+  ├─ {{subscriber.firstName}} → 'Smith'（翻译服务内 Liquid 可能已解析）
+  └─ {{t.personalized}} → 'Your order {{payload.orderId}} is on the way'
+translatedText: '<p>Hello Smith! Your order {{payload.orderId}} is on the way</p>'
   ↓ unescapeJsonString()  — \" → "
-  ↓ Step 2: liquidEngine.parseAndRender() 变量替换
-  ├─ {{subscriber.firstName}} → 'Alice'
+  ↓ Step 2: this.liquidEngine.parseAndRender() 第二遍 Liquid (自定义 outputEscape)
   └─ {{payload.orderId}} → '12345'
-最终: '<p>Hello Alice! Your order 12345 is on the way</p>'
+最终: '<p>Hello Smith! Your order 12345 is on the way</p>'
 ```
 
 **关键特点**：
-- **翻译先、变量替换后** 是两个分开的步骤
+- **翻译先、Renderer 本地 Liquid 后**，两个阶段分开
 - 翻译文本中可以包含 Liquid 变量，在 Step 2 被解析
-- 变量替换使用 Renderer 自有的 `this.liquidEngine`（自定义 `outputEscape`，处理 Maily 对象转义）
+- **变量替换实际跑了两遍**：翻译服务内部一遍（默认 Liquid 配置），Renderer 本地一遍（自定义 `outputEscape`）
+- Renderer 自有的 `this.liquidEngine` 的 `outputEscape` 对对象/数组做 `JSON.stringify` + 双引号转单引号 + 换行转义，保证结果能嵌入更大结构；字符串不做 HTML 转义
+
+**为什么要两遍 Liquid**：
+- 翻译服务用 `createLiquidEngine()` 默认配置，outputEscape 对数组/对象不做特殊处理
+- Email 场景中 payload 可能含有数组/对象，Step 1 翻译服务的默认 Liquid 输出可能不符合 JSON 兼容性要求
+- Step 2 用 Renderer 自有 liquidEngine（自定义 outputEscape）做最终保障，确保对象/数组输出的字符串能被正确 `JSON.parse`
 
 ---
 
@@ -241,46 +249,99 @@ private async processBodyContent({ body, ... }): Promise<string> {
 }
 ```
 
-#### 阶段 1：`wrapMailyInLiquid()` — Maily 节点属性转 Liquid 表达式
+#### 阶段 1：`wrapMailyInLiquid()` — Maily 节点属性按需转 Liquid 表达式
 
 **代码**：[maily-utils.ts#L455-L482](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/libs/application-generic/src/utils/maily-utils.ts#L455-L482)
 
-遍历 Maily JSON 所有节点，将属性值转为 `{{ variable | default: 'fallback' }}` 形式的 Liquid 表达式。例如：
+遍历 Maily JSON 所有节点，**按 `variableAttributeConfig(type)` 返回的属性白名单**将属性值转为 `{{ variable | default: 'fallback' }}` 形式的 Liquid 表达式。
+
+**属性白名单映射**（由 `variableAttributeConfig()` 在 [maily-utils.ts#L96-L146](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/libs/application-generic/src/utils/maily-utils.ts#L96-L146) 定义）：
+
+| 节点 type | 可包裹 Liquid 的 attr (flag) |
+|-----------|------------------------------|
+| `variable` / `repeat` / `for` / 所有未显式列出的 type | `id(id)`、`showIfKey(showIfKey)`、`each(each)` — 即 commonConfig |
+| `button` | `text(isTextVariable)`、`url(isUrlVariable)` + commonConfig |
+| `image` / `inlineImage` | `src(isSrcVariable)`、`externalLink(isExternalLinkVariable)` + commonConfig |
+| `link` | `href(isUrlVariable)` + commonConfig |
+
+**包裹触发条件**（`processVariableNodeAttributes`）：
+```typescript
+const flagValue = attrs[flag];   // 例如 flag='isTextVariable'，attrs.isTextVariable 必须为真
+const attrValue = attrs[attr];   // 例如 attr='text'
+if (!flagValue || !attrValue || typeof attrValue !== 'string') return;  // flag 为假则不包裹
+```
+
+- 只有 `flag` 对应的属性**为真**时，才会把 `attr` 的值包裹为 Liquid
+- 对 `variable` 节点：flag 和 attr 都是 `id`，只要 `id` 本身非空字符串（**总是 truthy**），就一定包裹
+
+**示例**：
 
 ```
-输入节点: { "type": "variable", "attrs": { "id": "payload.user.name", "fallback": "Guest" } }
-输出节点: { "type": "variable", "attrs": { "id": "{{ payload.user.name | default: 'Guest' }}", ... } }
+输入 variable 节点: { "type": "variable", "attrs": { "id": "payload.user.name", "fallback": "Guest" } }
+输出:              { "type": "variable", "attrs": { "id": "{{ payload.user.name | default: 'Guest' }}", ... } }
 
-输入按钮: { "type": "button", "attrs": { "text": "Click", "url": "payload.link", "isUrlVariable": true } }
-输出按钮: { "type": "button", "attrs": { "text": "Click", "url": "{{ payload.link }}", ... } }
+输入 button 节点:  { "type": "button", "attrs": { "text": "payload.link", "isTextVariable": true } }
+输出:              { "type": "button", "attrs": { "text": "{{ payload.link }}", "isTextVariable": true, ... } }
 ```
 
-**特殊处理（翻译 key 豁免）**：如果按钮 `text` 属性本身就是翻译标记 `{{t.key}}`，则不包裹 Liquid（因为 Liquid 不能识别翻译标记）。
+##### 翻译 key 豁免规则（仅 button text）
+
+**代码**：[maily-utils.ts#L460-L468](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/libs/application-generic/src/utils/maily-utils.ts#L460-L468)
 
 ```typescript
-if (attrKey === MailyAttrsEnum.TEXT && attrs.isTextVariable === true && TRANSLATION_KEY_SINGLE_REGEX.test(attrValue)) {
-  return false;  // 跳过包裹，保留原始 {{t.key}}
+shouldProcessAttr: ({ attrValue, attrKey, attrs }) => {
+  // 仅当 attrKey === 'text'（button text）且 isTextVariable === true 且值匹配 {{t.key}} 时才豁免
+  if (
+    attrKey === MailyAttrsEnum.TEXT &&
+    attrs.isTextVariable === true &&
+    TRANSLATION_KEY_SINGLE_REGEX.test(attrValue)
+  ) {
+    return false;  // 不包裹 Liquid，保留原始 {{t.key}}
+  }
+  return true;
 }
 ```
+
+**豁免仅适用于 button 的 text 属性**。`variable` 节点的 `id`、button 的 `url`、image 的 `src`、link 的 `href` — 这些属性即便是翻译 key 仍然会被包裹 Liquid。
+
+| 节点 + attr | 值为翻译 key 时的行为 |
+|------------|----------------------|
+| `variable` 节点的 `id`（值如 `'t.greeting'`） | ✅ 被包裹为 `{{ t.greeting }}`（flag=`id` 总是 truthy，且豁免规则不命中 `id` attr） |
+| `button.attrs.text`（`isTextVariable=true`，值如 `'{{t.order_status}}'`） | ❌ **豁免**，保留 `{{t.order_status}}` 原样 |
+| `button.attrs.url`（`isUrlVariable=true`，值如 `'t.track_url'`） | ✅ 被包裹为 `{{ t.track_url }}`（豁免仅针对 `text` attr） |
+| `image.attrs.src`（`isSrcVariable=true`） | ✅ 被包裹 |
+| `link.attrs.href`（`isUrlVariable=true`） | ✅ 被包裹 |
+
+---
 
 #### 阶段 2：`transformMailyContent()` — 结构化节点预处理（show/each/variable）
 
 **代码**：[email-output-renderer.usecase.ts#L631-L665](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L631-L665)
 
-遍历 Maily 节点树，对特殊节点做预处理：
+BFS 遍历 Maily 节点树，对特殊节点做预处理：
 
 | 节点类型 | 处理逻辑 |
 |---------|----------|
-| `show` 条件节点 | `handleShowNode()`：用 Liquid 执行 `showIf` 表达式，决定是否删除该节点 |
-| `each` 循环节点 | `multiplyForEachNode()`：展开循环，为每个迭代复制子节点并重写变量路径为带数组下标的形式，如 `{{payload.comments[0].author}}` |
-| `variable` 变量节点 | `processVariableNodeTypes()`：将 `{type:"variable", attrs:{id:"..."}}` 改为 `{type:"text", text:"{{...}}"}`，以便 Liquid 在 JSON 字符串中识别并替换 |
+| `show` 条件节点 | `handleShowNode()`：用 Liquid 执行 `showIf` 表达式，返回 false 则从 parent.content 中移除该节点 |
+| `each` 循环节点 | `multiplyForEachNode()`：展开循环，为每个迭代复制子节点并重写变量路径为带数组下标的形式 |
+| `variable` 变量节点 | `processVariableNodeTypes()`：将 `{type:"variable", attrs:{id:"{{ ... }}"}}` 改为 `{type:"text", text:"{{ ... }}"}`，把 Liquid 表达式移到 `text` 字段以便后续在 JSON 字符串中被 Liquid 识别 |
 
-**关键细节**：`multiplyForEachNode()` 中的 `addIndexToLiquidExpression`：
+**关键细节**：`processVariableNodeTypes()` 不做任何变量解析，只是**改变节点结构**：
+```typescript
+private processVariableNodeTypes(node: MailyJSONContent) {
+  node.type = 'text';                // variable → text
+  node.text = node.attrs?.id || '';  // attrs.id → text（id 里已经是 {{ ... }} 形式）
+}
+```
+
+`multiplyForEachNode()` 中的 `addIndexToLiquidExpression`：
 - 原始：`{{ payload.comments.author }}`
 - 迭代 0：`{{ payload.comments[0].author }}`
 - 迭代 1：`{{ payload.comments[1].author }}`
 
-#### 阶段 3：`processMailyTranslations()` — 翻译替换
+---
+
+#### 阶段 3：`processMailyTranslations()` — 翻译服务替换
 
 **代码**：[email-output-renderer.usecase.ts#L524-L570](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L524-L570)
 
@@ -297,12 +358,38 @@ private async processMailyTranslations({ mailyContent, variables, ... }): Promis
 
 **流程**：
 1. 将整个 Maily JSON 序列化为字符串
-2. 调用 `@novu/ee-translation` 对 JSON 字符串做翻译替换（所有节点的 text、attrs.text、attrs.url 等字符串属性中的 `{{t.key}}` 被替换为翻译文本）
+2. 调用 `@novu/ee-translation`（`Translate.execute()` 或 `executeWithContext()`）对 JSON 字符串做翻译
 3. 反序列化为 Maily JSON 对象
 
-**翻译可能引入 Liquid 变量**：例如 `{{t.greeting}}` → `Hello {{payload.name}}`，但此阶段 Liquid 变量原样保留（在阶段 4 处理）。
+##### `@novu/ee-translation` 的职责边界
 
-#### 阶段 4：`parseMailyContentByLiquid()` — 变量替换
+从其调用签名和参数推断（[base-translation-renderer.usecase.ts#L229-L241](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/base-translation-renderer.usecase.ts#L229-L241)）：
+
+```typescript
+const translatedContent = await translate.execute({
+  resourceId, resourceType, organizationId, environmentId,
+  userId: 'system', locale,
+  content: contentString,     // 原始内容字符串
+  payload: variables,          // 完整变量对象
+  liquidEngine,                // Liquid 引擎实例
+  resourceEntity, organization,
+});
+```
+
+**翻译服务内部**做两件事：
+1. **翻译替换**：通过 `TRANSLATION_KEY_SINGLE_REGEX` 正则匹配 `{{t.key}}` / `{{ t.key }}`，替换为对应 locale 的翻译文本
+2. **Liquid 变量替换**：对翻译后的文本调用传入的 `liquidEngine.parseAndRender()` 解析 `{{payload.xxx}}` 等变量（**至少对非 Email 路径是如此**）
+
+但在 **Email Maily 路径**中，`processMailyTranslations()` 之后**还有**阶段 4 的 `parseMailyContentByLiquid()`，因此翻译服务对 Maily JSON 字符串内部 Liquid 变量的解析结果会再次被阶段 4 覆盖或补充。对 Email 来说，阶段 3 的核心职责是**翻译替换**，阶段 4 的核心职责是**Liquid 变量替换（包括自定义 outputEscape 的处理）**。
+
+翻译服务不负责：
+- Maily 节点结构处理（show/each/variable 展开在阶段 2）
+- Maily JSON 到 HTML 的转换（在阶段 5）
+- 自定义 outputEscape 转义（阶段 4 用 Renderer 自有 liquidEngine）
+
+---
+
+#### 阶段 4：`parseMailyContentByLiquid()` — Liquid 变量替换（Renderer 自有引擎）
 
 **代码**：[email-output-renderer.usecase.ts#L616-L629](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L616-L629)
 
@@ -314,89 +401,179 @@ private async parseMailyContentByLiquid(mailyContent, variables): Promise<MailyJ
 ```
 
 - 将翻译后的 Maily JSON 再次序列化为字符串
-- Liquid 引擎解析所有 `{{payload.xxx}}`、`{{subscriber.xxx}}` 等变量
+- 用 **Renderer 自有的 `this.liquidEngine`** 解析所有 `{{payload.xxx}}`、`{{subscriber.xxx}}` 等 Liquid 表达式
 - 反序列化为 Maily JSON 对象
 
-**关键特点**：使用 Renderer 自定义的 `this.liquidEngine`，其 `outputEscape` 对对象/数组做 `JSON.stringify` 转单引号、转义换行，对字符串不做 HTML 转义。
+**自定义 `outputEscape` 的作用**（[email-output-renderer.usecase.ts#L110-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L110-L122)）：
+
+```typescript
+outputEscape: (output: unknown): string => {
+  if (Array.isArray(output) || (typeof output === 'object' && output !== null)) {
+    // 对象/数组：JSON.stringify → 双引号转单引号 → 转义换行
+    const valueStringified = JSON.stringify(output);
+    const valueSingleQuotes = valueStringified.replace(/"/g, "'");
+    const valueEscapedNewLines = valueSingleQuotes.replace(/\n/g, '\\n');
+    return valueEscapedNewLines;
+  }
+  // 字符串/数字/布尔：不做 HTML 转义，直接输出
+  return output === undefined || output === null ? '' : String(output as unknown);
+}
+```
+
+这确保 Maily JSON 中的 Liquid 变量（如 `{{payload.items}}` 对应一个数组）输出后仍能被 `JSON.parse` 正确解析，同时字符串中的引号、HTML 属性不被破坏。
+
+---
 
 #### 阶段 5：`mailyRender()` + `decodeHTML()` — Maily JSON 转 HTML
 
 - `@novu/maily-render` 的 `render()` 函数将处理完的 Maily JSON 转为 HTML 字符串
-- `decodeHTML()` 对 HTML 实体做解码
+- `decodeHTML()` 对 HTML 实体做解码（如 `&amp;` → `&`）
 
 ---
 
-### Maily JSON 完整五阶段示例
+### Maily JSON 完整五阶段示例（精确版）
 
 ```
-原始 Maily JSON:
+原始 Maily JSON (混合 variable 节点 + button 翻译 key):
 {
   type: 'doc',
   content: [
     { type: 'paragraph', content: [
+      // variable 节点，id 是翻译 key（无 {{ }} 包裹）
       { type: 'variable', attrs: { id: 't.greeting' } },
       { type: 'text', text: ' ' },
-      { type: 'variable', attrs: { id: 'subscriber.firstName' } }
+      // variable 节点，id 是普通变量
+      { type: 'variable', attrs: { id: 'subscriber.firstName' } },
+      { type: 'text', text: '! ' },
+      // button 节点，text 是翻译 key（带 {{ }} 包裹，isTextVariable=true）
+      { type: 'button', attrs: {
+          text: '{{t.order_status}}', isTextVariable: true,
+          url: 't.track_url', isUrlVariable: true   // url 也是翻译 key（但无 {{ }}，且豁免仅针对 text）
+      }}
     ]}
   ]
 }
 
 翻译数据:
-  t.greeting → 'Hello, {{t.title}} {{payload.name}}'
-  t.title    → 'Mr.'
+  t.greeting     → 'Hello'
+  t.order_status → 'Your order {{payload.orderId}} is ready'
+  t.track_url    → 'https://example.com/track/{{payload.orderId}}'
 
-payload: { name: 'John' }
+payload: { orderId: '12345' }
 subscriber: { firstName: 'Smith' }
-
-===== 阶段 1: wrapMailyInLiquid =====
-{
-  type: 'doc',
-  content: [{ type: 'paragraph', content: [
-    { type: 'variable', attrs: { id: '{{ t.greeting }}' } },   // 注意：翻译 key 也被包裹了？
-    { type: 'text', text: ' ' },
-    { type: 'variable', attrs: { id: '{{ subscriber.firstName }}' } }
-  ]}]
-}
-
-===== 阶段 2: transformMailyContent =====
-{
-  type: 'doc',
-  content: [{ type: 'paragraph', content: [
-    { type: 'text', text: '{{ t.greeting }}' },   // variable→text, attrs.id→text
-    { type: 'text', text: ' ' },
-    { type: 'text', text: '{{ subscriber.firstName }}' }
-  ]}]
-}
-
-===== 阶段 3: processMailyTranslations (JSON 字符串翻译) =====
-"{{ t.greeting }}" → "Hello, {{t.title}} {{payload.name}}"
-  ↓
-{
-  type: 'doc',
-  content: [{ type: 'paragraph', content: [
-    { type: 'text', text: 'Hello, {{t.title}} {{payload.name}}' },
-    { type: 'text', text: ' ' },
-    { type: 'text', text: '{{ subscriber.firstName }}' }
-  ]}]
-}
-
-===== 阶段 4: parseMailyContentByLiquid (JSON 字符串 Liquid) =====
-"{{t.title}}" 不变（Liquid 不解析 t. 前缀）
-"{{payload.name}}" → "John"
-"{{ subscriber.firstName }}" → "Smith"
-  ↓
-{
-  type: 'doc',
-  content: [{ type: 'paragraph', content: [
-    { type: 'text', text: 'Hello, {{t.title}} John' },  // ⚠️ 这里翻译嵌套 t.title
-    { type: 'text', text: ' ' },
-    { type: 'text', text: 'Smith' }
-  ]}]
-}
-
-===== 阶段 5: mailyRender + decodeHTML =====
-<p>Hello, {{t.title}} John Smith</p>
 ```
+
+**阶段 1: `wrapMailyInLiquid()`**
+
+```
+{
+  type: 'doc', content: [{ type: 'paragraph', content: [
+    // variable.id='t.greeting'：flag=id, attrValue 为 truthy → 包裹为 {{ t.greeting }}
+    { type: 'variable', attrs: { id: '{{ t.greeting }}' } },
+    { type: 'text', text: ' ' },
+    // variable.id='subscriber.firstName' → 包裹为 {{ subscriber.firstName }}
+    { type: 'variable', attrs: { id: '{{ subscriber.firstName }}' } },
+    { type: 'text', text: '! ' },
+    // button.text='{{t.order_status}}': attrKey=TEXT, isTextVariable=true, 正则匹配 → 豁免！保留原样
+    // button.url='t.track_url': attrKey=URL（非 TEXT） → 不触发豁免，包裹为 {{ t.track_url }}
+    { type: 'button', attrs: {
+        text: '{{t.order_status}}', isTextVariable: true,
+        url: '{{ t.track_url }}', isUrlVariable: true
+    }}
+  ]}]
+}
+```
+
+**阶段 2: `transformMailyContent()` (variable→text 转换)**
+
+```
+{
+  type: 'doc', content: [{ type: 'paragraph', content: [
+    // variable → text, attrs.id → text
+    { type: 'text', text: '{{ t.greeting }}' },
+    { type: 'text', text: ' ' },
+    { type: 'text', text: '{{ subscriber.firstName }}' },
+    { type: 'text', text: '! ' },
+    // button 不变（不是 variable 节点）
+    { type: 'button', attrs: {
+        text: '{{t.order_status}}', isTextVariable: true,
+        url: '{{ t.track_url }}', isUrlVariable: true
+    }}
+  ]}]
+}
+```
+
+**阶段 3: `processMailyTranslations()` (翻译服务 — JSON 字符串替换)**
+
+Maily JSON 被 stringify 后，翻译服务在 JSON 字符串中匹配 `{{ t.greeting }}`、`{{t.order_status}}`、`{{ t.track_url }}`：
+
+```
+"{{ t.greeting }}"        → "Hello"
+"{{t.order_status}}"      → "Your order {{payload.orderId}} is ready"
+"{{ t.track_url }}"       → "https://example.com/track/{{payload.orderId}}"
+```
+
+结果（翻译服务可能已解析部分 Liquid，但阶段 4 会再跑一次 Liquid 确保完整性）：
+
+```
+{
+  type: 'doc', content: [{ type: 'paragraph', content: [
+    { type: 'text', text: 'Hello' },
+    { type: 'text', text: ' ' },
+    { type: 'text', text: '{{ subscriber.firstName }}' },
+    { type: 'text', text: '! ' },
+    { type: 'button', attrs: {
+        text: 'Your order {{payload.orderId}} is ready', isTextVariable: true,
+        url: 'https://example.com/track/{{payload.orderId}}', isUrlVariable: true
+    }}
+  ]}]
+}
+```
+
+**阶段 4: `parseMailyContentByLiquid()` (Renderer Liquid 引擎 — 变量替换)**
+
+```
+{{ subscriber.firstName }} → 'Smith'
+{{payload.orderId}}        → '12345'
+```
+
+```
+{
+  type: 'doc', content: [{ type: 'paragraph', content: [
+    { type: 'text', text: 'Hello' },
+    { type: 'text', text: ' ' },
+    { type: 'text', text: 'Smith' },
+    { type: 'text', text: '! ' },
+    { type: 'button', attrs: {
+        text: 'Your order 12345 is ready', isTextVariable: true,
+        url: 'https://example.com/track/12345', isUrlVariable: true
+    }}
+  ]}]
+}
+```
+
+**阶段 5: `mailyRender()` → HTML**
+
+```html
+<p>Hello Smith! <a href="https://example.com/track/12345">Your order 12345 is ready</a></p>
+```
+
+---
+
+### `@novu/ee-translation` 与本地 Liquid 的职责边界总表
+
+| 职责 | `@novu/ee-translation` (阶段 3) | Renderer 本地 Liquid (阶段 4) |
+|------|---------------------------------|-------------------------------|
+| 翻译 `{{t.key}}` → 文本 | ✅ 是（核心职责） | ❌ 否（Liquid 不识别 t. 前缀） |
+| 解析 `{{payload.xxx}}` 变量 | ⚠️ 内部有 Liquid 引擎，可能会解析 | ✅ 是（最终保障，用自定义 outputEscape） |
+| 解析 `{{subscriber.xxx}}` 变量 | ⚠️ 同上 | ✅ 是 |
+| 自定义 outputEscape (对象/数组转义) | ❌ 否（翻译服务用 `createLiquidEngine()` 默认配置） | ✅ 是（Renderer 自有 liquidEngine） |
+| Maily show/each 节点处理 | ❌ 否 | ❌ 否（阶段 2 已完成） |
+| Maily JSON → HTML 渲染 | ❌ 否 | ❌ 否（阶段 5 mailyRender） |
+
+**设计意图**：
+- 对 **SMS/In-App/Push/Chat**：翻译服务内部的 Liquid 引擎**足够用**，不需要再跑本地 Liquid
+- 对 **Email (Maily)**：翻译服务的 Liquid 引擎配置不满足 Maily JSON 对对象/数组转义的特殊需求，因此额外在阶段 4 用 Renderer 自有 liquidEngine 再跑一次，确保 JSON 完整性
 
 ---
 
@@ -433,13 +610,13 @@ return this.processBodyContent({
 
 ### 各路径翻译 + 变量替换顺序对比表
 
-| 路径 | 翻译替换位置 | 变量替换位置 | 是否分开两步 | 翻译后是否含 Liquid 变量 |
-|------|-------------|-------------|-------------|-----------------------|
-| SMS/In-App/Push/Chat | `@novu/ee-translation.execute()` 内部 | `@novu/ee-translation.execute()` 内部 | ❌ 同一步 | ✅ 翻译服务内部先翻译再 Liquid |
-| Email Subject | `processStringTranslations()` | `processStringTranslations()` 返回前 | ❌ 同一步（翻译服务内部） | ✅ 但 subject 不走 Liquid，翻译服务搞定 |
-| Email 纯文本 Body | `processTextTranslations()` 前半段 | `processTextTranslations()` 后半段 `liquidEngine.parseAndRender()` | ✅ 两步 | ✅ 翻译文本可含 Liquid 变量 |
-| Email Maily JSON Body (阶段 3) | `processMailyTranslations()` (JSON 字符串) | `parseMailyContentByLiquid()` (阶段 4, JSON 字符串) | ✅ 两步 | ✅ 翻译文本可含 Liquid 变量 |
-| Email Layout Body | 走 processBodyContent 同上 | 走 processBodyContent 同上 | ✅ 两步 | ✅ 同上 |
+| 路径 | 翻译替换位置 | Liquid 变量替换次数 & 位置 | 翻译与变量是否分开 | 翻译服务内部是否跑 Liquid |
+|------|-------------|---------------------------|-------------------|--------------------------|
+| SMS/In-App/Push/Chat | `@novu/ee-translation.execute()` 内部 | **1 次** — 翻译服务内部 | ❌ 同一步 | ✅ 是，一次搞定 |
+| Email Subject | `processSubjectTranslations` → `processStringTranslations` | **1 次** — 翻译服务内部 | ❌ 同一步 | ✅ 是，后续只做 unescapeJsonString + decodeHTML |
+| Email 纯文本 Body | `processTextTranslations` 前半段（翻译服务） | **2 次** — 翻译服务内 1 次 + `this.liquidEngine.parseAndRender()` 1 次 | ✅ 翻译阶段与 Renderer 本地 Liquid 阶段分开 | ✅ 是，但 Step 2 用自定义 outputEscape 再跑一遍做最终保障 |
+| Email Maily JSON Body | `processMailyTranslations`（阶段 3, JSON 字符串） | **2 次** — 翻译服务内 1 次（阶段 3）+ `this.liquidEngine.parseAndRender()` 1 次（阶段 4） | ✅ 阶段 3 与阶段 4 分开 | ✅ 是，但阶段 4 用自定义 outputEscape 保障 JSON 可解析性 |
+| Email Layout Body | 走 processBodyContent（同纯文本或 Maily） | 同上 | ✅ 两步（同上） | ✅ 同上 |
 
 ---
 
@@ -904,3 +1081,25 @@ const translationModule = require('@novu/ee-translation')?.Translate;
 ### ❌ 错误：`'t.key'` filter 参数直接被翻译
 
 **✅ 正确**：`'t.key'` 作为 Liquid filter 的字符串参数，Liquid 引擎将其视为普通字符串不会触发翻译。完整路径是：`'t.key'` → `preprocessFilterTranslationArgs()` 转为 `'[T:key]'` → Liquid 透传 → `postprocessTranslationMarkers()` 还原为 `{{t.key}}` → `@novu/ee-translation` 翻译为最终文本。
+
+### ❌ 错误：Maily `wrapMailyInLiquid` 会把所有属性都包裹成 Liquid
+
+**✅ 正确**：`wrapMailyInLiquid` 只按 `variableAttributeConfig(type)` 返回的白名单包裹属性，且还需 `flag` 对应的属性值为 truthy。例如 `button.text` 仅当 `isTextVariable=true` 时才会被包裹，`image.src` 仅当 `isSrcVariable=true` 时才会被包裹。
+
+### ❌ 错误：所有节点上的翻译 key 都能豁免 Liquid 包裹
+
+**✅ 正确**：**翻译 key 豁免规则仅适用于 `button.attrs.text`（且需 `isTextVariable=true`）**。其他所有属性 — 包括 `variable` 节点的 `id`、`button.url`、`image.src`、`link.href` — 即便值是翻译 key，仍然会被包裹成 `{{ t.xxx }}`。例如 `{type:"variable", attrs:{id:"t.greeting"}}` 会被包裹为 `{type:"variable", attrs:{id:"{{ t.greeting }}"}}`。
+
+### ❌ 错误：Maily `variable` 节点的 id 会被翻译服务直接识别
+
+**✅ 正确**：`variable` 节点的 `id` 不是文本节点，翻译服务在 JSON 字符串中搜索 `{{t.key}}` / `{{ t.key }}`。`variable` 节点先在阶段 1 被 `wrapMailyInLiquid` 包裹为 `{{ t.xxx }}`，再在阶段 2 被 `processVariableNodeTypes` 从 `attrs.id` 搬到 `text` 字段，此时 JSON 字符串中才出现 `"text":"{{ t.xxx }}"`，翻译服务才能在阶段 3 匹配并替换。
+
+### ❌ 错误：所有路径只执行一次 Liquid 变量替换
+
+**✅ 正确**：不同路径 Liquid 执行次数不同：
+- SMS/In-App/Push/Chat：**1 次**（翻译服务内部）
+- Email Subject：**1 次**（翻译服务内部）
+- Email 纯文本 Body：**2 次**（翻译服务内部 + Renderer 自有 liquidEngine）
+- Email Maily JSON：**2 次**（翻译服务内部阶段 3 + Renderer 自有 liquidEngine 阶段 4）
+
+Renderer 自有 `this.liquidEngine` 额外执行的原因是其 `outputEscape` 对对象/数组做了特殊处理（`JSON.stringify` + 双引号转单引号 + 换行转义），保证 Maily JSON 和 Email 场景中嵌入的复杂变量能被正确 `JSON.parse`。
