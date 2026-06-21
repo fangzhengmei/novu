@@ -587,7 +587,415 @@ return filter.isNegated ? !result : result;
 
 ---
 
-## 8. 完整协作时序图
+## 8. 数据来源全景：三大引用类数据的生命周期
+
+Variant 路由中的引用型过滤（`subscriber` 属性、`isOnline` 状态、`previousStep` 状态）依赖三类外部数据。下面分别追踪它们的「写入 → 存储 → 读取」完整链路。
+
+---
+
+## 9. 订阅者属性预加载（Subscriber Preload）数据来源
+
+### 9.1 触发条件：按需加载
+
+[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L45-L67)
+
+```typescript
+private async fetchSubscriberIfMissing(command, filters) {
+  // 优先使用已传入的 subscriber（上层调用方已预加载）
+  if (command.variables?.subscriber) {
+    return command.variables.subscriber;
+  }
+
+  // 仅当 filters 中存在 subscriber 类型条件时才加载
+  const subscriberFilterExist = filters?.find((filter) =>
+    filter?.children?.find((item) => item?.on === FilterPartTypeEnum.SUBSCRIBER)
+  );
+
+  if (subscriberFilterExist && command.job) {
+    return await this.getSubscriberBySubscriberId({
+      subscriberId: command.job.subscriberId,   // job 中的外部 subscriberId
+      _environmentId: command.environmentId,
+    });
+  }
+  return undefined;
+}
+```
+
+注意：虽然 `isOnline` / `isOnlineInLast` / `previousStep` 也依赖 subscriber，但它们**不**经过 `fetchSubscriberIfMissing` 的按需加载判断——`isOnline`/`isOnlineInLast` 会在 `processIsOnline` 内部单独查询 subscriber；`previousStep` 则完全不依赖 subscriber 对象本身。
+
+### 9.2 查询方法与缓存
+
+[normalize-variables.usecase.ts](libs/application-generic/src/usecases/normalize-variables/normalize-variables.usecase.ts#L95-L113)
+
+```typescript
+@CachedResponse({
+  builder: (command) => buildSubscriberKey({
+    _environmentId: command._environmentId,
+    subscriberId: command.subscriberId,
+  }),
+})
+public async getSubscriberBySubscriberId({ subscriberId, _environmentId }) {
+  return await this.subscriberRepository.findOne({
+    _environmentId,
+    subscriberId,
+  });
+}
+```
+
+缓存 key 格式（[entities.ts](libs/application-generic/src/services/cache/key-builders/entities.ts#L12-L25)）：
+
+```
+{entity:subscriber:e=<environmentId>:s=<subscriberId>}
+```
+
+由 `@CachedResponse` 装饰器（基于 Redis）提供缓存，避免重复 DB 查询。
+
+### 9.3 底层存储：Subscriber Collection
+
+[subscriber.schema.ts](libs/dal/src/repositories/subscriber/subscriber.schema.ts#L8-L36) 中的关键字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `subscriberId` | String | **外部业务 ID**，来自 Trigger 事件，查询条件之一 |
+| `_environmentId` | ObjectId | 环境 ID，查询条件之一 |
+| `_organizationId` | ObjectId | 组织 ID |
+| `firstName` / `lastName` | String | 基本属性，可用于 filter 比较 |
+| `email` / `phone` | String | 渠道地址 |
+| `locale` / `timezone` | String | 本地化信息 |
+| `data` | Mixed | 自定义属性对象，filter 中通过 `subscriber.data.xxx` 访问 |
+| `channels` | Mixed[] | 渠道凭证（token/endpoint 等） |
+| `isOnline` | Boolean | 在线状态（见第 10 节） |
+| `lastOnlineAt` | Date | 最后在线时间（见第 10 节） |
+
+**唯一索引**（[subscriber.schema.ts](libs/dal/src/repositories/subscriber/subscriber.schema.ts#L179-L182)）：
+
+```javascript
+{ subscriberId: 1, _environmentId: 1 }
+// unique: true, partialFilterExpression: { deleted: false }
+```
+
+这保证同一环境下 subscriberId 唯一，`findOne({ _environmentId, subscriberId })` 能命中索引高效查询。
+
+### 9.4 可用于 Filter 的字段层级
+
+`processFilterEquality` 使用 `_.get(variables, `${on}.${field}`)` 取值（[filter.ts](libs/application-generic/src/utils/filter.ts#L7-L18)），因此 subscriber 相关 filter 的取值路径为：
+
+| filter.on | filter.field 示例 | lodash 取值路径 | 对应 Subscriber Entity 字段 |
+|---|---|---|---|
+| `subscriber` | `firstName` | `variables.subscriber.firstName` | `subscriberEntity.firstName` |
+| `subscriber` | `email` | `variables.subscriber.email` | `subscriberEntity.email` |
+| `subscriber` | `data.vipLevel` | `variables.subscriber.data.vipLevel` | `subscriberEntity.data.vipLevel`（自定义数据） |
+| `subscriber` | `locale` | `variables.subscriber.locale` | `subscriberEntity.locale` |
+
+---
+
+## 10. 在线状态判断（isOnline / isOnlineInLast）数据来源
+
+### 10.1 数据存储位置
+
+在线状态同样存储在 **Subscriber Collection** 中（[subscriber.schema.ts](libs/dal/src/repositories/subscriber/subscriber.schema.ts#L26-L31)）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `isOnline` | Boolean | `false` | 当前是否在线 |
+| `lastOnlineAt` | Date | （无默认） | 最后一次在线的 ISO 时间戳 |
+
+### 10.2 写入路径一：WebSocket 实时连接
+
+这是在线状态的主要写入源，由 `apps/ws` 服务负责。
+
+#### 连接建立
+
+[ws.gateway.ts](apps/ws/src/socket/ws.gateway.ts#L134-L168)
+
+```typescript
+private async processConnectionRequest(connection: Socket) {
+  const token = this.extractToken(connection);
+  const subscriber = await this.getSubscriber(token); // JWT 校验，aud === 'widget_user'
+
+  await connection.join(subscriber._id);   // 加入以 subscriber._id 命名的 Socket.IO 房间
+  await this.subscriberOnlineService.handleConnection(subscriber);
+}
+```
+
+[subscriber-online.service.ts](apps/ws/src/shared/subscriber-online/subscriber-online.service.ts#L14-L18)
+
+```typescript
+async handleConnection(subscriber: ISubscriberJwt) {
+  await this.subscriberRepository.update(
+    { _id: subscriber._id, _environmentId: subscriber.environmentId },
+    { $set: { isOnline: true } }
+  );
+}
+```
+
+#### 连接断开
+
+[ws.gateway.ts](apps/ws/src/socket/ws.gateway.ts#L99-L126)
+
+```typescript
+private async handlerSubscriberDisconnection(connection: Socket) {
+  const subscriber = await this.getSubscriber(token);
+  // 检查该 subscriber 当前还有多少个活跃 Socket.IO 连接
+  const activeConnections = await this.getActiveConnections(connection, subscriber._id);
+
+  await this.subscriberOnlineService.handleDisconnection(subscriber, activeConnections);
+}
+```
+
+[subscriber-online.service.ts](apps/ws/src/shared/subscriber-online/subscriber-online.service.ts#L20-L38)
+
+```typescript
+async handleDisconnection(subscriber, activeConnections) {
+  let isOnline = false;
+  const lastOnlineAt = new Date().toISOString();
+
+  // 多设备/多标签页场景：仍有活跃连接则保持在线
+  if (activeConnections > 1) {
+    isOnline = true;
+  }
+
+  await this.subscriberRepository.update(
+    { _id: subscriber._id, _environmentId: subscriber.environmentId },
+    { $set: { isOnline, lastOnlineAt } }
+  );
+}
+```
+
+关键细节：断开时并非直接置为离线，而是先通过 `server.in(subscriber._id).fetchSockets()` 统计该 subscriber 仍有多少活跃连接——多于 1 个则保持 `isOnline = true`。
+
+### 10.3 写入路径二：REST API（手动标记）
+
+- **公共 API**：[update-subscriber-online-flag.usecase.ts](apps/api/src/app/subscribers/usecases/update-subscriber-online-flag/update-subscriber-online-flag.usecase.ts#L15-L37)
+
+  ```typescript
+  private getUpdatedFields(isOnline: boolean) {
+    return {
+      isOnline,
+      ...(!isOnline && { lastOnlineAt: new Date().toISOString() }),
+    };
+  }
+  ```
+
+  仅在 `isOnline = false` 时更新 `lastOnlineAt`。
+
+- **内部 API**：[update-subscriber-online-state.usecase.ts](apps/api/src/app/internal/usecases/update-subscriber-online-state/update-subscriber-online-state.usecase.ts#L15-L43)
+
+  无论 `isOnline` 是 true 还是 false，都会更新 `lastOnlineAt`。
+
+### 10.4 读取路径：processIsOnline
+
+[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L187-L244)
+
+```typescript
+private async processIsOnline(filter, command, details) {
+  // 从 SubscriberRepository 查询（有缓存 @CachedResponse）
+  const subscriber = await this.getSubscriberBySubscriberId({
+    subscriberId: command.job.subscriberId,
+    _environmentId: command.environmentId,
+  });
+
+  // 老订阅者（在线功能上线前创建）：两个字段都为 undefined → 判定为不通过
+  if (typeof subscriber?.isOnline === 'undefined' && typeof subscriber?.lastOnlineAt === 'undefined') {
+    return false;
+  }
+
+  // IS_ONLINE：精确匹配布尔值
+  if (filter.on === FilterPartTypeEnum.IS_ONLINE) {
+    return subscriber?.isOnline === filter.value;
+  }
+
+  // IS_ONLINE_IN_LAST：当前在线 或 lastOnlineAt 距今 <= N 时间单位
+  const diff = differenceIn(new Date(), parseISO(subscriber.lastOnlineAt), filter.timeOperator);
+  return subscriber?.isOnline || (!subscriber?.isOnline && diff >= 0 && diff <= filter.value);
+}
+```
+
+注意：`processIsOnline` 自己调用 `getSubscriberBySubscriberId`，并不依赖 `NormalizeVariables` 预加载的 subscriber。这意味着在同一次 filter 评估中，如果同时存在 `subscriber` 字段 filter 和 `isOnline` filter，subscriber 可能被查询两次（但有缓存，第二次是 Redis 命中）。
+
+### 10.5 数据一致性说明
+
+- **潜在延迟**：WS 服务的在线状态更新依赖 Socket.IO 连接事件。当 WS 实例异常宕机时，`isShutdown` 标志为 true，断开事件会被跳过（[ws.gateway.ts](apps/ws/src/socket/ws.gateway.ts#L99-L105)），可能导致 `isOnline` 状态残留为 `true`。
+- **无主动心跳检测**：目前代码中未发现定期扫描长时间未更新 `lastOnlineAt` 的订阅者并强制置为离线的任务。
+
+---
+
+## 11. 前置步骤状态查询（previousStep）数据来源
+
+`previousStep` filter 通过查询同一次 Trigger 事务中前置 Step 的消息状态（seen/read）来做条件判断。涉及两张 MongoDB Collection：**Job** 和 **Message**。
+
+### 11.1 数据源一：Job Collection
+
+#### 存储内容
+
+[job.entity.ts](libs/dal/src/repositories/job/job.entity.ts#L24-L61)
+
+| 字段 | 作用（对 previousStep 查询而言） |
+|---|---|
+| `_id` | Job 的 ObjectId，用于关联 Message |
+| `transactionId` | 同一次 Trigger 事务的唯一标识，**查询条件之一** |
+| `_subscriberId` | subscriber 的内部 ObjectId，**查询条件之一** |
+| `_environmentId` / `_organizationId` | 多租户隔离，**查询条件之一** |
+| `step` | 完整的 `NotificationStepEntity`，内嵌 `step.uuid` 字段 — **这就是被引用的 Step 标识** |
+| `status` | Job 状态 |
+| `type` | Step 类型（EMAIL / SMS / IN_APP 等） |
+
+#### 查询方式
+
+[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L140-L150)
+
+```typescript
+const job = await this.jobRepository.findOne({
+  transactionId: command.job.transactionId,  // 同一事务
+  _subscriberId: command.job._subscriberId,   // 同一订阅者
+  _environmentId: command.environmentId,
+  _organizationId: command.organizationId,
+  'step.uuid': filter.step,                   // filter.step = 被引用 Step 的 uuid
+});
+```
+
+这是一个「点号查询」（dot notation），在 MongoDB 中匹配嵌套文档字段 `step.uuid`。
+
+**容错策略**：如果 job 不存在，直接返回 `true`（视为条件通过）。这意味着如果前置步骤尚未执行或根本不存在，不会阻断当前 Variant 的匹配。
+
+### 11.2 数据源二：Message Collection
+
+#### 存储内容
+
+[message.entity.ts](libs/dal/src/repositories/message/message.entity.ts#L23-L99)
+
+| 字段 | 作用 |
+|---|---|
+| `_id` | Message 的 ObjectId |
+| `_jobId` | 关联的 Job ObjectId，**查询条件之一** |
+| `_subscriberId` | subscriber 内部 ID，**查询条件之一** |
+| `transactionId` | 同事务标识，**查询条件之一** |
+| `_environmentId` / `_organizationId` | 多租户隔离 |
+| `seen` | Boolean — 用户是否「看到」消息（In-App Feed 中出现在视口） |
+| `read` | Boolean — 用户是否「阅读」消息（主动点击/打开） |
+| `channel` | 渠道类型（EMAIL / IN_APP / SMS 等） |
+
+#### 查询方式
+
+[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L152-L161)
+
+```typescript
+const message = await this.messageRepository.findOne({
+  _jobId: job._id,
+  _environmentId: command.environmentId,
+  _subscriberId: command.job._subscriberId,
+  transactionId: command.job.transactionId,
+});
+```
+
+同样的容错策略：Message 不存在也返回 `true`。
+
+#### seen/read 的写入路径
+
+主要由 Widget / Inbox API 的「标记已读/已见」接口写入：
+
+[mark-message-as.usecase.ts](apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts#L39-L117)
+
+```typescript
+async execute(command) {
+  // 1. 失效计数缓存
+  await this.invalidateCache.invalidateQuery({ key: buildMessageCountKey().invalidate(...) });
+
+  // 2. 更新 Message 文档的 seen / read 字段（含 lastSeenDate / lastReadDate）
+  await this.messageRepository.changeStatus(
+    command.environmentId,
+    subscriber._id,
+    command.messageIds,
+    command.mark   // { seen?: boolean, read?: boolean }
+  );
+
+  // 3. 通过 WebSocket 推送新的未读/未见计数到前端
+  this.webSocketsQueueService.add({
+    name: 'sendMessage',
+    data: { event: WebSocketEventEnum.UNREAD, userId: subscriber._id, ... },
+  });
+
+  // 4. 触发 MESSAGE_SEEN / MESSAGE_READ Webhook
+  await this.sendWebhookMessage.execute({ eventType: WebhookEventEnum.MESSAGE_SEEN, ... });
+}
+```
+
+底层写入（[message.repository.ts](libs/dal/src/repositories/message/message.repository.ts#L724-L758)）：
+
+```typescript
+async changeStatus(environmentId, subscriberId, messageIds, mark) {
+  const requestQuery = {};
+  if (mark.seen != null)  { requestQuery.seen = mark.seen;  requestQuery.lastSeenDate = new Date(); }
+  if (mark.read != null)  { requestQuery.read = mark.read;  requestQuery.lastReadDate = new Date(); }
+
+  for (const chunk of this.chunkArray(messageIds)) {
+    await this.update(
+      { _environmentId, _subscriberId, _id: { $in: chunk.map(id => ObjectId(id)) } },
+      { $set: requestQuery }
+    );
+  }
+}
+```
+
+### 11.3 状态判定逻辑
+
+[conditions-filter.usecase.ts](libs/application-generic/src/usecases/conditions-filter/conditions-filter.usecase.ts#L163-L184)
+
+```typescript
+// stepType 为 SEEN / UNSEEN → 检查 message.seen
+// stepType 为 READ / UNREAD → 检查 message.read
+const value = [PreviousStepTypeEnum.SEEN, PreviousStepTypeEnum.UNSEEN]
+  .includes(filter.stepType) ? message.seen : message.read;
+
+// UNREAD / UNSEEN 语义自动取反：期望「未读」等价于 value === false
+const passed = [PreviousStepTypeEnum.UNREAD, PreviousStepTypeEnum.UNSEEN]
+  .includes(filter.stepType) ? value === false : value;
+```
+
+即：
+
+| filter.stepType | 比较逻辑 |
+|---|---|
+| `read` | `message.read === true` |
+| `unread` | `message.read === false` |
+| `seen` | `message.seen === true` |
+| `unseen` | `message.seen === false` |
+
+### 11.4 完整数据流图
+
+```
+用户触发 Widget In-App「标记已读」
+        │
+        ▼
+apps/api: MarkMessageAs.execute()
+        │
+        ├──► messageRepository.changeStatus()
+        │       └──► MongoDB Message Collection
+        │              └─► _id, seen, read, lastSeenDate, lastReadDate
+        │
+        ├──► invalidateCache(buildMessageCountKey)  ← Redis 计数缓存失效
+        │
+        └──► WebSocketsQueueService.add()
+                └──► apps/ws: WSGateway.sendMessage()
+                        └──► 前端实时刷新未读数
+                                    │
+                                    ▼
+                    ┌────────────────────────────────────┐
+Variant 路由时       │  Worker: processPreviousStep()     │
+(previousStep filter)│    1. jobRepository.findOne(       │
+                     │         transactionId,             │
+                     │         _subscriberId,             │
+                     │         'step.uuid': <uuid>)       │
+                     │    2. messageRepository.findOne(   │
+                     │         _jobId, _subscriberId,     │
+                     │         transactionId)             │
+                     │    3. 比较 seen / read             │
+                     └────────────────────────────────────┘
+```
+
+---
+
+## 12. 完整协作时序图
 
 ```
 ┌──────────┐    ┌──────────────────┐    ┌─────────────┐    ┌──────────────────┐
@@ -637,7 +1045,7 @@ return filter.isNegated ? !result : result;
 
 ---
 
-## 9. 关键文件索引
+## 13. 关键文件索引
 
 | 文件 | 职责 |
 |---|---|
@@ -657,6 +1065,18 @@ return filter.isNegated ? !result : result;
 | [send-message.base.ts](apps/worker/src/app/workflow/usecases/send-message/send-message.base.ts) | processVariants：连接路由结果与 Channel 发送 |
 | [send-message.usecase.ts](apps/worker/src/app/workflow/usecases/send-message/send-message.usecase.ts) | Step 级条件评估 + 分发到具体 Channel |
 | [send-message-email.usecase.ts](apps/worker/src/app/workflow/usecases/send-message/send-message-email.usecase.ts) | Email Channel 中 processVariants → 模板替换的完整示例 |
+| [subscriber.schema.ts](libs/dal/src/repositories/subscriber/subscriber.schema.ts) | Subscriber MongoDB Schema（含 `isOnline` / `lastOnlineAt` 字段 + 唯一索引定义） |
+| [subscriber.repository.ts](libs/dal/src/repositories/subscriber/subscriber.repository.ts) | Subscriber DAL：findBySubscriberId / findByEmail / findByPhone / bulkCreateSubscribers |
+| [job.entity.ts](libs/dal/src/repositories/job/job.entity.ts) | Job Entity：`transactionId` / `_subscriberId` / `step.uuid` 等 previousStep 查询所需字段 |
+| [job.repository.ts](libs/dal/src/repositories/job/job.repository.ts) | Job DAL：storeJobs / updateStatus / findJobsToDigest |
+| [message.entity.ts](libs/dal/src/repositories/message/message.entity.ts) | Message Entity：`_jobId` / `seen` / `read` / `transactionId` 等 previousStep 查询所需字段 |
+| [message.repository.ts](libs/dal/src/repositories/message/message.repository.ts) | Message DAL：changeStatus（seen/read 更新） / updateMessagesStatusByIds |
+| [ws.gateway.ts](apps/ws/src/socket/ws.gateway.ts) | WebSocket Gateway：连接建立/断开 → 调用 SubscriberOnlineService |
+| [subscriber-online.service.ts](apps/ws/src/shared/subscriber-online/subscriber-online.service.ts) | WS 在线状态写入：handleConnection / handleDisconnection（多设备感知） |
+| [update-subscriber-online-flag.usecase.ts](apps/api/src/app/subscribers/usecases/update-subscriber-online-flag/update-subscriber-online-flag.usecase.ts) | 公共 REST API：手动标记订阅者在线状态 |
+| [update-subscriber-online-state.usecase.ts](apps/api/src/app/internal/usecases/update-subscriber-online-state/update-subscriber-online-state.usecase.ts) | 内部 REST API：标记订阅者在线状态（每次都写 lastOnlineAt） |
+| [mark-message-as.usecase.ts](apps/api/src/app/widgets/usecases/mark-message-as/mark-message-as.usecase.ts) | Widget In-App：标记消息已读/已见（seen/read 写入 + WebSocket 推送 + Webhook） |
+| [entities.ts](libs/application-generic/src/services/cache/key-builders/entities.ts) | 缓存 key 构建：buildSubscriberKey / buildDedupSubscriberKey |
 | [select-variant.spec.ts](libs/application-generic/src/usecases/select-variant/select-variant.spec.ts) | Variant 选择的单元测试（含完整测试数据，`isNegated` 仅在 fixture 中出现） |
 | [conditions-filter.usecase.spec.ts](apps/worker/src/app/workflow/specs/conditions-filter.usecase.spec.ts) | ConditionsFilter 的集成测试（`isNegated` 仅在 fixture 中出现） |
 | [conditions-editor.tsx](apps/dashboard/src/components/conditions-editor/conditions-editor.tsx) | Dashboard 条件编辑器（基于 react-querybuilder，未处理 `isNegated`） |
