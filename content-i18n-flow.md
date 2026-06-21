@@ -323,15 +323,172 @@ content = command.bridgeData?.outputs?.body  // 直接使用 bridge 输出
 在 V2 Liquid 模板中，翻译 key 可以作为 filter 的字符串参数：
 
 ```handlebars
-{{payload.count | pluralize: 't.apple', 't.apples'}}
+You have {{payload.appleCount | pluralize: 't.appleSingular', 't.applePlural', 'false'}} and {{payload.itemCount | pluralize: 't.itemSingular', 't.itemPlural', 'false' | append: 't.suffix'}}
 ```
 
-**处理流程**：
-1. Framework `preprocessFilterTranslationArgs()`: `'t.apple'` → `'[T:apple]'`
-2. Liquid 渲染 `pluralize` filter
-3. `@novu/ee-translation` 替换 `'[T:apple]'` → 实际翻译
+这里的 `'t.appleSingular'` 是一个 **Liquid filter 的字符串参数**，不是模板变量。翻译 key 的完整生命周期如下：
 
-**E2E 测试证据**：[translation-replacement.e2e-ee.ts#L400-L437](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/translations/e2e/v2/translation-replacement.e2e-ee.ts#L400-L437)
+### 完整四阶段流转
+
+```
+原始 control:    {{payload.appleCount | pluralize: 't.appleSingular', 't.applePlural', 'false'}}
+                 ↓
+阶段 1 预处理:   {{payload.appleCount | pluralize: '[T:appleSingular]', '[T:applePlural]', 'false'}}
+                 ↓
+阶段 2 Liquid:   pluralize(1, '[T:appleSingular]', '[T:applePlural]', 'false') → '[T:appleSingular]'
+                 完整输出: "You have [T:appleSingular]"
+                 ↓
+阶段 3 后处理:   "You have {{t.appleSingular}}"
+                 ↓
+阶段 4 翻译:     @novu/ee-translation → "You have apple"
+```
+
+### 各阶段详解
+
+**阶段 1 — `preprocessFilterTranslationArgs()`**
+
+代码：[client.ts#L796-L798](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/packages/framework/src/client.ts#L796-L798)
+
+```typescript
+private preprocessFilterTranslationArgs(template: string): string {
+  return template.replace(/'t\.([\p{L}\p{N}_.-]+)'/gu, "'[T:$1]'");
+}
+```
+
+- 匹配单引号包裹的 `'t.key'` 字符串（注意：只匹配 filter 参数中的翻译 key，不匹配独立的 `{{t.key}}`）
+- `'t.appleSingular'` → `'[T:appleSingular]'`
+- 转换后仍然是合法的 Liquid 字符串参数
+
+**阶段 2 — Liquid 渲染**
+
+`pluralize` filter（[pluralize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/packages/framework/src/filters/pluralize.ts)）接收字符串参数并原样返回选中的那个：
+
+```
+pluralize(1, '[T:appleSingular]', '[T:applePlural]', 'false')
+  → count=1, 选 singular 参数 → 返回字符串 '[T:appleSingular]'
+```
+
+关键点：`[T:appleSingular]` 不是 Liquid 语法，Liquid 引擎对它不做任何处理，它作为普通字符串透传。
+
+`append` filter 同理：
+```
+{{payload.itemCount | pluralize: '[T:itemSingular]', '[T:itemPlural]', 'false' | append: '[T:suffix]'}}
+  → pluralize(5, ...) → '[T:itemPlural]'
+  → append('[T:suffix]') → '[T:itemPlural][T:suffix]'
+```
+
+**阶段 3 — `postprocessTranslationMarkers()`**
+
+代码：[client.ts#L804-L806](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/packages/framework/src/client.ts#L804-L806)
+
+```typescript
+private postprocessTranslationMarkers(content: string): string {
+  return content.replace(/\[T:([\p{L}\p{N}_.-]+)\]/gu, '{{t.$1}}');
+}
+```
+
+- 将所有 `[T:key]` 占位符还原为 `{{t.key}}` 翻译标记
+- 无论是独立的 `{{t.key}}` 还是 filter 参数中的 `'t.key'`，最终都统一变成 `{{t.key}}` 形式
+- `postprocess` 是**统一**处理 `preprocessTranslationPatterns` 和 `preprocessFilterTranslationArgs` 两步产出的
+
+**阶段 4 — `@novu/ee-translation` 翻译**
+
+`{{t.key}}` 标记由 `@novu/ee-translation` 模块通过正则匹配解析并替换为翻译文本。
+
+### 单元测试证据
+
+[client.test.ts#L1449-L1462](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/packages/framework/src/client.test.ts#L1449-L1462)：
+
+```typescript
+// 输入 controls
+controls: {
+  body: "You have {{ payload.count | pluralize: 't.apple', 't.apples' }}",
+  subject: "{{ payload.count | pluralize: 't.itemSingular', 't.itemPlural' }} in your cart",
+}
+
+// Framework 输出 (count=5)
+// 注意：输出中仍是 {{t.key}} 标记，不是 [T:key] 占位符
+expect(emailExecutionResult.outputs).toEqual({
+  body: 'You have 5 {{t.apples}}',
+  subject: '5 {{t.itemPlural}} in your cart',
+});
+```
+
+这证明了：
+1. `[T:key]` 只是 Liquid 渲染期间的**临时中间态**，Framework 输出时已经还原为 `{{t.key}}`
+2. `{{t.key}}` 才是交给下一阶段（`@novu/ee-translation`）的**真正翻译标记**
+
+### E2E 测试证据
+
+[translation-replacement.e2e-ee.ts#L400-L437](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/translations/e2e/v2/translation-replacement.e2e-ee.ts#L400-L437)：
+
+```typescript
+// 翻译内容
+content: {
+  appleSingular: 'apple',
+  applePlural: 'apples',
+  itemSingular: 'item',
+  itemPlural: 'items',
+  suffix: ' in cart',
+}
+
+// 输入 controls (包含 pluralize + append 两种 filter)
+body: "You have {{payload.appleCount | pluralize: 't.appleSingular', 't.applePlural', 'false'}} and {{payload.itemCount | pluralize: 't.itemSingular', 't.itemPlural', 'false' | append: 't.suffix'}}"
+
+// payload: { appleCount: 1, itemCount: 5 }
+
+// 最终结果
+expect(preview.body).to.include('You have apple and items in cart');
+```
+
+完整流转：
+```
+'You have {{payload.appleCount | pluralize: 't.appleSingular', 't.applePlural', 'false'}} ...'
+  ↓ preprocessFilterTranslationArgs
+'You have {{payload.appleCount | pluralize: '[T:appleSingular]', '[T:applePlural]', 'false'}} ...'
+  ↓ Liquid render (appleCount=1, itemCount=5)
+'You have [T:appleSingular] and [T:itemPlural][T:suffix]'
+  ↓ postprocessTranslationMarkers
+'You have {{t.appleSingular}} and {{t.itemPlural}}{{t.suffix}}'
+  ↓ @novu/ee-translation
+'You have apple and items in cart'
+```
+
+---
+
+### Layout 中的 filter 参数翻译 key — 跳过 Framework 的捷径
+
+Layout 内容直接从数据库获取，**不经过 Framework 的 `compileControls()` 流程**，因此缺少 `preprocessFilterTranslationArgs` 和 `postprocessTranslationMarkers` 两个步骤。
+
+代码：[email-output-renderer.usecase.ts#L390-L400](file:///d:/fz/0601-2/solo-dogfeeding/code/61-novu/apps/api/src/app/environments-v1/usecases/output-renderers/email-output-renderer.usecase.ts#L390-L400)
+
+```typescript
+const layoutBody = (layoutControlValues.email?.body ?? '').replace(/'t\.([\p{L}\p{N}_.-]+)'/gu, "'{{t.$1}}'");
+```
+
+这条替换将 `'t.key'` **直接**转为 `'{{t.key}}'`，跳过了 `[T:key]` 中间态。
+
+为什么可以跳过？因为在 Layout 场景下，layout body 是纯 HTML/Liquid 文本，`'{{t.key}}'` 作为 Liquid 的字符串参数会原样透传（Liquid 不会解析引号内的 `{{ }}`），效果等同于 Framework 中 `[T:key]` 透传 Liquid 后再 `postprocess` 还原为 `{{t.key}}`。
+
+```
+Framework 路径 (4步):
+  't.key' → '[T:key]' → Liquid透传 → '{{t.key}}' → 翻译
+
+Layout 捷径 (2步):
+  't.key' → '{{t.key}}' → Liquid透传 → 翻译
+```
+
+两种路径的最终效果一致：`{{t.key}}` 标记到达 `@novu/ee-translation` 进行翻译。
+
+---
+
+### 总结：`'t.key'` 的三种形态和它们的意义
+
+| 形态 | 出现阶段 | 作用 |
+|------|----------|------|
+| `'t.key'` | 用户在模板中书写 | 原始形式，Liquid 会将其视为普通字符串（无法被翻译） |
+| `[T:key]` | Framework 预处理后、Liquid 渲染期间 | **临时逃逸占位符**，保护翻译 key 不被 Liquid 破坏的同时透传到输出 |
+| `{{t.key}}` | Framework 后处理后、进入翻译服务 | **最终翻译标记**，`@novu/ee-translation` 识别并替换为翻译文本 |
 
 ---
 
@@ -424,3 +581,11 @@ const translationModule = require('@novu/ee-translation')?.Translate;
 ### ❌ 错误：`{{t.key}}` 是 Handlebars 语法
 
 **✅ 正确**：`{{t.key}}` 不是 Handlebars 语法，而是 `@novu/ee-translation` 模块通过正则识别的自定义标记。
+
+### ❌ 错误：`[T:key]` 占位符是最终翻译目标
+
+**✅ 正确**：`[T:key]` 只是 Liquid 渲染期间的**临时逃逸占位符**，用于让翻译 key 安全穿越 Liquid 引擎。Framework 输出时已经通过 `postprocessTranslationMarkers()` 将其还原为 `{{t.key}}`。`{{t.key}}` 才是交给 `@novu/ee-translation` 翻译服务的最终标记。
+
+### ❌ 错误：`'t.key'` filter 参数直接被翻译
+
+**✅ 正确**：`'t.key'` 作为 Liquid filter 的字符串参数，Liquid 引擎将其视为普通字符串不会触发翻译。完整路径是：`'t.key'` → `preprocessFilterTranslationArgs()` 转为 `'[T:key]'` → Liquid 透传 → `postprocessTranslationMarkers()` 还原为 `{{t.key}}` → `@novu/ee-translation` 翻译为最终文本。
